@@ -1,4 +1,3 @@
-import os
 import argparse
 import cross_section_functions as csf
 import trimesh
@@ -6,6 +5,8 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
+import matplotlib.path as mpath
 
 
 def analyze_stomata_cross_sections(torus_path, num_sections=16, visualize=True, output_dir=None, closed_stomata=False):
@@ -201,6 +202,7 @@ def analyze_torus_ring_sections_fixed(torus_path, num_sections=16, custom_angles
     cross_sections = []
     section_objects = []  # Store the original section objects too
     valid_sections = []
+    section_transforms = []
 
     print(f"Taking {num_sections} cross-sections around the torus ring centerline...")
     for i, (point, tangent, position) in enumerate(zip(centerline_points, tangent_vectors, section_positions)):
@@ -232,6 +234,13 @@ def analyze_torus_ring_sections_fixed(torus_path, num_sections=16, custom_angles
             local_mesh = mesh
             
             section = local_mesh.section(plane_origin=point, plane_normal=tangent)
+
+            # Add this line:
+            original_section_points = section.vertices.copy() if section is not None else None
+
+            # Add diagnostics
+            if section is not None:
+                print(f"  Section found with {len(section.entities)} entities")
             
             # Add diagnostics
             if section is not None:
@@ -239,7 +248,8 @@ def analyze_torus_ring_sections_fixed(torus_path, num_sections=16, custom_angles
                 
                 if len(section.entities) > 0:
                     # Convert to 2D coordinates
-                    path_2D, transform = section.to_planar()
+                    path_2D, transform = section.to_2D()
+                    section_transforms.append(transform) # Store the transformation matrix
                     
                     # Get all closed paths
                     points_2D = path_2D.vertices
@@ -248,6 +258,12 @@ def analyze_torus_ring_sections_fixed(torus_path, num_sections=16, custom_angles
                     # the centerline point becomes the origin (0,0)
                     # So the cross-section we want should be centered near the origin
                     
+                    # --- Get the 2D representation of the original 3D centerline point ---
+                    point_3d_h = np.append(point, 1)
+                    point_transformed_h = transform @ point_3d_h
+                    point_2d_target = point_transformed_h[:2]
+                    # --- End Get 2D representation ---
+
                     # Use DBSCAN to identify distinct cross-sections
                     eps_value = minor_radius * 0.3  # Adaptive clustering distance
                     clustering = DBSCAN(eps=eps_value, min_samples=3).fit(points_2D)
@@ -256,201 +272,104 @@ def analyze_torus_ring_sections_fixed(torus_path, num_sections=16, custom_angles
                     # Find distinct clusters
                     unique_labels = np.unique(labels)
                     valid_labels = unique_labels[unique_labels != -1]  # Exclude noise
-                
-                if len(valid_labels) > 1:
-                    print(f"  Section at position {position:.2f} has {len(valid_labels)} separate cross-sections")
-                    
-                    # Simple selection criterion: pick cluster closest to origin
-                    cluster_centers = []
-                    for label in valid_labels:
-                        cluster_points = points_2D[labels == label]
-                        center = np.mean(cluster_points, axis=0)
-                        cluster_centers.append((label, center, np.linalg.norm(center)))
-                    
-                    # Sort by distance to origin and take the closest
-                    closest_label = sorted(cluster_centers, key=lambda x: x[2])[0][0]
-                    
-                    # Filter to just the closest cluster
-                    points_2D = points_2D[labels == closest_label]
-                    print(f"  Selected cross-section with {len(points_2D)} points (distance to origin: {sorted(cluster_centers, key=lambda x: x[2])[0][2]:.4f})")
-                else:
-                    # Just filter out noise points if only one valid cluster
-                    filtered_points = points_2D[labels != -1] if -1 in unique_labels else points_2D
-                    print(f"  Single cross-section with {len(filtered_points)} points")
-                    points_2D = filtered_points
-  
-                
-                # Calculate area using ordered points
-                center_point = np.mean(points_2D, axis=0)
-                angles = np.arctan2(points_2D[:, 1] - center_point[1], points_2D[:, 0] - center_point[0])
-                sorted_indices = np.argsort(angles)
 
-                # Calculate convexity ratio
-                convexity = csf.calculate_convexity(points_2D)                       
+                    # --- Define variables to hold the FINAL filtered points ---
+                    final_points_2D = np.empty((0, 2))
+                    final_original_points_3D = np.empty((0, 3))
+                    # --- End Define ---
 
-                # Calculate additional shape metrics
-                # 1. Find the bounding box and check aspect ratio
-                min_coords = np.min(points_2D, axis=0)
-                max_coords = np.max(points_2D, axis=0)
-                width = max_coords[0] - min_coords[0]
-                height = max_coords[1] - min_coords[1]
-                aspect_ratio = max(width/height, height/width) if min(width, height) > 0 else 1.0
+                    if len(valid_labels) > 1:
+                        # --- New Selection Logic: Minimum Average Distance to Target Point ---
+                        cluster_avg_distances = []
+                        cluster_info = []
+                        original_points_mapping = {}
 
-                # 2. Measure the roundness using PCA
-                pca = PCA(n_components=2)
-                pca.fit(points_2D)
-                variance_ratio = pca.explained_variance_ratio_[0] / (pca.explained_variance_ratio_[1] + 1e-10)
+                        for label in valid_labels:
+                            label_mask = (labels == label)
+                            cluster_points_2d = points_2D[label_mask]
+                            num_points = len(cluster_points_2d)
+                            if num_points < 3: continue
 
-                print(f"  Shape metrics - Aspect ratio: {aspect_ratio:.2f}, Variance ratio: {variance_ratio:.2f}")
+                            original_points_mapping[label] = original_section_points[label_mask]
 
-                # BRANCHING LOGIC: Different approaches based on closed_stomata flag
+                            # Calculate distances from target to each point in the cluster
+                            distances = np.linalg.norm(cluster_points_2d - point_2d_target, axis=1)
+                            avg_distance = np.mean(distances)
 
-                if closed_stomata:
-                    # Assume points_2D and labels have been computed already.
-                    unique_labels = np.unique(labels[labels != -1])
-                    if len(unique_labels) > 1:
-                        # Compute centroids for each cluster
-                        cluster_centers = []
-                        for label in unique_labels:
-                            cluster_points = points_2D[labels == label]
-                            cluster_center = np.mean(cluster_points, axis=0)
-                            distance = np.linalg.norm(cluster_center)  # distance to origin
-                            cluster_centers.append((label, cluster_center, distance))
-                        # Select cluster with smallest distance
-                        best_label = sorted(cluster_centers, key=lambda x: x[2])[0][0]
-                        points_2D = points_2D[labels == best_label]
-                        print(f"  Closed stomata: selected cluster {best_label} based on proximity")
-                    else:
-                        print("  Closed stomata: only one cluster detected")
+                            cluster_avg_distances.append({'label': label, 'avg_distance': avg_distance})
+                            # Store other info for logging/fallback
+                            center = np.mean(cluster_points_2d, axis=0)
+                            cluster_info.append({'label': label, 'num_points': num_points, 'center': center})
 
-                else:
-                    # Only consider splitting for open stomata
-                    if (convexity < 0.45) and (variance_ratio > 3.5 or aspect_ratio > 2.5):
-                        # Process merged cells only for open stomata
-                        print(f"  Open stomata with merged guard cells detected")
-                        
-                        # Find the best splitting line using PCA
-                        main_axis = pca.components_[0]  # Primary axis
-                        
-                        # Project points onto the main axis
-                        projections = points_2D @ main_axis
-                    
-                        # First check if we need to perform any splitting
-                        # Use PCA to check if there might be two guard cells present
-                        pca = PCA(n_components=2).fit(points_2D)
-                        variance_ratio = pca.explained_variance_ratio_[0] / (pca.explained_variance_ratio_[1] + 1e-10)
-                        
-                        # If the shape is elongated, try to split between cells
-                        if variance_ratio > 2.5:  # Fairly elongated shape
-                            main_axis = pca.components_[0]  # Primary axis
-                            
-                            # Project points onto the main axis
-                            projections = points_2D @ main_axis
-                            
-                            # Find center point projection
-                            center_proj = np.mean(projections)
-                            
-                            # Calculate distance from center of section to each point
-                            center_point = np.mean(points_2D, axis=0)
-                            distances = np.linalg.norm(points_2D - center_point, axis=1)
-                            
-                            # Find the median distance - useful for threshold
-                            median_dist = np.median(distances)
-                            
-                            # Find the split point that maximizes separation between cells
-                            # Try multiple approaches
-                            
-                            # Method 1: Use histogram to find valleys
-                            hist, bin_edges = np.histogram(projections, bins=min(40, len(projections)//2))
-                            hist_smooth = np.convolve(hist, np.ones(3)/3, mode='same')  # Smooth histogram
-                            
-                            # Look for valleys in the histogram
-                            neg_hist = -hist_smooth
-                            peaks, _ = find_peaks(neg_hist)
-                            
-                            split_point = None
-                            
-                            if len(peaks) > 0:
-                                # Find a good valley near the center
-                                hist_max = np.max(hist_smooth)
-                                peak_depths = hist_max - hist_smooth[peaks]
-                                
-                                # Get the deepest valleys
-                                sorted_peaks = sorted(zip(peaks, peak_depths), key=lambda x: -x[1])
-                                
-                                for peak_idx, depth in sorted_peaks:
-                                    # Get the actual bin center for this valley
-                                    valley_proj = bin_edges[peak_idx:peak_idx+2].mean()
-                                    
-                                    # Check if this valley is a good split point
-                                    # We want it to be away from center, so it preserves the inner cell
-                                    if abs(valley_proj - center_proj) > median_dist * 0.3:
-                                        split_point = valley_proj
-                                        print(f"  Found good split point at projection {split_point:.4f}")
-                                        break
-                            
-                            # If we found a valid split point, apply it
-                            if split_point is not None:
-                                # Split the points
-                                if split_point < center_proj:
-                                    # Keep points to the right of the split
-                                    points_2D = points_2D[projections >= split_point]
-                                else:
-                                    # Keep points to the left of the split
-                                    points_2D = points_2D[projections <= split_point]
-                                
-                                print(f"  Split cross-section to keep inner guard cell with {len(points_2D)} points")
-                            else:
-                                print(f"  Could not find good split point, keeping entire cross-section")
+                        # --- Decision based on minimum average distance ---
+                        if cluster_avg_distances: # Check if list is not empty
+                            cluster_avg_distances.sort(key=lambda x: x['avg_distance'])
+                            best_label = cluster_avg_distances[0]['label']
+                            min_avg_dist = cluster_avg_distances[0]['avg_distance']
+                            print(f"  Selected cluster (label {best_label}) with minimum average distance ({min_avg_dist:.4f}) to target {point_2d_target}.")
                         else:
-                            print(f"  Cross-section doesn't appear to have multiple cells (variance_ratio={variance_ratio:.2f})")
+                            # Fallback if no valid clusters found after filtering small ones
+                            print(f"  Warning: No substantial clusters found. Falling back to largest cluster overall (if any).")
+                            if not cluster_info:
+                                 print("  No clusters found at all.")
+                                 best_label = -1
+                            else:
+                                cluster_info.sort(key=lambda x: x['num_points'], reverse=True)
+                                best_label = cluster_info[0]['label']
+                                print(f"  Fallback selected largest cluster (label {best_label}).")
 
 
-                
-                # Store data
-                cross_sections.append(points_2D)
-                
-                # Create a modified section object containing only the filtered points
-                # Get proper ordering for the points around the circumference
-                try:
-                    # Find center of the points
-                    center_point = np.mean(points_2D, axis=0)
-                    
-                    # Order points by their angle around this center
-                    angles = np.arctan2(points_2D[:, 1] - center_point[1], 
-                                    points_2D[:, 0] - center_point[0])
-                    sorted_indices = np.argsort(angles)
-                    sorted_points = points_2D[sorted_indices]
-                    
-                    # Create a new path entity for the processed section
-                    entity = section.entities[0].copy()
-                    entity.points = np.arange(len(sorted_points))
-                    
-                    # Store this modified section for visualization
-                    modified_section = section.copy()
-                    modified_section.entities = [entity]
-                    modified_section.vertices = sorted_points
-                except Exception as e:
-                    modified_section = section  # Fall back to original section
-                
-                section_objects.append(modified_section)
-                valid_sections.append(True)
-                print(f"  Section at position {position:.2f} successful")
-            else:
-                print(f"  No intersection at position {position:.2f}")
-                cross_sections.append(None)
-                section_objects.append(None)
-                valid_sections.append(False)
+                        # --- Get the FINAL points based on the best label ---
+                        if best_label != -1:
+                            final_mask = (labels == best_label)
+                            final_points_2D = points_2D[final_mask]
+                            final_original_points_3D = original_section_points[final_mask]
+                            selected_center = next((info['center'] for info in cluster_info if info['label'] == best_label), None)
+                            print(f"  Final selection: Cluster {best_label} with {len(final_points_2D)} points (center: {selected_center})")
+                        else:
+                             final_points_2D = np.empty((0, 2))
+                             final_original_points_3D = np.empty((0, 3))
+                        # --- End Selection Logic ---
+
+                    elif len(valid_labels) == 1:
+                        # Just filter out noise points if only one valid cluster
+                        final_mask = (labels != -1) # Mask for the single valid cluster
+                        # --- Get the FINAL points ---
+                        final_points_2D = points_2D[final_mask]
+                        final_original_points_3D = original_section_points[final_mask]
+                        # --- End Get FINAL ---
+                        print(f"  Single cross-section with {len(final_points_2D)} points")
+                    else: # No valid clusters found
+                        print("  No valid clusters found after DBSCAN.")
+                        # final_points_2D and final_original_points_3D remain empty
+
+                    # --- Assertion to catch mismatch during generation ---
+                    assert len(final_points_2D) == len(final_original_points_3D), \
+                        f"Mismatch during generation! Section {i}: final_points_2D len {len(final_points_2D)}, final_original_points_3D len {len(final_original_points_3D)}"
+                    # --- End Assertion ---
+
+                    # Store the FINAL filtered points
+                    cross_sections.append((final_points_2D, final_original_points_3D))
+                    section_transforms.append(transform) # Keep transform associated
+                    valid_sections.append(len(final_points_2D) > 0) # Section is valid if points remain
+
+                else: # Section was None or empty BEFORE DBSCAN
+                    print(f"  Section at position {position:.2f} is invalid or empty.")
+                    cross_sections.append((np.empty((0, 2)), np.empty((0, 3))))
+                    section_transforms.append(None)
+                    valid_sections.append(False)
+
         except Exception as e:
-            print(f"  Error at position {position:.2f}: {str(e)}")
-            cross_sections.append(None)
-            section_objects.append(None)
+            # ... (exception handling remains the same) ...
+            print(f"Error processing section at position {position:.2f}: {e}")
+            cross_sections.append((np.empty((0, 2)), np.empty((0, 3))))
+            section_transforms.append(None)
             valid_sections.append(False)
-    
+
     # 6. Create visualizations
     if visualize:
         csf.create_visualizations(mesh, centerline_points, tangent_vectors, section_positions, 
-                             cross_sections, section_objects, raw_centerline_points, 
+                             cross_sections, section_objects, section_transforms, raw_centerline_points, 
                              inner_points, outer_points, minor_radius, valid_sections, 
                              output_dir, closed_stomata=closed_stomata)
     
@@ -480,5 +399,5 @@ if __name__ == "__main__":
     num_sections=args.num_sections,
     visualize=args.visualize,
     output_dir=args.output_dir,
-    closed_stomata=args.closed_stomata  # Pass this parameter through
+    closed_stomata=args.closed_stomata 
     )

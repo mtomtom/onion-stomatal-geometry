@@ -1,20 +1,24 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import trimesh
 import os
 from scipy.optimize import curve_fit
 from scipy.spatial import ConvexHull
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from scipy.signal import find_peaks
-import argparse
 from scipy.spatial import KDTree
+import trimesh
 
 def ellipse(theta, a, b, phi):
     """Parameterized equation of an ellipse."""
     r = a*b / np.sqrt((b*np.cos(theta-phi))**2 + (a*np.sin(theta-phi))**2)
     return r
+
+def get_2d_points(cross_section):
+    """Extract 2D points from a cross-section, handling both tuple and direct formats."""
+    if cross_section is None:
+        return None
+    return cross_section[0] if isinstance(cross_section, tuple) else cross_section
 
 
 def order_points(points, method="nearest", center=None):
@@ -159,7 +163,9 @@ def process_cross_section(cross_section):
         tuple or None: (segments, ordered_points) if successful, None otherwise
     """
     try:
-        ordered_points = order_points(cross_section, method="nearest")
+        # Ensure points are in 2D
+        points_2d = get_2d_points(cross_section)
+        ordered_points = order_points(points_2d, method="nearest")
         
         # Create segments from consecutive points
         segments = []
@@ -189,17 +195,23 @@ def create_combined_cross_section_figure(cross_sections, valid_sections, minor_r
     fig.suptitle('All Cross-Sections Comparison (Boundary Split)', fontsize=16)
 
     plot_idx = 1
+    valid_indices = [i for i, valid in enumerate(valid_sections) if valid]
+
+    # Add section index mapping as text in the figure
+    mapping_text = "Section Mapping: " + ", ".join([f"Plot {j+1}→Sec {i}" for j, i in enumerate(valid_indices)])
+    fig.text(0.5, 0.01, mapping_text, ha='center', fontsize=9)
 
     for i, (cross_section, valid) in enumerate(zip(cross_sections, valid_sections)):
-        if not valid or cross_section is None or len(cross_section) < 5: # Need more points for boundary detection
+        points_2d = get_2d_points(cross_section)
+        if not valid or cross_section is None or len(points_2d) < 5: # Need more points for boundary detection
             continue
 
         ax = fig.add_subplot(rows, cols, plot_idx)
-        ax.set_title(f'Section {i}')
+        ax.set_title(f'Plot {plot_idx}: Section {i}')
         plot_idx += 1
 
-        original_center = np.mean(cross_section, axis=0)
-        centered = cross_section - original_center
+        original_center = np.mean(points_2d, axis=0)
+        centered = points_2d - original_center
 
         selected_points = centered # Default
         has_split = False # Flag if boundary split was successful
@@ -210,9 +222,6 @@ def create_combined_cross_section_figure(cross_sections, valid_sections, minor_r
             points_to_process = centered
             initial_point_count = len(points_to_process)
 
-            
-
-        # --- End of Boundary Detection Logic ---
         
             used_fallback = False
             try:
@@ -344,21 +353,21 @@ def create_combined_cross_section_figure(cross_sections, valid_sections, minor_r
         #ax.plot(circle_x, circle_y, 'k--', linewidth=1, alpha=0.7)
 
         # Compute metrics based on the final selected points
-        points_for_metrics = selected_points
-        if len(points_for_metrics) > 0:
-            width = np.ptp(points_for_metrics[:, 0])
-            height = np.ptp(points_for_metrics[:, 1])
-            aspect = width / height if height > 0 else 0
-            try:
-                convexity_val2 = calculate_convexity(order_points(points_for_metrics, method="angular"))
-                props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}\nC: {convexity_val2:.2f}"
-            except Exception as e:
-                props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}"
-        else:
-             props_text = "Pts: 0"
+        #points_for_metrics = selected_points
+        #if len(points_for_metrics) > 0:
+        #    width = np.ptp(points_for_metrics[:, 0])
+        #    height = np.ptp(points_for_metrics[:, 1])
+        #    aspect = width / height if height > 0 else 0
+        #    try:
+        #        convexity_val2 = calculate_convexity(order_points(points_for_metrics, method="angular"))
+        #        props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}\nC: {convexity_val2:.2f}"
+        #    except Exception as e:
+        #        props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}"
+        #else:
+        #     props_text = "Pts: 0"
 
-        ax.text(0.05, 0.95, props_text, transform=ax.transAxes, verticalalignment='top',
-                fontsize=8, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+        #ax.text(0.05, 0.95, props_text, transform=ax.transAxes, verticalalignment='top',
+        #        fontsize=8, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
         ax.set_aspect('equal')
         #ax.grid(True)
         ax.set_xticklabels([])
@@ -377,7 +386,7 @@ def create_combined_cross_section_figure(cross_sections, valid_sections, minor_r
     plt.close(fig)
 
 def create_visualizations(mesh, centerline_points, tangent_vectors, section_positions, 
-                         cross_sections, section_objects, raw_centerline_points, 
+                         cross_sections, section_objects, section_transforms, raw_centerline_points, 
                          inner_points, outer_points, minor_radius, valid_sections, 
                          output_dir=None, closed_stomata=False):
     """Create visualization figures for the analysis results."""
@@ -480,9 +489,208 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
                 name=f'Section {i}'
             )
             section_traces.append(section_trace)
+
+        section_point_traces = []
+        for i, (cross_section, transform, valid, point, tangent) in enumerate(zip(
+                cross_sections, section_transforms, valid_sections, centerline_points, tangent_vectors)):
+            if not valid or cross_section is None:
+                continue
+                
+            # Unpack the cross-section data - these are the already processed 2D points
+            processed_points_2d, original_points_3d = cross_section if isinstance(cross_section, tuple) else (cross_section, None)
+            
+            try:
+                # --- Start Modification ---
+                # Always calculate the correct order based on the processed 2D points first
+                center_2d = np.mean(processed_points_2d, axis=0)
+                centered_points_2d = processed_points_2d - center_2d
+                angles = np.arctan2(centered_points_2d[:, 1], centered_points_2d[:, 0])
+                sorted_indices = np.argsort(angles)
+
+                if original_points_3d is not None and len(original_points_3d) > 0:
+                    # Use original 3D points, but apply the calculated order for connectivity
+                    # Check if the number of points matches before applying indices
+                    if len(original_points_3d) == len(sorted_indices):
+                         points_3d = original_points_3d[sorted_indices]
+                         print(f"  Section {i}: Using ORDERED original 3D points ({len(points_3d)} points)")
+                    else:
+                         # Fallback if point counts mismatch (should not happen often with filtering)
+                         print(f"  Section {i}: Warning - Mismatch between original ({len(original_points_3d)}) and processed ({len(processed_points_2d)}) points. Using fallback.")
+                         # Use the fallback transformation (copied from below)
+                         ordered_centered_points_2d = centered_points_2d[sorted_indices]
+                         if np.abs(tangent[0]) > 0.9: v1 = np.array([0, 1, 0])
+                         else: v1 = np.array([1, 0, 0])
+                         v1 = v1 - np.dot(v1, tangent) * tangent; v1 /= np.linalg.norm(v1)
+                         v2 = np.cross(tangent, v1)
+                         points_3d = np.array([point + ordered_centered_points_2d[j, 0] * v1 + ordered_centered_points_2d[j, 1] * v2 for j in range(len(ordered_centered_points_2d))])
+
+                else:
+                    # FALLBACK: Reconstruct 3D points using the manual plane basis.
+                    print(f"  Section {i}: Warning - Original 3D points not available. Using fallback transformation.")
+                    # Use the CENTERED and ORDERED points for transformation
+                    ordered_centered_points_2d = centered_points_2d[sorted_indices]
+
+                    # Calculate the plane basis vectors (v1, v2)
+                    if np.abs(tangent[0]) > 0.9:
+                        v1 = np.array([0, 1, 0])
+                    else:
+                        v1 = np.array([1, 0, 0])
+                    v1 = v1 - np.dot(v1, tangent) * tangent
+                    v1 = v1 / np.linalg.norm(v1)
+                    v2 = np.cross(tangent, v1)
+
+                    # Transform the CENTERED points relative to the centerline point 'point'
+                    points_3d = np.array([
+                        point + ordered_centered_points_2d[j, 0] * v1 + ordered_centered_points_2d[j, 1] * v2
+                        for j in range(len(ordered_centered_points_2d))
+                    ])
+                    print(f"  Section {i}: Using transformed centered 2D points ({len(points_3d)} points)")
+                
+                # Create color based on section index for consistent coloring
+                color = plt.cm.hsv(i / len(valid_sections))
+                rgb_color = f'rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})'
+                
+                # Create visualization for the selected cross-section points
+                # Add the first point again at the end to close the loop
+                if len(points_3d) > 0: # Check if points_3d is not empty
+                    closed_points_3d = np.vstack([points_3d, points_3d[0]])
+                else:
+                    closed_points_3d = np.empty((0, 3)) # Handle empty case
+                
+                section_point_trace = go.Scatter3d(
+                    x=closed_points_3d[:, 0],
+                    y=closed_points_3d[:, 1],
+                    z=closed_points_3d[:, 2],
+                    mode='lines',  # Just use lines for a clean visualization
+                    line=dict(color=rgb_color, width=5),  # Thicker lines for visibility
+                    name=f'Section {i}'  # Consistent naming with section planes
+                )
+                section_point_traces.append(section_point_trace)
+                
+                # Also add points for better visibility
+                points_trace = go.Scatter3d(
+                    x=points_3d[:, 0],
+                    y=points_3d[:, 1],
+                    z=points_3d[:, 2],
+                    mode='markers',
+                    marker=dict(
+                        size=4,
+                        color=rgb_color,
+                        symbol='circle',
+                    ),
+                    name=f'Section {i} Points',
+                    showlegend=False
+                )
+                section_point_traces.append(points_trace)
+                
+            except Exception as e:
+                print(f"Could not visualize section {i} points: {str(e)}")
+                print(f"  Debug info: {e.__class__.__name__}, processed_points_2d shape: {processed_points_2d.shape if processed_points_2d is not None else 'None'}")
+        # Update the figure creation to include these new traces
+        fig = go.Figure(data=[mesh_trace, raw_centerline_trace, centerline_trace] + section_traces + section_point_traces)
+        valid_indices = [i for i, valid in enumerate(valid_sections) if valid]
+        buttons = [
+            {
+                'label': 'Show All',
+                'method': 'update',
+                'args': [{'visible': [True] * len(fig.data)}]
+            }
+        ]
+
+        # Add buttons for individual sections
+        base_traces = 3  # mesh, raw_centerline, centerline
+        for i, valid in enumerate(valid_sections):
+            if not valid:
+                continue
+            
+            # Calculate indices within the visible traces
+            plane_idx = base_traces + valid_indices.index(i)
+            points_idx = base_traces + len(section_traces) + valid_indices.index(i)
+            
+            # Create a visibility list where only this section's plane and points are visible
+            visible = [True] * base_traces  # Always show mesh and centerlines
+            visible.extend([False] * (len(section_traces) + len(section_point_traces)))
+            
+            # Make this section's plane and points visible
+            if plane_idx < len(visible):
+                visible[plane_idx] = True
+            if points_idx < len(visible):
+                visible[points_idx] = True
+            
+            buttons.append({
+                'label': f'Section {i}',
+                'method': 'update',
+                'args': [{'visible': visible}]
+            })
+
+        # --- Update Button Generation Logic ---
+        num_base_traces = 3 # mesh_trace, raw_centerline_trace, centerline_trace
+        num_plane_traces = len(section_traces)
+        # Each section point visualization adds TWO traces (lines + markers)
+        num_point_traces_per_section = 2
+        total_traces = num_base_traces + num_plane_traces + len(section_point_traces)
+
+        buttons = [
+            {
+                'label': 'Show All',
+                'method': 'update',
+                'args': [{'visible': [True] * total_traces}]
+            }
+        ]
+
+        # Keep track of which index in the original loop corresponds to which trace index
+        valid_section_indices = [i for i, valid in enumerate(valid_sections) if valid]
+        plane_trace_map = {original_idx: trace_idx for trace_idx, original_idx in enumerate(valid_section_indices)}
+        # Point traces start after base traces and plane traces
+        point_trace_start_idx = num_base_traces + num_plane_traces
+        point_trace_map = {original_idx: point_trace_start_idx + trace_idx * num_point_traces_per_section
+                           for trace_idx, original_idx in enumerate(valid_section_indices)}
+
+        # Add buttons for individual sections
+        for original_idx in valid_section_indices:
+            visibility = [False] * total_traces
+            # Show base traces
+            visibility[0:num_base_traces] = [True] * num_base_traces
+
+            # Find the correct trace indices for this section
+            plane_idx = plane_trace_map.get(original_idx)
+            point_start_idx = point_trace_map.get(original_idx)
+
+            if plane_idx is not None:
+                 # Plane traces start right after base traces
+                visibility[num_base_traces + plane_idx] = True
+            if point_start_idx is not None:
+                # Show both line and marker traces for this section
+                visibility[point_start_idx] = True # Line trace
+                visibility[point_start_idx + 1] = True # Marker trace
+
+            buttons.append({
+                'label': f'Section {original_idx}',
+                'method': 'update',
+                'args': [{'visible': visibility}]
+            })
+        # --- End Update Button Generation Logic ---
+
+        # Update layout with buttons
+        fig.update_layout(
+            updatemenus=[{
+                'buttons': buttons,
+                'direction': 'down',
+                'showactive': True,
+                'x': 0.1,
+                'xanchor': 'left',
+                'y': 1.15,
+                'yanchor': 'top'
+            }],
+            # ... rest of layout settings ...
+        )
+
+        # Save or show the figure
+        # ... (rest of the function) ...
+            
         
         # Create figure with the traces
-        fig = go.Figure(data=[mesh_trace, raw_centerline_trace, centerline_trace] + section_traces)
+        #fig = go.Figure(data=[mesh_trace, raw_centerline_trace, centerline_trace] + section_traces)
         
         # Update layout
         fig.update_layout(title='3D Visualization of Stomata with Cross-Sections',
@@ -636,8 +844,10 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
         
         # Add reference circle for section at 0 degrees
         if valid_sections[zero_idx] and cross_sections[zero_idx] is not None:
-            ref_center = np.mean(cross_sections[zero_idx], axis=0)
+            ref_points = get_2d_points(cross_sections[zero_idx])
+            ref_center = np.mean(ref_points, axis=0)
             ax_raw.plot(circle_x + ref_center[0], circle_y + ref_center[1], 'g--', linewidth=1, alpha=0.7)
+
             
         # Set consistent limits
         if raw_points is not None:
@@ -667,7 +877,8 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
         
         try:
             # Process the cross section to get properly ordered segments and points
-            result = process_cross_section(cross_section)
+            points_2d = get_2d_points(cross_section)
+            result = process_cross_section(points_2d)
             
             if result is not None:
                 segments, ordered_points = result
@@ -678,12 +889,12 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
                 ax_all.plot(x, y, '-', color=color, alpha=0.8, linewidth=1.5)
                 
                 # Mark center
-                center = np.mean(cross_section, axis=0)
+                center = np.mean(points_2d, axis=0)
                 ax_all.plot(center[0], center[1], 'o', color=color, markersize=4)
         except Exception as e:
             # Fall back to simple plotting if processing fails
             print(f"Error plotting section {i}: {e}")
-            ax_all.plot(cross_section[:, 0], cross_section[:, 1], '-', color=color, 
+            ax_all.plot(points_2d[:, 0], points_2d[:, 1], '-', color=color, 
                         alpha=0.8, linewidth=1.5)
     
     # Set equal aspect ratio
@@ -703,9 +914,11 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
         if not valid or cross_section is None:
             continue
             
+        # Extract 2D points
+        points_2d = get_2d_points(cross_section)
         # Center each section at the origin
-        center = np.mean(cross_section, axis=0)
-        centered = cross_section - center
+        center = np.mean(points_2d, axis=0)
+        centered = points_2d - center
         
         # Use angle-based color
         color = plt.cm.hsv(i / len(valid_sections))
@@ -739,12 +952,12 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
     # Replace plot code for example section (around line 935-940):
 
     if valid_sections[example_idx] and cross_sections[example_idx] is not None:
-        example = cross_sections[example_idx]
+        points_2d = get_2d_points(cross_sections[example_idx])
         ax_example.set_title(f'Detailed View of Section {example_idx}')
         
         # Center the example
-        center = np.mean(example, axis=0)
-        centered = example - center
+        center = np.mean(points_2d, axis=0)
+        centered = points_2d - center
         
         # Sort points by angle for proper plotting
         angles = np.arctan2(centered[:, 1], centered[:, 0])
@@ -804,84 +1017,149 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
         create_combined_cross_section_figure(cross_sections, valid_sections, minor_radius, output_dir, closed_stomata)
 
 def _apply_proximity_fallback(centered_points, minor_radius, initial_point_count):
-    """Applies the proximity filter/region growing as a fallback."""
+    """
+    Applies the proximity filter/region growing as a fallback method for separating
+    inner boundary points from outer points.
+    
+    Args:
+        centered_points: Array of points centered around origin
+        minor_radius: Estimated minor radius of the structure
+        initial_point_count: Original number of points for comparison
+        
+    Returns:
+        (selected_points, has_filtered): Selected subset of points and whether filtering occurred
+    """
     print("  Applying proximity filter fallback...")
-    selected_points = centered_points
-    has_filtered = False
     points_to_process = centered_points
-
-    # Simplified DBSCAN cleanup
+    
+    # Step 1: DBSCAN cleanup to remove outliers and find main clusters
     try:
+        # Use 40% of minor radius as a reasonable neighborhood size
         dbscan_eps = minor_radius * 0.40
         clustering = DBSCAN(eps=dbscan_eps, min_samples=5).fit(points_to_process)
         labels = clustering.labels_
         unique_labels = np.unique(labels[labels != -1])
+        
         if len(unique_labels) > 1:
+            # Multiple clusters found - select the one closest to origin
             min_dist = float('inf')
             best_label = -1
+            
             for label in unique_labels:
                 cluster_points = points_to_process[labels == label]
-                if len(cluster_points) < 5: continue
+                if len(cluster_points) < 5:
+                    continue  # Skip tiny clusters
+                    
+                # Calculate distance from origin to cluster centroid
                 dist = np.linalg.norm(np.mean(cluster_points, axis=0))
                 if dist < min_dist:
                     min_dist = dist
                     best_label = label
-            if best_label != -1: points_to_process = points_to_process[labels == best_label]
-            else: points_to_process = points_to_process[labels != -1]
-        elif len(unique_labels) == 1: points_to_process = points_to_process[labels == unique_labels[0]]
-        elif len(labels[labels != -1]) > 5: points_to_process = points_to_process[labels != -1]
-        else: pass # Keep original if cleanup failed badly
+                    
+            if best_label != -1:
+                points_to_process = points_to_process[labels == best_label]
+            else:
+                # No good cluster found, just remove noise points
+                points_to_process = points_to_process[labels != -1]
+                
+        elif len(unique_labels) == 1:
+            # Only one cluster - keep it
+            points_to_process = points_to_process[labels == unique_labels[0]]
+            
+        elif len(labels[labels != -1]) > 5:
+            # No distinct clusters but some non-noise points exist
+            points_to_process = points_to_process[labels != -1]
+            
+        # If all points are noise or DBSCAN failed completely, keep original points
+        
+        # Store DBSCAN results
         points_after_dbscan = points_to_process.copy()
-    except Exception:
+        print(f"  DBSCAN filtering: {len(centered_points)} → {len(points_after_dbscan)} points")
+        
+    except Exception as e:
+        print(f"  DBSCAN clustering failed: {e}")
         points_after_dbscan = points_to_process.copy()
 
+    # Early exit if too few points remain
     if len(points_to_process) < 5:
+        print(f"  Too few points after DBSCAN ({len(points_to_process)}), returning early")
         return points_to_process, (len(points_to_process) < initial_point_count)
 
-    # Core identification and region growing (simplified from previous version)
-    core_radius = minor_radius * 0.4
-    distances_from_origin = np.linalg.norm(points_to_process, axis=1)
-    core_indices = np.where(distances_from_origin <= core_radius)[0]
-    start_indices = []
-    if len(core_indices) > 0: start_indices = list(core_indices)
-    else:
-        k_closest = min(3, len(points_to_process))
-        start_indices = list(np.argsort(distances_from_origin)[:k_closest])
-
-    if start_indices:
-        selection_mask = np.zeros(len(points_to_process), dtype=bool)
-        selection_mask[start_indices] = True
-        try:
-            temp_tree = KDTree(points_to_process)
-            distances, _ = temp_tree.query(points_to_process, k=min(6, len(points_to_process)))
-            if distances.ndim > 1 and distances.shape[1] > 1:
-                 avg_neighbor_dist = np.median(distances[:, 1])
-                 growth_threshold = avg_neighbor_dist * 3.5
-            else: growth_threshold = minor_radius * 0.25
-        except Exception: growth_threshold = minor_radius * 0.25
-
-        processed_indices = set(start_indices)
-        queue = start_indices[:]
-        grow_tree = KDTree(points_to_process)
-        while queue:
-            current_idx = queue.pop(0)
-            neighbor_indices = grow_tree.query_ball_point(points_to_process[current_idx], r=growth_threshold)
-            for neighbor_idx in neighbor_indices:
-                if neighbor_idx not in processed_indices:
-                    selection_mask[neighbor_idx] = True
-                    processed_indices.add(neighbor_idx)
-                    queue.append(neighbor_idx)
-        grown_points = points_to_process[selection_mask]
-
-        if len(grown_points) < 10: # Sanity check
-            selected_points = points_after_dbscan
-            has_filtered = (len(selected_points) < initial_point_count)
+    # Step 2: Region growing from core points
+    try:
+        # Core identification - points close to origin
+        core_radius = minor_radius * 0.4  # 40% of minor radius defines the core region
+        distances_from_origin = np.linalg.norm(points_to_process, axis=1)
+        core_indices = np.where(distances_from_origin <= core_radius)[0]
+        
+        # Select starting points - either core points or closest to origin
+        start_indices = []
+        if len(core_indices) > 0:
+            start_indices = list(core_indices)
         else:
-            selected_points = grown_points
-            has_filtered = (len(selected_points) < initial_point_count)
-    else:
-        selected_points = points_after_dbscan
-        has_filtered = (len(selected_points) < initial_point_count)
+            # If no core points, use the 3 closest points (or fewer if < 3 points total)
+            k_closest = min(3, len(points_to_process))
+            start_indices = list(np.argsort(distances_from_origin)[:k_closest])
 
+        if start_indices:
+            # Create selection mask and KDTree just once
+            selection_mask = np.zeros(len(points_to_process), dtype=bool)
+            selection_mask[start_indices] = True
+            
+            # Build KD-Tree for efficient neighbor searches
+            grow_tree = KDTree(points_to_process)
+            
+            # Determine growth threshold based on median neighbor distance
+            try:
+                distances, _ = grow_tree.query(points_to_process, k=min(6, len(points_to_process)))
+                if distances.ndim > 1 and distances.shape[1] > 1:
+                    # Use median distance to nearest neighbor times 3.5 as growth threshold
+                    avg_neighbor_dist = np.median(distances[:, 1])
+                    growth_threshold = avg_neighbor_dist * 3.5
+                else:
+                    growth_threshold = minor_radius * 0.25
+            except Exception as e:
+                print(f"  Error calculating growth threshold: {e}")
+                growth_threshold = minor_radius * 0.25
+                
+            print(f"  Using growth threshold: {growth_threshold:.4f}")
+
+            # Perform region growing using BFS
+            from collections import deque  # More efficient than list for queue operations
+            processed_indices = set(start_indices)
+            queue = deque(start_indices)
+            
+            while queue:
+                current_idx = queue.popleft()  # O(1) vs O(n) for list.pop(0)
+                neighbor_indices = grow_tree.query_ball_point(
+                    points_to_process[current_idx], r=growth_threshold)
+                
+                for neighbor_idx in neighbor_indices:
+                    if neighbor_idx not in processed_indices:
+                        selection_mask[neighbor_idx] = True
+                        processed_indices.add(neighbor_idx)
+                        queue.append(neighbor_idx)
+            
+            grown_points = points_to_process[selection_mask]
+            
+            # Verify growth produced reasonable results
+            if len(grown_points) < 10:
+                print(f"  Region growing produced too few points ({len(grown_points)}), reverting to DBSCAN result")
+                selected_points = points_after_dbscan
+            else:
+                print(f"  Region growing: {len(points_to_process)} → {len(grown_points)} points")
+                selected_points = grown_points
+        else:
+            # No starting points found (unlikely but possible)
+            print("  No starting points for region growing, using DBSCAN result")
+            selected_points = points_after_dbscan
+            
+    except Exception as e:
+        print(f"  Region growing failed: {e}")
+        selected_points = points_after_dbscan
+
+    # Determine if filtering occurred
+    has_filtered = (len(selected_points) < initial_point_count)
+    
     print(f"  Proximity fallback finished. Selected {len(selected_points)} points. Filtered: {has_filtered}")
     return selected_points, has_filtered
