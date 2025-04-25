@@ -413,8 +413,8 @@ def create_visualizations(mesh, centerline_points, tangent_vectors, section_posi
             y=vertices[:, 1],
             z=vertices[:, 2],
             i=i, j=j, k=k,
-            opacity=0.5,
-            color='lightblue'
+            opacity=0.8,
+            color='green'
         )
         
         # Add raw centerline points
