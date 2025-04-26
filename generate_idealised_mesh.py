@@ -23,29 +23,45 @@ def generate_average_mesh_reconstruction(file_paths, output_path, reference_inde
     pass
 
 # --- Helper function for Aspect Ratio Modulation ---
-def get_modulated_AR(theta, cl_phi, AR_mid, AR_min):
+# Replace the entire get_modulated_AR function
+
+def get_modulated_AR(theta_cl, cl_phi, AR_mid, AR_min, transition_power=2.0): # transition_power is now less relevant here
     """
-    Calculates a modulated aspect ratio based on the angle along the centerline.
-    AR is AR_mid at the major axis points (theta = cl_phi or cl_phi+pi)
-    and transitions smoothly to AR_min at the ends/tips (minor axis points: theta = cl_phi+pi/2 or cl_phi+3pi/2).
+    Calculates a modulated aspect ratio that maintains AR_mid along most of the guard cell
+    with a transition to AR_min only at the tips.
     """
     if AR_mid <= AR_min:
-        return AR_mid # No modulation needed
+        return AR_mid  # No modulation needed
 
-    # Calculate angular distance from the *nearest* major axis point (0 to pi/2)
-    relative_angle = (theta - cl_phi) % (2 * np.pi)
-    dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi)) # 0 at major, pi/2 at minor
+    # Calculate angular distance from nearest major axis point (0 to pi/2)
+    relative_angle = (theta_cl - cl_phi) % (2 * np.pi)
+    dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi))  # 0 at major, pi/2 at minor
 
-    # Use cosine modulation: factor is 1 at major axis (dist=0), 0 at minor axis (dist=pi/2)
-    modulation_factor = (np.cos(dist_to_major * 2) + 1) / 2.0
+    # Normalize to 0-1 range (0 at sides, 1 at tips)
+    normalized_dist = dist_to_major / (np.pi/2)
 
-    # Interpolate between AR_mid (at major axis, factor=1) and AR_min (at minor axis, factor=0)
-    # current_AR = AR_min + (AR_mid - AR_min) * modulation_factor # <<< OLD LOGIC (AR_min at major)
-    current_AR = AR_min + (AR_mid - AR_min) * modulation_factor # <<< CORRECTED LOGIC (AR_mid at major)
-    # Let's re-verify the interpolation:
-    # When modulation_factor = 1 (major axis): AR_min + (AR_mid - AR_min) * 1 = AR_mid
-    # When modulation_factor = 0 (minor axis): AR_min + (AR_mid - AR_min) * 0 = AR_min
-    # This seems correct now.
+    # EXPLICIT CONTROL: Define exact threshold where transition begins
+    # --- INCREASE FLAT ZONE SIGNIFICANTLY ---
+    flat_zone = 0.6  # Stay at AR_mid for 95% of the distance from side to tip
+                      # Adjust this value (0.9 - 0.98)
+
+    if normalized_dist <= flat_zone:
+        # Within the flat zone - maintain AR_mid exactly
+        modulation = 0.0
+    else:
+        # In the transition zone - smooth curve
+        # Rescale position in transition zone to 0-1
+        transition_pos = (normalized_dist - flat_zone) / (1.0 - flat_zone)
+        # --- USE POWER > 1 FOR SLOWER INITIAL TRANSITION ---
+        # This makes modulation stay near 0 longer within the transition zone
+        modulation = transition_pos ** 4.0 # Try high power (e.g., 2.0, 4.0, 6.0)
+
+    # Calculate final AR
+    current_AR = AR_mid - (AR_mid - AR_min) * modulation
+
+    # Debug output (keep this active)
+    print(f"  theta={np.degrees(theta_cl):.1f}, dist_major={np.degrees(dist_to_major):.1f}, " +
+          f"norm={normalized_dist:.3f}, mod={modulation:.4f}, AR={current_AR:.4f}")
 
     return current_AR
 
@@ -689,7 +705,7 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
 
 def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerline_segments=64,
                                        num_cross_section_points=64, visualize_steps=True,
-                                       min_aspect_ratio=1.1):
+                                       min_aspect_ratio=1.1, transition_power=2.0):
     """
     Generates a SINGLE guard cell with varying cross-section aspect ratio.
     The AR decreases towards the tips while maintaining constant cross-sectional area,
@@ -706,7 +722,7 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
     Returns:
         tuple: (trimesh.Trimesh or None, np.ndarray or None) - The generated mesh and the center point.
     """
-    print(f"\nGenerating SINGLE BULGING guard cell (Min AR={min_aspect_ratio:.2f}) for: {input_file_path}")
+    print(f"\nGenerating SINGLE BULGING guard cell (Min AR={min_aspect_ratio:.2f}, Power={transition_power:.2f}) for: {input_file_path}")
 
     # --- STEP 1: Get Centerline, Inner Points (Same as generate_single_guard_cell) ---
     print("STEP 1: Extracting centerline, inner points...")
@@ -857,12 +873,13 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
         cs_base_angles = np.linspace(0, 2*np.pi, num_cross_section_points, endpoint=False)
         for i, theta_cl in enumerate(half_theta):
             # Calculate modulated AR for this point on the centerline
-            current_AR = get_modulated_AR(theta_cl, cl_phi, AR_mid, min_aspect_ratio)
+            current_AR = get_modulated_AR(theta_cl, cl_phi + np.pi/2, AR_mid, min_aspect_ratio, transition_power)
 
             # Calculate current semi-axes ensuring constant area
-            # area = pi * a * b = pi * (AR * b) * b = pi * AR * b^2
-            # b^2 = area / (pi * AR)
+            # target_area = np.pi * cs_a_mid * cs_b_mid (calculated in Step 2)
+            # b^2 = target_area / (np.pi * current_AR)
             current_cs_b = np.sqrt(target_area / (np.pi * current_AR))
+            # a = AR * b
             current_cs_a = current_AR * current_cs_b
 
             # Create vertices for this specific cross-section
@@ -938,7 +955,13 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
 
             # Transform 2D vertices to 3D
             # cs_x maps to local_x (binormal), cs_y maps to local_y
+            # --- ORIGINAL ---
+            # cs_verts_3d = path_point + cs_verts_2d[:, 0][:, None] * local_x + cs_verts_2d[:, 1][:, None] * local_y
+            # --- SWAPPED ---
+            # Map cs_x (cs_a) to local_y and cs_y (cs_b) to local_x
             cs_verts_3d = path_point + cs_verts_2d[:, 0][:, None] * local_x + cs_verts_2d[:, 1][:, None] * local_y
+            # --- SWAPPED (CAUSES INVERSE EFFECT - COMMENT OUT OR DELETE) ---
+            # cs_verts_3d = path_point + cs_verts_2d[:, 0][:, None] * local_y + cs_verts_2d[:, 1][:, None] * local_x
             all_vertices.append(cs_verts_3d)
 
             # --- Generate Faces connecting this section to the previous one ---
@@ -974,15 +997,24 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
 
         # --- Capping: Project End Vertices and Triangulate (Replaces fill_holes) ---
         print("  Creating planar caps by projecting end vertices...")
+        start_point = half_centerline[0]
+        end_point = half_centerline[-1]
 
         # Get endpoint coordinates and the normal of the capping plane
         # The capping plane should be perpendicular to the centerline's major axis
-        start_point = half_centerline[0]
-        end_point = half_centerline[-1]
-        # Normal vector is parallel to the centerline's major axis direction vector
+        # Normal vector is PERPENDICULAR to the centerline's major axis direction vector
         major_axis_direction = np.array([np.cos(cl_phi), np.sin(cl_phi), 0])
-        cap_plane_normal = major_axis_direction # Normal to the plane is along the major axis
-
+        # cap_plane_normal = major_axis_direction # <<< INCORRECT
+        cap_plane_normal = np.array([-major_axis_direction[1], major_axis_direction[0], 0]) # <<< CORRECT (Perpendicular)
+        # Ensure it's normalized if needed (though projection math handles non-unit normals)
+        norm_mag = np.linalg.norm(cap_plane_normal)
+        if norm_mag > 1e-9:
+            cap_plane_normal /= norm_mag
+        else:
+        # Handle edge case where major axis might be vertical? Unlikely.
+        # Default to a standard normal if calculation fails.
+            print("  Warning: Could not calculate perpendicular cap plane normal reliably. Defaulting.")
+            cap_plane_normal = np.array([0, 1, 0]) # Or choose a suitable default
         # Identify vertices at start and end profiles (indices 0 to num_cs_pts-1 and the last num_cs_pts)
         if len(single_cell.vertices) < 2 * num_cs_pts:
              raise ValueError("Sweep did not generate enough vertices to identify end profiles for capping.")
@@ -1223,7 +1255,7 @@ def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
 # --- Modified Example Usage ---
 if __name__ == '__main__':
     # --- Select ONE file to process ---
-    file_to_process = "Meshes/OBJ/Ac_DA_1_3.obj" # Example file
+    file_to_process = "Meshes/OBJ/myrYFP_38.6_ABA+dark_t120_EDITED_GCS_ONLY_MESH3.obj" # Example file
     base_name = os.path.splitext(os.path.basename(file_to_process))[0]
 
     # Define output paths for BOTH standard and bulging meshes
@@ -1276,7 +1308,8 @@ if __name__ == '__main__':
             num_centerline_segments=128, # Keep consistent resolution
             num_cross_section_points=64,
             visualize_steps=True,
-            min_aspect_ratio=1.1 # Adjust this value as needed (e.g., 1.0 for circular ends)
+            min_aspect_ratio=1.0, # Adjust this value as needed (e.g., 1.0 for circular ends)
+            transition_power=1.0
         )
         print("-" * 20)
 
