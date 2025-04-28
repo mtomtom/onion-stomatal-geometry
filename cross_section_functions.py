@@ -8,6 +8,7 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from scipy.spatial import KDTree
 import trimesh
+from matplotlib.path import Path
 
 def ellipse(theta, a, b, phi):
     """Parameterized equation of an ellipse."""
@@ -1163,3 +1164,196 @@ def _apply_proximity_fallback(centered_points, minor_radius, initial_point_count
     
     print(f"  Proximity fallback finished. Selected {len(selected_points)} points. Filtered: {has_filtered}")
     return selected_points, has_filtered
+
+
+# ... existing functions ...
+
+def load_and_align_mesh(file_path, align_axis='Y'):
+    """Loads a mesh, centers it, and optionally aligns its longest axis using PCA."""
+    try:
+        mesh = trimesh.load_mesh(file_path, process=False)
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.dump(concatenate=True)
+        if not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
+            print(f"  Warning: Invalid mesh data loaded from {file_path}.")
+            return None, np.eye(4)
+
+        vertices = mesh.vertices.copy()
+        center_orig = vertices.mean(axis=0)
+        vertices_centered = vertices - center_orig
+        mesh.vertices = vertices_centered # Start with centered mesh
+
+        final_transform_4x4 = np.eye(4) # Initialize transform
+
+        if align_axis and len(vertices_centered) >= 3:
+            print(f"  Aligning mesh from {file_path}...")
+            try:
+                pca = PCA(n_components=3); pca.fit(vertices_centered)
+                principal_axes = pca.components_; longest_axis = principal_axes[0]
+
+                if np.linalg.norm(longest_axis) < 1e-6:
+                    raise ValueError("PCA longest axis has near-zero length.")
+
+                if align_axis.upper() == 'X': target_axis = np.array([1.0, 0.0, 0.0])
+                elif align_axis.upper() == 'Y': target_axis = np.array([0.0, 1.0, 0.0])
+                elif align_axis.upper() == 'Z': target_axis = np.array([0.0, 0.0, 1.0])
+                else: raise ValueError(f"Invalid align_axis: {align_axis}")
+
+                transform_matrix = trimesh.geometry.align_vectors(longest_axis, target_axis)
+
+                rotation_3x3 = np.eye(3)
+                if transform_matrix is None: raise ValueError("align_vectors returned None.")
+                elif transform_matrix.shape == (3, 3): rotation_3x3 = transform_matrix
+                elif transform_matrix.shape == (4, 4): rotation_3x3 = transform_matrix[:3, :3]
+                else: raise ValueError(f"align_vectors returned unexpected shape: {transform_matrix.shape}")
+
+                final_transform_4x4[:3, :3] = rotation_3x3
+                vertices_aligned = trimesh.transform_points(vertices_centered, final_transform_4x4)
+                mesh.vertices = vertices_aligned # Update mesh vertices
+                print(f"  Mesh aligned. Longest axis ({longest_axis.round(3)}) aligned to {align_axis.upper()}.")
+
+            except Exception as pca_err:
+                print(f"  Warning: PCA alignment failed: {pca_err}. Using centered mesh.")
+                # mesh.vertices remains centered
+                final_transform_4x4 = np.eye(4) # Reset transform
+        elif align_axis:
+             print("  Warning: Not enough vertices for PCA alignment. Using centered mesh.")
+
+        return mesh, final_transform_4x4
+
+    except Exception as e:
+        print(f"  Error loading/aligning mesh {file_path}: {e}")
+        return None, np.eye(4)
+    
+def get_radial_dimensions(mesh, center=None, ray_count=36):
+    """Performs radial ray casting from the center to find inner/outer points."""
+    if center is None:
+        center = mesh.centroid
+
+    ray_angles = np.linspace(0, 2*np.pi, ray_count, endpoint=False)
+    inner_points = []
+    outer_points = []
+
+    for angle in ray_angles:
+        direction = np.array([np.cos(angle), np.sin(angle), 0.0])
+        # Ensure origin is a list/array of points
+        origins = np.array([center])
+        directions = np.array([direction])
+        try:
+            locations, _, _ = mesh.ray.intersects_location(origins, directions)
+            if len(locations) >= 2:
+                dists = np.linalg.norm(locations - center, axis=1)
+                sorted_idx = np.argsort(dists)
+                inner_points.append(locations[sorted_idx[0]])
+                outer_points.append(locations[sorted_idx[-1]])
+        except Exception as ray_err:
+             print(f"  Warning: Ray casting error at angle {np.degrees(angle):.1f}: {ray_err}")
+
+
+    if not inner_points or not outer_points:
+        print("  Warning: Ray casting failed to find sufficient inner/outer points.")
+        return None, None, None, None
+
+    inner_points = np.array(inner_points)
+    outer_points = np.array(outer_points)
+    raw_centerline_points = (inner_points + outer_points) / 2.0
+    avg_minor_radius = np.mean(np.linalg.norm(outer_points - inner_points, axis=1)) / 2.0
+
+    print(f"  Ray casting complete. Avg minor radius: {avg_minor_radius:.4f}")
+    return inner_points, outer_points, raw_centerline_points, avg_minor_radius
+
+def fit_centerline_ellipse(raw_centerline_points, center):
+    """Fits an ellipse to the 2D projection of centerline points."""
+    if raw_centerline_points is None or len(raw_centerline_points) < 3 or center is None:
+        return None, None, None # Cannot fit
+
+    xy_centerline = raw_centerline_points[:, :2]
+    center_xy = center[:2]
+    r = np.linalg.norm(xy_centerline - center_xy, axis=1)
+    theta = np.arctan2(xy_centerline[:, 1] - center_xy[1], xy_centerline[:, 0] - center_xy[0])
+
+    # Initial guess based on mean radius
+    major_radius_est = np.mean(r)
+    if major_radius_est <= 1e-6: return None, None, None # Avoid fitting zero radius
+    initial_guess = [major_radius_est, major_radius_est, 0]
+
+    try:
+        params, _ = curve_fit(ellipse, theta, r, p0=initial_guess) # Assumes ellipse function exists
+        cl_a, cl_b, cl_phi = params
+        cl_phi = cl_phi % np.pi # Keep angle in [0, pi)
+
+        # Ensure cl_a is the semi-major axis
+        if cl_a < cl_b:
+            cl_a, cl_b = cl_b, cl_a
+            cl_phi = (cl_phi + np.pi/2) % np.pi
+
+        print(f"  Fitted centerline ellipse: a={cl_a:.3f}, b={cl_b:.3f}, phi={np.degrees(cl_phi):.1f}°")
+        return cl_a, cl_b, cl_phi
+    except Exception as e:
+        print(f"  Error fitting centerline ellipse: {e}")
+        return None, None, None  
+    
+def filter_section_points(points_2D, minor_radius, origin_2d_target, eps_factor=0.20, min_samples=3):
+    """Filters 2D section points using DBSCAN and proximity/containment checks."""
+    if points_2D is None or len(points_2D) < min_samples:
+        return np.empty((0, 2)), np.array([], dtype=bool) # Return empty array and mask
+
+    eps_value = minor_radius * eps_factor
+    try:
+        clustering = DBSCAN(eps=eps_value, min_samples=min_samples).fit(points_2D)
+        labels = clustering.labels_
+    except Exception as db_err:
+         print(f"  Warning: DBSCAN failed: {db_err}")
+         return points_2D, np.ones(len(points_2D), dtype=bool) # Return all points if DBSCAN fails
+
+    unique_labels = np.unique(labels)
+    valid_labels = unique_labels[unique_labels != -1]
+
+    best_label = -1
+    final_mask = np.zeros(len(points_2D), dtype=bool)
+
+    if len(valid_labels) > 0:
+        cluster_distances = {}
+        for label in valid_labels:
+            label_mask = (labels == label)
+            cluster_points_2d = points_2D[label_mask]
+            if len(cluster_points_2d) < min_samples: continue
+            distances = np.linalg.norm(cluster_points_2d - origin_2d_target, axis=1)
+            avg_distance = np.mean(distances)
+            cluster_distances[label] = avg_distance
+
+        if not cluster_distances: # No valid clusters after size check
+             print("  No substantial clusters found after DBSCAN.")
+             return np.empty((0, 2)), final_mask
+
+        sorted_labels = sorted(cluster_distances, key=cluster_distances.get)
+
+        for label in sorted_labels:
+            label_mask = (labels == label)
+            cluster_points_2d = points_2D[label_mask]
+
+            # Point-in-Polygon Check (Optional but good)
+            origin_is_inside = False
+            try:
+                ordered_cluster_pts = order_points(cluster_points_2d, method="angular") # Assumes order_points exists
+                path = Path(ordered_cluster_pts)
+                if path.contains_point(origin_2d_target):
+                    origin_is_inside = True
+                    print(f"  Cluster {label}: Origin is INSIDE polygon. Selecting.")
+                else:
+                    print(f"  Cluster {label}: Origin is OUTSIDE polygon. Skipping.")
+            except Exception as path_err:
+                print(f"  Warning: Point-in-polygon check failed for cluster {label}: {path_err}. Selecting based on distance.")
+                origin_is_inside = True # Select if check fails
+
+            if origin_is_inside:
+                best_label = label
+                final_mask = (labels == best_label)
+                break # Found suitable cluster
+
+        if best_label == -1:
+            print("  No suitable cluster found after distance and containment checks.")
+    else:
+        print("  No valid clusters found via DBSCAN.")
+
+    return points_2D[final_mask], final_mask
