@@ -1,267 +1,352 @@
 import os
 import numpy as np
 import trimesh
+from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN
-from sklearn.decomposition import PCA # Import PCA
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-# --- Import make_subplots ---
-from plotly.subplots import make_subplots
 import cross_section_functions as csf
-from matplotlib.colors import LightSource # Import LightSource
+from matplotlib.colors import LightSource
+# --- Added import ---
+from matplotlib.path import Path
 
-# --- analyze_midpoint_cross_section function ---
-def analyze_midpoint_cross_section(file_paths, output_dir=None, visualize=False):
+
+def analyze_cross_section(file_paths,
+                          section_location='midpoint',
+                          output_dir=None,
+                          visualize=False):
     """
-    Analyzes multiple OBJ files to extract the cross-section at the midpoint.
-    Calculates the aspect ratio of the 2D cross-section.
+    Analyzes multiple OBJ files to extract the cross-section at a specified location.
+    Aligns mesh using PCA before analysis. Calculates aspect ratio of the 2D cross-section.
     Generates individual 2D PNG and 3D HTML visualizations if visualize=True.
-
-    Args:
-        file_paths (list): A list of strings, each a path to an .obj file.
-        output_dir (str, optional): Directory to save visualizations. Defaults to None.
-        visualize (bool, optional): Whether to generate plots and scenes. Defaults to False.
-
-    Returns:
-        dict: A dictionary where keys are file paths and values are tuples
-              (points_2d, points_3d, transform, aspect_ratio, pca_minor_std_dev)
-              for the midpoint cross-section, or None if analysis failed.
-              - points_2d: Filtered 2D points of the cross-section.
-              - points_3d: Corresponding original 3D points.
-              - transform: 3D to 2D transformation matrix.
-              - aspect_ratio: Calculated aspect ratio (long axis / short axis).
-              - pca_minor_std_dev: Standard deviation along the minor PCA axis (use as cs_b).
     """
     results = {}
+    print(f"\n--- Starting Cross-Section Analysis (Location: {section_location.upper()}) ---")
 
+    # Prepare output directory for visualizations
     if visualize and output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        location_output_dir = os.path.join(output_dir, section_location)
+        os.makedirs(location_output_dir, exist_ok=True)
+    else:
+        location_output_dir = output_dir
 
     for file_path in file_paths:
-        print(f"\nProcessing file: {file_path}")
+        print(f"\nProcessing file: {file_path} for {section_location} section")
         aspect_ratio = None
-        pca_minor_std_dev = None # Initialize width measure
-        try:
-            # --- Analysis Steps 1-4 (Load, Dimensions, Midpoint, Section) ---
-            # ... (Keep existing code for steps 1-4) ...
-            # 1. Load Mesh and Find Center
-            mesh = trimesh.load_mesh(file_path)
-            center = mesh.centroid
-            # 2. Determine Dimensions (Ray Casting)
-            ray_count = 36
-            ray_angles = np.linspace(0, 2*np.pi, ray_count, endpoint=False)
-            inner_points = []
-            outer_points = []
-            for angle in ray_angles:
-                direction = np.array([np.cos(angle), np.sin(angle), 0.0])
-                locations, _, _ = mesh.ray.intersects_location([center], [direction])
-                if len(locations) >= 2:
-                    dists = np.linalg.norm(locations - center, axis=1)
-                    sorted_idx = np.argsort(dists)
-                    inner_points.append(locations[sorted_idx[0]])
-                    outer_points.append(locations[sorted_idx[-1]])
-            if not inner_points or not outer_points:
-                 print("  Error: Could not determine dimensions via ray casting.")
-                 results[file_path] = None
-                 continue
-            inner_points = np.array(inner_points)
-            outer_points = np.array(outer_points)
-            minor_radius = np.mean(np.linalg.norm(outer_points - inner_points, axis=1)) / 2
-            # 3. Estimate Midpoint and Tangent
-            zero_angle_indices = np.where(np.abs(ray_angles) < np.pi/ray_count)[0]
-            if len(zero_angle_indices) > 0 and len(inner_points) > 0 and len(outer_points) > 0:
-                 mid_inner = np.mean(inner_points[zero_angle_indices], axis=0)
-                 mid_outer = np.mean(outer_points[zero_angle_indices], axis=0)
-                 midpoint = (mid_inner + mid_outer) / 2
-            else:
-                 major_radius_est = np.mean(np.linalg.norm(inner_points[:,:2] - center[:2], axis=1)) + minor_radius if len(inner_points) > 0 else minor_radius * 2
-                 midpoint = center + np.array([major_radius_est, 0, 0])
-            tangent = np.array([0.0, 1.0, 0.0])
-            # 4. Take Cross-Section
-            section = mesh.section(plane_origin=midpoint, plane_normal=tangent)
-            original_section_points_3d = section.vertices.copy() if section is not None else None
-            if section is None or len(section.entities) == 0:
-                print("  Midpoint section failed or is empty.")
-                results[file_path] = None
-                continue
+        pca_minor_std_dev = None
+        plane_origin = None
+        tangent = None
+        mesh, tranform_4x4 = csf.load_and_align_mesh(file_path, align_axis = 'Y')
 
-            # 5. Process and Filter Section
-            path_2D, transform = section.to_2D()
-            points_2D = path_2D.vertices
-            midpoint_h = np.append(midpoint, 1)
-            midpoint_transformed_h = transform @ midpoint_h
-            midpoint_2d_target = midpoint_transformed_h[:2]
-            # eps_value = minor_radius * 0.3 # Original
-            eps_value = minor_radius * 0.15 # Adjusted value
-            clustering = DBSCAN(eps=eps_value, min_samples=3).fit(points_2D)
-            labels = clustering.labels_
-            unique_labels = np.unique(labels)
-            valid_labels = unique_labels[unique_labels != -1]
-            final_points_2D = np.empty((0, 2))
-            final_original_points_3D = np.empty((0, 3))
-            best_label = -1
-            # ... (DBSCAN filtering logic remains the same) ...
-            if len(valid_labels) > 1:
-                min_avg_dist = float('inf')
-                for label in valid_labels:
-                    label_mask = (labels == label)
-                    cluster_points_2d = points_2D[label_mask]
-                    if len(cluster_points_2d) < 3: continue
-                    distances = np.linalg.norm(cluster_points_2d - midpoint_2d_target, axis=1)
-                    avg_distance = np.mean(distances)
-                    if avg_distance < min_avg_dist:
-                        min_avg_dist = avg_distance
-                        best_label = label
-                if best_label != -1:
-                     final_mask = (labels == best_label)
-                     final_points_2D = points_2D[final_mask]
-                     if original_section_points_3d is not None and len(original_section_points_3d) == len(points_2D):
-                         final_original_points_3D = original_section_points_3d[final_mask]
-                     else: final_original_points_3D = np.empty((0, 3))
-            elif len(valid_labels) == 1:
-                best_label = valid_labels[0]
-                final_mask = (labels == best_label)
-                final_points_2D = points_2D[final_mask]
-                if original_section_points_3d is not None and len(original_section_points_3d) == len(points_2D):
-                    final_original_points_3D = original_section_points_3d[final_mask]
-                else: final_original_points_3D = np.empty((0, 3))
-            else:
-                print("  No valid clusters found in midpoint section.")
+        if mesh is None:
+            print(f"  Skipping file {file_path} due to loading/alignment error.")
+            results[file_path] = None
+            continue
 
+        # --- Step 3: Determine Ray Casting Origin and Dimensions (on ALIGNED mesh) ---
+        ray_origin = np.array([0.0, 0.0, 0.0]) # Default origin (centroid of aligned mesh)
 
-            if len(final_points_2D) != len(final_original_points_3D) and len(final_original_points_3D) > 0:
-                 print(f"  WARNING: Final 2D ({len(final_points_2D)}) and 3D ({len(final_original_points_3D)}) point counts differ.")
+        if section_location == 'midpoint':
+            # --- Find Pore Center for Midpoint Ray Casting ---
+            print("  Finding pore center for midpoint analysis...")
+            try:
+                # Cast rays along +/- X axis from the aligned origin
+                origins_x = [ray_origin, ray_origin]
+                dirs_x = [np.array([1.0, 0.0, 0.0]), np.array([-1.0, 0.0, 0.0])]
+                locations_x, index_ray_x, _ = mesh.ray.intersects_location(origins_x, dirs_x)
 
-            # --- Calculate Aspect Ratio and PCA Minor Axis Std Dev ---
-            if len(final_points_2D) >= 3: # Need at least 3 points for PCA
-                try:
-                    pca = PCA(n_components=2)
-                    pca.fit(final_points_2D)
-                    # Explained variance gives variance along principal axes
-                    # Standard deviation is sqrt of variance
-                    std_devs = np.sqrt(pca.explained_variance_)
-                    # Ensure std_devs[1] is not zero to avoid division error
-                    if std_devs[1] > 1e-6: # Check against a small epsilon
-                        aspect_ratio = std_devs[0] / std_devs[1]
-                        pca_minor_std_dev = std_devs[1] # <<< STORE THE MINOR AXIS STD DEV
-                        print(f"  PCA Results: Aspect Ratio={aspect_ratio:.3f}, Minor Axis StdDev={pca_minor_std_dev:.3f}")
+                if len(locations_x) >= 2:
+                    pts_plus_x = locations_x[index_ray_x == 0]
+                    pts_minus_x = locations_x[index_ray_x == 1]
+
+                    if len(pts_plus_x) > 0 and len(pts_minus_x) > 0:
+                        inner_plus_x = pts_plus_x[np.argmin(np.linalg.norm(pts_plus_x - ray_origin, axis=1))]
+                        inner_minus_x = pts_minus_x[np.argmin(np.linalg.norm(pts_minus_x - ray_origin, axis=1))]
+                        pore_center = (inner_plus_x + inner_minus_x) / 2.0
+                        ray_origin = pore_center # Use this as the origin for radial rays
+                        print(f"  Using estimated pore center as ray origin: {ray_origin.round(3)}")
                     else:
-                        print("  Warning: Short axis standard deviation is near zero. Cannot calculate AR or width.")
-                        aspect_ratio = np.inf # Or None, depending on how you want to handle it
-                        pca_minor_std_dev = 0.0 # Or None
-                except Exception as pca_err:
-                    print(f"  Error calculating PCA results: {pca_err}")
-                    aspect_ratio = None
-                    pca_minor_std_dev = None
-            else:
-                 if len(final_points_2D) > 0:
-                     print("  Not enough points (<3) to calculate aspect ratio.")
-                 aspect_ratio = None
-                 pca_minor_std_dev = None
+                        print("  Warning: Could not find inner points along X-axis. Using aligned origin [0,0,0].")
+                else:
+                    print("  Warning: Ray casting along X-axis failed. Using aligned origin [0,0,0].")
+            except Exception as pore_err:
+                print(f"  Warning: Error finding pore center: {pore_err}. Using aligned origin [0,0,0].")
+            # --- End Finding Pore Center ---
 
+        ## Comment this out to use the above code
+        ray_origin = np.array([0.0, 0.0, 0.0])
 
-            # --- Store results (including pca_minor_std_dev) ---
-            if len(final_points_2D) > 0:
-                print(f"  Successfully extracted midpoint section with {len(final_points_2D)} points.")
-                # <<< Return pca_minor_std_dev instead of minor_radius >>>
-                results[file_path] = (final_points_2D, final_original_points_3D, transform, aspect_ratio, pca_minor_std_dev)
+        # --- Radial Ray Casting ---
+        print(f"  Performing radial ray casting from origin: {ray_origin.round(3)}")
+        ray_count = 36 # Or adjust as needed
+        inner_points, outer_points, raw_centerline_points, minor_radius = csf.get_radial_dimensions(
+            mesh, center=ray_origin, ray_count=ray_count
+        )
 
-                # --- Individual Visualization (Step 6) ---
-                if visualize:
-                    # ... (Keep the existing visualization code here) ...
-                    # (No changes needed in the visualization part itself)
-                    base_name = os.path.splitext(os.path.basename(file_path))[0]
-                    # --- Create and Save Individual 2D Plot ---
-                    fig_2d, ax2d = plt.subplots(figsize=(6, 6))
-                    ax2d.set_title(f'2D Midpoint Cross-Section\n{base_name}')
-                    ax2d.set_aspect('equal')
-                    ax2d.grid(True)
-                    ordered_plot_points = csf.order_points(final_points_2D, method="angular")
-                    ax2d.plot(np.append(ordered_plot_points[:, 0], ordered_plot_points[0, 0]), np.append(ordered_plot_points[:, 1], ordered_plot_points[0, 1]), 'b-', linewidth=1.5)
-                    ax2d.plot(ordered_plot_points[:, 0], ordered_plot_points[:, 1], 'b.', markersize=4)
-                    ax2d.plot(midpoint_2d_target[0], midpoint_2d_target[1], 'ro', markersize=6, label='Target Center (2D)')
-                    # Add aspect ratio to 2D plot title if calculated
-                    title_str = f'2D Midpoint Cross-Section\n{base_name}'
-                    if aspect_ratio is not None and np.isfinite(aspect_ratio):
-                        title_str += f'\nAR: {aspect_ratio:.3f}'
-                    if pca_minor_std_dev is not None:
-                         title_str += f', Width(b): {pca_minor_std_dev:.3f}' # Add width info
-                    ax2d.set_title(title_str)
-                    ax2d.legend()
-                    plt.tight_layout()
-                    if output_dir:
-                        save_path_2d = os.path.join(output_dir, f'{base_name}_midpoint_section_2D.png')
-                        plt.savefig(save_path_2d, dpi=150)
-                        print(f"  Saved 2D visualization to {save_path_2d}")
-                    plt.close(fig_2d)
-                    # --- Create and Save Individual 3D Plotly Scene ---
-                    plotly_traces = []
-                    vertices = mesh.vertices
-                    faces = mesh.faces
-                    mesh_trace = go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=faces[:, 0], j=faces[:, 1], k=faces[:, 2], opacity=0.5, color='green', name='Mesh')
-                    plotly_traces.append(mesh_trace)
-                    midpoint_trace = go.Scatter3d(x=[midpoint[0]], y=[midpoint[1]], z=[midpoint[2]], mode='markers', marker=dict(size=5, color='red'), name='Est. Midpoint')
-                    plotly_traces.append(midpoint_trace)
-                    if len(final_original_points_3D) > 0:
-                        center_2d_final = np.mean(final_points_2D, axis=0)
-                        centered_2d_final = final_points_2D - center_2d_final
-                        angles_final = np.arctan2(centered_2d_final[:, 1], centered_2d_final[:, 0])
-                        sorted_indices_final = np.argsort(angles_final)
-                        ordered_points_3d = final_original_points_3D[sorted_indices_final]
-                        closed_points_3d = np.vstack([ordered_points_3d, ordered_points_3d[0]])
-                        section_line_trace = go.Scatter3d(x=closed_points_3d[:, 0], y=closed_points_3d[:, 1], z=closed_points_3d[:, 2], mode='lines', line=dict(color='blue', width=5), name='Section Outline')
-                        plotly_traces.append(section_line_trace)
-                        section_points_trace = go.Scatter3d(x=final_original_points_3D[:, 0], y=final_original_points_3D[:, 1], z=final_original_points_3D[:, 2], mode='markers', marker=dict(size=3, color='blue'), name='Section Points', showlegend=False)
-                        plotly_traces.append(section_points_trace)
-                    plane_size = minor_radius * 1.5
-                    v1 = np.cross(tangent, np.array([0, 0, 1]) if not np.allclose(tangent, [0,0,1]) else np.array([0,1,0]))
-                    v1 /= np.linalg.norm(v1)
-                    v2 = np.cross(tangent, v1)
-                    v2 /= np.linalg.norm(v2)
-                    xx, yy = np.meshgrid(np.linspace(-plane_size, plane_size, 5), np.linspace(-plane_size, plane_size, 5))
-                    plane_points_x = midpoint[0] + v1[0] * xx + v2[0] * yy
-                    plane_points_y = midpoint[1] + v1[1] * xx + v2[1] * yy
-                    plane_points_z = midpoint[2] + v1[2] * xx + v2[2] * yy
-                    plane_trace = go.Surface(x=plane_points_x, y=plane_points_y, z=plane_points_z, colorscale=[[0, 'rgba(255,0,255,0.5)'], [1, 'rgba(255,0,255,0.5)']], showscale=False, opacity=0.5, name='Section Plane')
-                    plotly_traces.append(plane_trace)
-                    fig_3d = go.Figure(data=plotly_traces)
-                    fig_3d.update_layout(title=f'3D Visualization - Midpoint Section<br>{base_name}', scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=40))
-                    if output_dir:
-                         save_path_3d_html = os.path.join(output_dir, f'{base_name}_midpoint_scene.html')
-                         try: fig_3d.write_html(save_path_3d_html); print(f"  Saved 3D HTML scene to {save_path_3d_html}")
-                         except Exception as export_err: print(f"  Failed to export 3D HTML scene: {export_err}")
+        # --- Add Debug Print Here ---
+        print(f"  DEBUG RayCast Results: inner={len(inner_points) if inner_points is not None else 'None'}, outer={len(outer_points) if outer_points is not None else 'None'}, cl_raw={len(raw_centerline_points) if raw_centerline_points is not None else 'None'}, minor_rad={minor_radius}")
+        # --- End Debug Print ---
 
-            else: # If len(final_points_2D) == 0 and aspect_ratio is None
-                if aspect_ratio is None and len(points_2D) > 0: # Check if filtering failed but section existed
-                     print("  Midpoint section valid but resulted in 0 points after filtering.")
-                # Store None if no valid points were found
+        # Check if ray casting was successful
+        if inner_points is None or outer_points is None or raw_centerline_points is None or minor_radius is None:
+                print("  Error: Could not determine dimensions via radial ray casting (get_radial_dimensions failed).")
                 results[file_path] = None
+                continue # Skip to the next file
 
+        print(f"  Estimated Minor Radius (aligned): {minor_radius:.3f}")
+        # --- End Ray Casting ---
 
-        except Exception as e:
-            print(f"  Error processing {file_path}: {e}")
-            import traceback
-            traceback.print_exc()
+        # --- Step 4: Estimate Plane Origin and Normal (Tangent) on ALIGNED centerline ---
+        print(f"  DEBUG Check Centerline Calc: inner_len={len(inner_points)}, outer_len={len(outer_points)}")
+        # --- End Debug Print ---
+        if len(inner_points) > 0 and len(outer_points) > 0 and len(inner_points) == len(outer_points):
+                raw_centerline_points = (inner_points + outer_points) / 2; num_cl_points = len(raw_centerline_points)
+        else:
+                print("  Error: Cannot calculate centerline from ray casting results."); results[file_path] = None; continue
+
+        if section_location == 'midpoint':
+            # Find point on centerline closest to the ray_origin used
+            mid_idx = np.argmin(np.linalg.norm(raw_centerline_points - ray_origin, axis=1))
+            plane_origin = raw_centerline_points[mid_idx]
+            # Calculate tangent at midpoint
+            prev_idx = (mid_idx - 1 + num_cl_points) % num_cl_points; next_idx = (mid_idx + 1) % num_cl_points
+            tangent_vec = raw_centerline_points[next_idx] - raw_centerline_points[prev_idx]
+            tangent_norm = np.linalg.norm(tangent_vec)
+            if tangent_norm > 1e-6: tangent = tangent_vec / tangent_norm
+            else: tangent = np.array([0.0, 1.0, 0.0]) # Fallback
+            print(f"  Calculated Midpoint Plane Origin (aligned): {plane_origin.round(3)}")
+            print(f"  Using Midpoint Tangent (aligned): {tangent.round(3)}")
+
+        elif section_location == 'tip':
+            # --- MODIFIED TIP LOGIC ---
+            # Find the vertex index with the minimum Y coordinate on the aligned mesh
+            min_y_vertex_idx = np.argmin(mesh.vertices[:, 1])
+            min_y_vertex = mesh.vertices[min_y_vertex_idx]
+            print(f"  Found mesh vertex with min Y (pole estimate): {min_y_vertex.round(3)}")
+
+            # Find the index of the centerline point closest to this minimum Y vertex
+            distances_to_min_y_vertex = np.linalg.norm(raw_centerline_points - min_y_vertex, axis=1)
+            initial_tip_cl_idx = np.argmin(distances_to_min_y_vertex)
+            print(f"  Initial centerline point index {initial_tip_cl_idx} (closest to min Y vertex).")
+
+            # --- Offset by stepping along centerline points ---
+            num_steps_inward = 0 # Define how many points to step inwards (ADJUST AS NEEDED)
+
+            # Determine the 'inward' direction (usually towards larger Y)
+            prev_idx_initial = (initial_tip_cl_idx - 1 + num_cl_points) % num_cl_points
+            next_idx_initial = (initial_tip_cl_idx + 1) % num_cl_points
+            step_direction = 0
+            if raw_centerline_points[next_idx_initial][1] > raw_centerline_points[prev_idx_initial][1]:
+                step_direction = 1 # next_idx is inwards
+            elif raw_centerline_points[prev_idx_initial][1] > raw_centerline_points[next_idx_initial][1]:
+                step_direction = -1 # prev_idx is inwards
+            else:
+                # If Y is the same, default to stepping based on index order (arbitrary but consistent)
+                step_direction = 1
+
+            if step_direction == 0:
+                print("  Warning: Could not determine inward direction reliably. Using initial tip index.")
+                new_tip_cl_idx = initial_tip_cl_idx
+            else:
+                # Calculate the new index by stepping
+                new_tip_cl_idx = (initial_tip_cl_idx + num_steps_inward * step_direction + num_cl_points) % num_cl_points
+                print(f"  Stepped {num_steps_inward} points inward to index {new_tip_cl_idx}.")
+
+            # Use the new index for plane origin
+            plane_origin = raw_centerline_points[new_tip_cl_idx]
+
+            # Calculate Tangent at the NEW centerline index
+            prev_idx_new = (new_tip_cl_idx - 1 + num_cl_points) % num_cl_points
+            next_idx_new = (new_tip_cl_idx + 1) % num_cl_points
+            tangent_vec = raw_centerline_points[next_idx_new] - raw_centerline_points[prev_idx_new]
+            tangent_norm = np.linalg.norm(tangent_vec)
+
+            # --- Add Debug Prints Here ---
+            print(f"  DEBUG Tip Tangent: Index={new_tip_cl_idx}, Vec={tangent_vec.round(5)}, Norm={tangent_norm:.6e}")
+            # --- End Debug Prints ---
+
+            if tangent_norm > 1e-6:
+                tangent = tangent_vec / tangent_norm # This is the plane normal
+                print(f"  Using Plane Origin at CL Index {new_tip_cl_idx} (aligned): {plane_origin.round(3)}")
+                print(f"  Using Tangent calculated at CL Index {new_tip_cl_idx} (aligned): {tangent.round(3)}")
+            else:
+                # --- Add Debug Print Here ---
+                print(f"  DEBUG Tip Tangent: *** Using Fallback Tangent because Norm <= 1e-6 ***")
+                # --- End Debug Print ---
+                print(f"  Error: Could not calculate valid tangent at new tip CL index {new_tip_cl_idx} (zero norm). Using fallback.")
+                # Fallback: Use the origin but a default tangent
+                tangent = np.array([0.0, 1.0, 0.0])
+                print(f"  Using Plane Origin at CL Index {new_tip_cl_idx} (aligned): {plane_origin.round(3)}")
+                print(f"  Using Fallback Tangent: {tangent.round(3)}")
+            # --- END MODIFIED TIP LOGIC ---
+        else:
+            print(f"  Error: Unknown section_location '{section_location}'."); results[file_path] = None; continue
+
+        # --- Step 5: Take Cross-Section (on ALIGNED mesh) ---
+        if plane_origin is None or tangent is None:
+                print("  Error: Plane origin or normal not determined."); results[file_path] = None; continue
+        section = mesh.section(plane_origin=plane_origin, plane_normal=tangent)
+        # Store the original 3D points of the section *before* filtering
+        original_section_points_3d = section.vertices.copy() if section is not None else None
+        if section is None or len(section.entities) == 0:
+            print(f"  {section_location.capitalize()} section failed or is empty."); results[file_path] = None; continue
+
+        # --- Step 6: Process and Filter Section (DBSCAN, PCA on 2D section) ---
+        path_2D, transform_2d_to_3d = section.to_2D() # Get 2D path and the transform matrix
+        points_2D = path_2D.vertices
+
+        # Check if the number of original 3D points matches the number of 2D points
+        if original_section_points_3d is None or len(original_section_points_3d) != len(points_2D):
+            print(f"  Warning: Mismatch between original 3D section points ({len(original_section_points_3d) if original_section_points_3d is not None else 'None'}) and 2D points ({len(points_2D)}). Cannot reliably map back.")
+            original_section_points_3d = None # Invalidate if mismatch
+
+        # Transform 3D plane origin to 2D for distance/containment checks
+        try:
+            transform_3d_to_2d = np.linalg.inv(transform_2d_to_3d)
+        except np.linalg.LinAlgError:
+            print("  Error: Cannot invert section transformation matrix. Skipping containment check.")
+            transform_3d_to_2d = None
+
+        plane_origin_2d_target = None
+        if transform_3d_to_2d is not None:
+            plane_origin_h = np.append(plane_origin, 1) # Homogeneous coordinates
+            plane_origin_transformed_h = transform_3d_to_2d @ plane_origin_h
+            plane_origin_2d_target = plane_origin_transformed_h[:2] # Target point in 2D space
+            print(f"  Plane origin projected to 2D: {plane_origin_2d_target.round(3)}")
+        else:
+            print("  Cannot project plane origin to 2D. Filtering based on distance only.")
+            plane_origin_2d_target = np.mean(points_2D, axis=0) if len(points_2D) > 0 else np.array([0.0, 0.0])
+
+        # --- DBSCAN Clustering ---
+        eps_factor = 0.15 if section_location == 'midpoint' else 0.20
+        min_samples = 3
+        final_points_2D, final_mask = csf.filter_section_points(
+            points_2D,
+            minor_radius,
+            plane_origin_2d_target,
+            eps_factor=eps_factor,
+            min_samples=min_samples
+        )
+
+        # Map back to 3D points (ALIGNED space) using the mask
+        final_original_points_3D = np.empty((0, 3))
+        if original_section_points_3d is not None and len(final_mask) == len(original_section_points_3d):
+            final_original_points_3D = original_section_points_3d[final_mask]
+        elif len(final_points_2D) > 0:
+            # This condition might occur if original_section_points_3d was invalidated earlier
+            # or if the mask length somehow doesn't match (shouldn't happen with current logic)
+            print(f"  Warning: Could not map filtered 2D points back to 3D points.")
+
+        # --- End Filtering ---
+
+        # --- Step 7: Calculate Aspect Ratio and PCA Minor Axis Std Dev ---
+        if len(final_points_2D) >= 3:
+            try:
+                pca = PCA(n_components=2); pca.fit(final_points_2D)
+                std_devs = np.sqrt(pca.explained_variance_)
+                if std_devs[1] > 1e-6:
+                    aspect_ratio = std_devs[0] / std_devs[1]; pca_minor_std_dev = std_devs[1]
+                    print(f"  PCA Results ({section_location}): AR={aspect_ratio:.3f}, Width(b)={pca_minor_std_dev:.3f}")
+                else:
+                    print(f"  Warning ({section_location}): Minor axis std dev near zero."); aspect_ratio = np.inf; pca_minor_std_dev = 0.0
+            except Exception as pca_err:
+                print(f"  Error calculating PCA results ({section_location}): {pca_err}"); aspect_ratio = None; pca_minor_std_dev = None
+        else:
+                if len(final_points_2D) > 0: print(f"  Not enough points (<3) for PCA in {section_location} section.")
+                aspect_ratio = None; pca_minor_std_dev = None
+
+        # --- Step 8: Store results ---
+        if len(final_points_2D) > 0 and len(final_original_points_3D) > 0:
+            print(f"  Successfully extracted {section_location} section with {len(final_points_2D)} points.")
+            # Store the 2D points, the 3D points *in the aligned space*, the 2D->3D transform, AR, and width
+            results[file_path] = (final_points_2D, final_original_points_3D, transform_2d_to_3d, aspect_ratio, pca_minor_std_dev)
+        else:
+            if aspect_ratio is None and len(points_2D) > 0: print(f"  {section_location.capitalize()} section valid but resulted in 0 points after filtering or 3D mapping failed.")
             results[file_path] = None
 
+        # --- Step 9: Individual Visualization ---
+        if visualize and location_output_dir and results[file_path] is not None:
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            # --- Create and Save Individual 2D Plot ---
+            fig_2d, ax2d = plt.subplots(figsize=(6, 6))
+            title_prefix = f'2D {section_location.capitalize()} Cross-Section'
+            ax2d.set_aspect('equal'); ax2d.grid(True)
+            ordered_plot_points = csf.order_points(final_points_2D, method="angular")
+            ax2d.plot(np.append(ordered_plot_points[:, 0], ordered_plot_points[0, 0]), np.append(ordered_plot_points[:, 1], ordered_plot_points[0, 1]), 'b-', linewidth=1.5)
+            ax2d.plot(ordered_plot_points[:, 0], ordered_plot_points[:, 1], 'b.', markersize=4)
+            if plane_origin_2d_target is not None:
+                ax2d.plot(plane_origin_2d_target[0], plane_origin_2d_target[1], 'ro', markersize=6, label=f'Target Center ({section_location}, 2D)')
+            title_str = f'{title_prefix}\n{base_name}'
+            if aspect_ratio is not None and np.isfinite(aspect_ratio): title_str += f'\nAR: {aspect_ratio:.3f}'
+            if pca_minor_std_dev is not None: title_str += f', Width(b): {pca_minor_std_dev:.3f}'
+            ax2d.set_title(title_str); ax2d.legend()
+            plt.tight_layout()
+            save_path_2d = os.path.join(location_output_dir, f'{base_name}_{section_location}_section_2D.png')
+            plt.savefig(save_path_2d, dpi=150); print(f"  Saved 2D visualization to {save_path_2d}"); plt.close(fig_2d)
+
+            # --- Create and Save Individual 3D Plotly Scene (Aligned) ---
+            plotly_traces = []
+            vertices_vis = mesh.vertices; faces_vis = mesh.faces
+            mesh_trace = go.Mesh3d(x=vertices_vis[:, 0], y=vertices_vis[:, 1], z=vertices_vis[:, 2], i=faces_vis[:, 0], j=faces_vis[:, 1], k=faces_vis[:, 2], opacity=0.5, color='lightgrey', name='Aligned Mesh')
+            plotly_traces.append(mesh_trace)
+
+            origin_trace = go.Scatter3d(x=[plane_origin[0]], y=[plane_origin[1]], z=[plane_origin[2]], mode='markers', marker=dict(size=5, color='red'), name=f'{section_location.capitalize()} Origin (Aligned)')
+            plotly_traces.append(origin_trace)
+
+            # Plot the Ray Casting Origin ---
+            ray_origin_trace = go.Scatter3d(x=[ray_origin[0]], y=[ray_origin[1]], z=[ray_origin[2]], mode='markers', marker=dict(size=5, color='green', symbol='cross'), name='Ray Casting Origin')
+            plotly_traces.append(ray_origin_trace)
+
+            # Use final_original_points_3D for plotting the section in 3D
+            if len(final_original_points_3D) > 0:
+                # Order points for line plot (using 2D angles for consistency)
+                center_2d_final = np.mean(final_points_2D, axis=0); centered_2d_final = final_points_2D - center_2d_final
+                angles_final = np.arctan2(centered_2d_final[:, 1], centered_2d_final[:, 0]); sorted_indices_final = np.argsort(angles_final)
+                ordered_points_3d_aligned = final_original_points_3D[sorted_indices_final]
+                closed_points_3d_aligned = np.vstack([ordered_points_3d_aligned, ordered_points_3d_aligned[0]])
+                section_line_trace = go.Scatter3d(x=closed_points_3d_aligned[:, 0], y=closed_points_3d_aligned[:, 1], z=closed_points_3d_aligned[:, 2], mode='lines', line=dict(color='blue', width=5), name='Section Outline (Aligned)')
+                plotly_traces.append(section_line_trace)
+                section_points_trace = go.Scatter3d(x=final_original_points_3D[:, 0], y=final_original_points_3D[:, 1], z=final_original_points_3D[:, 2], mode='markers', marker=dict(size=3, color='blue'), name='Section Points (Aligned)', showlegend=False)
+                plotly_traces.append(section_points_trace)
+            # Section Plane Visualization
+            plane_size = minor_radius * 1.5
+            if np.abs(np.dot(tangent, np.array([0,0,1]))) < 0.99: v1 = np.cross(tangent, np.array([0, 0, 1]))
+            else: v1 = np.cross(tangent, np.array([0, 1, 0]))
+            v1 /= np.linalg.norm(v1); v2 = np.cross(tangent, v1)
+            xx, yy = np.meshgrid(np.linspace(-plane_size, plane_size, 5), np.linspace(-plane_size, plane_size, 5))
+            plane_points_x = plane_origin[0] + v1[0] * xx + v2[0] * yy; plane_points_y = plane_origin[1] + v1[1] * xx + v2[1] * yy; plane_points_z = plane_origin[2] + v1[2] * xx + v2[2] * yy
+            plane_trace = go.Surface(x=plane_points_x, y=plane_points_y, z=plane_points_z, colorscale=[[0, 'rgba(255,0,255,0.4)'], [1, 'rgba(255,0,255,0.4)']], showscale=False, opacity=0.4, name='Section Plane (Aligned)')
+            plotly_traces.append(plane_trace)
+            # Create Figure
+            fig_3d = go.Figure(data=plotly_traces)
+            fig_3d.update_layout(title=f'3D Visualization (Aligned) - {section_location.capitalize()} Section<br>{base_name}', scene=dict(xaxis_title='X', yaxis_title='Y (Aligned Length)', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=40))
+            save_path_3d_html = os.path.join(location_output_dir, f'{base_name}_{section_location}_scene_aligned.html')
+            try: fig_3d.write_html(save_path_3d_html); print(f"  Saved 3D HTML scene (aligned) to {save_path_3d_html}")
+            except Exception as export_err: print(f"  Failed to export 3D HTML scene: {export_err}")
+
+
+    print(f"--- Finished Cross-Section Analysis (Location: {section_location.upper()}) ---")
     return results
 
-# --- create_combined_midpoint_2d_plot function ---
-# (No changes needed here, it uses the results dictionary)
-def create_combined_midpoint_2d_plot(results_data, output_path):
-    # ... (Keep existing code for combined plot) ...
-    print(f"\nCreating combined 2D overlay plot at: {output_path}")
+def create_combined_2d_plot(results_data, output_path, location_name='Midpoint'):
+    """ Creates a combined 2D overlay plot for a given set of section results. """
+    print(f"\nCreating combined 2D overlay plot ({location_name}) at: {output_path}")
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title('Combined Midpoint Cross-Sections (Centered)')
+    # --- Increase title font size ---
+    ax.set_title(f'Combined {location_name} Cross-Sections (Centered)', fontsize=16)
+
     ax.set_aspect('equal')
     ax.grid(True)
-    ax.set_xlabel("X (centered)")
-    ax.set_ylabel("Y (centered)")
+    # --- Swap axis labels and increase font size ---
+    ax.set_xlabel("Y (centered)", fontsize=12)
+    ax.set_ylabel("X (centered)", fontsize=12)
+
     valid_files = [fp for fp, data in results_data.items() if data is not None and len(data[0]) > 0]
     if not valid_files:
-        print("  No valid midpoint sections found to plot.")
+        print(f"  No valid {location_name} sections found to plot.")
         plt.close(fig)
         return
+
     colors = plt.cm.viridis(np.linspace(0, 1, len(valid_files)))
     max_extent = 0
     for i, file_path in enumerate(valid_files):
@@ -269,74 +354,68 @@ def create_combined_midpoint_2d_plot(results_data, output_path):
         center_pt = np.mean(points_2d, axis=0)
         centered_points = points_2d - center_pt
         ordered_points = csf.order_points(centered_points, method="angular")
-        ax.plot(np.append(ordered_points[:, 0], ordered_points[0, 0]), np.append(ordered_points[:, 1], ordered_points[0, 1]), '-', color=colors[i], linewidth=2, alpha=0.7, label=os.path.basename(file_path))
+        # --- Swap X and Y in plot call ---
+        ax.plot(np.append(ordered_points[:, 1], ordered_points[0, 1]), # Y values first
+                np.append(ordered_points[:, 0], ordered_points[0, 0]), # X values second
+                '-', color=colors[i], linewidth=2, alpha=0.7, label=os.path.basename(file_path))
         max_extent = max(max_extent, np.max(np.abs(ordered_points)))
+
     limit = max_extent * 1.1
-    ax.set_xlim(-limit, limit)
-    ax.set_ylim(-limit, limit)
+    # --- Swap axis limits ---
+    ax.set_xlim(-limit, limit) # Y-axis limits
+    ax.set_ylim(-limit, limit) # X-axis limits
+
+    # --- Increase legend font size ---
     if len(valid_files) <= 10:
-        ax.legend(loc='upper right', fontsize='small')
+        ax.legend(loc='upper right', fontsize=10) # Adjusted font size
     else:
         print("  Legend omitted due to large number of files.")
+
     try:
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
-        print(f"  Successfully saved combined 2D plot.")
+        print(f"  Successfully saved combined 2D plot ({location_name}).")
     except Exception as e:
-        print(f"  Error saving combined 2D plot: {e}")
+        print(f"  Error saving combined 2D plot ({location_name}): {e}")
     finally:
         plt.close(fig)
 
-
 # --- NEW Function to create aspect ratio box plot ---
-def create_aspect_ratio_boxplot(aspect_ratios, output_path):
+def create_data_boxplot(data_values, output_path, data_name='Aspect Ratio', location_name='Midpoint'):
     """
-    Creates a box plot of the calculated aspect ratios, overlaying individual points.
-
-    Args:
-        aspect_ratios (list): A list of valid, finite aspect ratio values.
-        output_path (str): Full path to save the box plot PNG image.
+    Creates a box plot for a list of data values (e.g., aspect ratios, widths).
     """
-    if not aspect_ratios:
-        print("  No valid aspect ratios to create a box plot.")
+    if not data_values:
+        print(f"  No valid {data_name} values ({location_name}) to create a box plot.")
         return
 
-    print(f"\nCreating aspect ratio box plot with points at: {output_path}")
+    print(f"\nCreating {data_name} box plot ({location_name}) at: {output_path}")
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # --- Add jittered scatter plot for individual points ---
-    # Generate x-coordinates with jitter around position 1
-    jitter_strength = 0.08 # Adjust as needed
-    x_jitter = np.random.normal(1, jitter_strength, size=len(aspect_ratios))
+    jitter_strength = 0.08
+    x_jitter = np.random.normal(1, jitter_strength, size=len(data_values))
 
-    # --- Create the box plot ---
-    # showfliers=False can be used if scatter shows all points, but keep True for standard box plot look
-    bp = ax.boxplot(aspect_ratios, vert=True, patch_artist=True, showmeans=False,
-                    positions=[1], # Explicitly set position to 1
-                    widths=0.5,    # Adjust width if needed
-                    showfliers=True, # Keep showing standard outliers
-                    boxprops=dict(facecolor='lightblue', alpha=0.8, zorder=2), # alpha for transparency, zorder=2 to plot over scatter
+    bp = ax.boxplot(data_values, vert=True, patch_artist=True, showmeans=False,
+                    positions=[1], widths=0.5, showfliers=True,
+                    boxprops=dict(facecolor='lightblue', alpha=0.8, zorder=2),
                     medianprops=dict(color='red', linewidth=2, zorder=3),
-                    whiskerprops=dict(zorder=2),
-                    capprops=dict(zorder=2),
-                    flierprops=dict(marker='o', markersize=5, markerfacecolor='orange', markeredgecolor='grey', zorder=2) # Style outliers
+                    whiskerprops=dict(zorder=2), capprops=dict(zorder=2),
+                    flierprops=dict(marker='o', markersize=5, markerfacecolor='orange', markeredgecolor='grey', zorder=2)
                    )
-     # Plot the points
-    ax.scatter(x_jitter, aspect_ratios, alpha=1.0, s=20, color='red', zorder=4, label='Individual Sections') # zorder=1 to plot behind box
-    ax.set_ylabel('Aspect Ratio (Long Axis / Short Axis)')
-    ax.set_title(f'Distribution of Midpoint Aspect Ratios (N={len(aspect_ratios)})')
-    ax.set_xticks([1]) # Set tick position
-    ax.set_xticklabels(['Midpoint Sections']) # Label the tick
+    ax.scatter(x_jitter, data_values, alpha=1.0, s=20, color='red', zorder=4, label='Individual Sections')
+    ax.set_ylabel(data_name)
+    ax.set_title(f'Distribution of {location_name} {data_name} (N={len(data_values)})')
+    ax.set_xticks([1])
+    ax.set_xticklabels([f'{location_name} Sections'])
     ax.grid(axis='y', linestyle='--', alpha=0.7)
-    # Optional: Add legend if desired, though often clear from context
-    # ax.legend()
+    # ax.legend() # Optional
 
     try:
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
-        print(f"  Successfully saved aspect ratio box plot with points.")
+        print(f"  Successfully saved {data_name} box plot ({location_name}).")
     except Exception as e:
-        print(f"  Error saving aspect ratio box plot: {e}")
+        print(f"  Error saving {data_name} box plot ({location_name}): {e}")
     finally:
         plt.close(fig)
 
@@ -511,63 +590,94 @@ if __name__ == "__main__":
         "Meshes/OBJ/Ac_DA_1_8_mesh.obj", "Meshes/OBJ/Ac_DA_1_6.obj"
     ]
 
+    # files_to_process = [
+    #     "Meshes/OBJ/Ac_DA_1_3.obj", "Meshes/OBJ/Ac_DA_1_2.obj", "Meshes/OBJ/Ac_DA_1_5.obj",
+    #     "Meshes/OBJ/Ac_DA_1_4.obj",  "Meshes/OBJ/Ac_DA_3_6.obj",
+    #     "Meshes/OBJ/Ac_DA_3_4.obj",  
+    #      "Meshes/OBJ/Ac_DA_2_7.obj", "Meshes/OBJ/Ac_DA_2_6b.obj",
+    #     "Meshes/OBJ/Ac_DA_2_6a.obj", "Meshes/OBJ/Ac_DA_2_4.obj", "Meshes/OBJ/Ac_DA_2_3.obj",
+    #     "Meshes/OBJ/Ac_DA_1_8_mesh.obj", "Meshes/OBJ/Ac_DA_1_6.obj"
+    # ]
+
     # Check if files exist
     if not all(os.path.exists(f) for f in files_to_process):
          print("Error: One or more specified files do not exist. Please check paths.")
          print("Files expected:", files_to_process)
     else:
-        # Define output directory
-        output_directory = "midpoint_analysis_results"
-        os.makedirs(output_directory, exist_ok=True) # Ensure directory exists
+        # Define base output directory
+        base_output_directory = "cross_section_analysis_results" # Renamed for clarity
+        os.makedirs(base_output_directory, exist_ok=True)
 
-        # --- 1. Run Midpoint Analysis ---
-        # Set visualize=True to generate individual plots during analysis
-        midpoint_data = analyze_midpoint_cross_section(
+        # --- Run Analysis for MIDPOINT ---
+        midpoint_data = analyze_cross_section(
             files_to_process,
-            output_dir=output_directory,
+            section_location='midpoint',
+            output_dir=base_output_directory, # Pass base directory
             visualize=True
         )
 
-        # --- 2. Create Combined 2D Plot ---
-        combined_plot_path = os.path.join(output_directory, "combined_midpoint_overlay_2D.png")
-        create_combined_midpoint_2d_plot(midpoint_data, combined_plot_path)
+        # --- Run Analysis for TIP ---
+        tip_data = analyze_cross_section(
+            files_to_process,
+            section_location='tip',
+            output_dir=base_output_directory, # Pass base directory
+            visualize=True
+        )
 
-        # --- 3. Create Aspect Ratio Box Plot ---
-        # Extract valid aspect ratios from results
-        valid_aspect_ratios = []
-        # --- ALSO EXTRACT WIDTHS FOR A SEPARATE PLOT (Optional) ---
-        valid_widths = []
+        # --- Process and Plot MIDPOINT Results ---
         if midpoint_data:
-            for file_path, data in midpoint_data.items():
-                # Data is tuple: (pts2d, pts3d, transform, aspect_ratio, pca_minor_std_dev)
-                if data and len(data) > 4: # Check length >= 5
-                    ar = data[3]
-                    width = data[4]
-                    if ar is not None and np.isfinite(ar):
-                        valid_aspect_ratios.append(ar)
-                    if width is not None and np.isfinite(width) and width > 1e-9:
-                         valid_widths.append(width)
+            # Combined 2D Plot
+            combined_plot_path_mid = os.path.join(base_output_directory, "combined_midpoint_overlay_2D.png")
+            create_combined_2d_plot(midpoint_data, combined_plot_path_mid, location_name='Midpoint')
 
-        if valid_aspect_ratios:
-            boxplot_path_ar = os.path.join(output_directory, "aspect_ratio_boxplot.png")
-            create_aspect_ratio_boxplot(valid_aspect_ratios, boxplot_path_ar) # Pass only ARs
-        else: print("\nNo valid aspect ratios found.")
+            # Extract ARs and Widths
+            midpoint_ars = []
+            midpoint_widths = []
+            for data in midpoint_data.values():
+                if data and len(data) > 4:
+                    ar, width = data[3], data[4]
+                    if ar is not None and np.isfinite(ar): midpoint_ars.append(ar)
+                    if width is not None and np.isfinite(width) and width > 1e-9: midpoint_widths.append(width)
 
-        # --- Optional: Create Box Plot for Widths ---
-        if valid_widths:
-             boxplot_path_width = os.path.join(output_directory, "pca_width_boxplot.png")
-             # You might need a modified boxplot function or just reuse it
-             # Reusing create_aspect_ratio_boxplot for widths:
-             create_aspect_ratio_boxplot(valid_widths, boxplot_path_width)
-             # Adjust title/labels inside the function if modifying, or accept generic labels
-             print(f"Saved PCA width box plot to {boxplot_path_width}")
-        else: print("\nNo valid PCA widths found.")
-        # --- End Optional Width Plot ---
+            # Box Plots
+            if midpoint_ars:
+                boxplot_path_ar_mid = os.path.join(base_output_directory, "midpoint_aspect_ratio_boxplot.png")
+                create_data_boxplot(midpoint_ars, boxplot_path_ar_mid, data_name='Aspect Ratio', location_name='Midpoint')
+            if midpoint_widths:
+                boxplot_path_width_mid = os.path.join(base_output_directory, "midpoint_pca_width_boxplot.png")
+                create_data_boxplot(midpoint_widths, boxplot_path_width_mid, data_name='PCA Width (b)', location_name='Midpoint')
+        else:
+            print("\nNo valid data generated for midpoint analysis.")
 
 
-        # --- 4. Create Input Mesh Grid Plot ---
-        mesh_grid_path = os.path.join(output_directory, "input_mesh_grid_matplotlib.png") # Change extension
-        # Call the MATPLOTLIB version of the grid plot function
+        # --- Process and Plot TIP Results ---
+        if tip_data:
+            # Combined 2D Plot
+            combined_plot_path_tip = os.path.join(base_output_directory, "combined_tip_overlay_2D.png")
+            create_combined_2d_plot(tip_data, combined_plot_path_tip, location_name='Tip')
+
+            # Extract ARs and Widths
+            tip_ars = []
+            tip_widths = []
+            for data in tip_data.values():
+                if data and len(data) > 4:
+                    ar, width = data[3], data[4]
+                    if ar is not None and np.isfinite(ar): tip_ars.append(ar)
+                    if width is not None and np.isfinite(width) and width > 1e-9: tip_widths.append(width)
+
+            # Box Plots
+            if tip_ars:
+                boxplot_path_ar_tip = os.path.join(base_output_directory, "tip_aspect_ratio_boxplot.png")
+                create_data_boxplot(tip_ars, boxplot_path_ar_tip, data_name='Aspect Ratio', location_name='Tip')
+            if tip_widths:
+                boxplot_path_width_tip = os.path.join(base_output_directory, "tip_pca_width_boxplot.png")
+                create_data_boxplot(tip_widths, boxplot_path_width_tip, data_name='PCA Width (b)', location_name='Tip')
+        else:
+            print("\nNo valid data generated for tip analysis.")
+
+
+        # --- Create Input Mesh Grid Plot (Only needs to be done once) ---
+        mesh_grid_path = os.path.join(base_output_directory, "input_mesh_grid_matplotlib.png")
         create_mesh_grid_plot(files_to_process, mesh_grid_path, rows=3, cols=6)
 
         print("\n--- Analysis and Visualization Complete ---")
