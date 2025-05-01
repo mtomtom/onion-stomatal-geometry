@@ -94,7 +94,7 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
         if pca_minor_std_dev is None:
              raise ValueError("Could not determine cross-section width from midpoint analysis.")
 
-        pca_width_scale_factor = 1.43 # Keep consistent
+        pca_width_scale_factor = 1.36 # Keep consistent
         cs_b_mid = pca_minor_std_dev * pca_width_scale_factor
         cs_a_mid = cs_b_mid * AR_mid
         if cs_a_mid < cs_b_mid: cs_a_mid, cs_b_mid = cs_b_mid, cs_a_mid
@@ -701,6 +701,8 @@ if __name__ == '__main__':
         "Meshes/OBJ/Ac_DA_3_1.obj", "Meshes/OBJ/Ac_DA_2_7.obj", "Meshes/OBJ/Ac_DA_2_6b.obj",
         "Meshes/OBJ/Ac_DA_2_6a.obj", "Meshes/OBJ/Ac_DA_2_4.obj", "Meshes/OBJ/Ac_DA_2_3.obj",
         "Meshes/OBJ/Ac_DA_1_8_mesh.obj", "Meshes/OBJ/Ac_DA_1_6.obj"]
+    
+    mesh_list = ["Meshes/OBJ/Ac_DA_1_5.obj"]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory
