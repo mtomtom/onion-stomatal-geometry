@@ -1,1359 +1,574 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import trimesh
 from scipy.optimize import curve_fit
 from scipy.spatial import ConvexHull
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from scipy.spatial import KDTree
-import trimesh
 from matplotlib.path import Path
 
 def ellipse(theta, a, b, phi):
-    """Parameterized equation of an ellipse."""
-    r = a*b / np.sqrt((b*np.cos(theta-phi))**2 + (a*np.sin(theta-phi))**2)
-    return r
+    """Parameterized equation of an ellipse. Returns zero if degenerate."""
+    if not (a and b and a > 0 and b > 0):
+        return 0.0
+    cos_term = (b * np.cos(theta - phi))**2
+    sin_term = (a * np.sin(theta - phi))**2
+    return (a * b) / np.sqrt(cos_term + sin_term)
+
 
 def get_2d_points(cross_section):
-    """Extract 2D points from a cross-section, handling both tuple and direct formats."""
+    """Extract 2D points from a cross-section, handling (points, transform) tuples."""
     if cross_section is None:
         return None
-    return cross_section[0] if isinstance(cross_section, tuple) else cross_section
+    pts = cross_section[0] if isinstance(cross_section, tuple) and len(cross_section) == 2 else cross_section
+    if pts is None:
+        return None
+    arr = np.asarray(pts)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(f"Expected 2D point array of shape (N,2), got {arr.shape}")
+    return arr
 
 
-def order_points(points, method="nearest", center=None):
+def order_points(points, method="angular", center=None):
     """
-    Order points using specified method.
-    
-    Args:
-        points: numpy array of 2D points
-        method: "nearest" for nearest neighbor, "angular" for sorted by angle
-        center: optional center point for angular method
-        
-    Returns:
-        ordered points array
+    Order points using angular or nearest-neighbor method.
     """
-    if len(points) <= 1:
-        return points
-        
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"order_points expects shape (N,2), got {pts.shape}")
+    if len(pts) < 2:
+        return pts.copy()
+
     if method == "angular":
-        # Center points if using angular method
-        if center is None:
-            center = np.mean(points, axis=0)
-        angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
-        return points[np.argsort(angles)]
-    
-    else:  # Default to nearest-neighbor method
-        ordered_indices = []
-        remaining = set(range(len(points)))
-        
-        # Start with leftmost point
-        current = np.argmin(points[:, 0])
-        ordered_indices.append(current)
-        remaining.remove(current)
-        
-        # Greedily select nearest neighbors
+        cen = np.mean(pts, axis=0) if center is None else np.asarray(center)
+        if cen.shape != (2,):
+            raise ValueError(f"Center must be shape (2,), got {cen.shape}")
+        angles = np.arctan2(pts[:, 1] - cen[1], pts[:, 0] - cen[0])
+        return pts[np.argsort(angles)]
+
+    elif method == "nearest":
+        remaining = pts.tolist()
+        ordered = [min(remaining, key=lambda p: p[0])]
+        remaining.remove(ordered[0])
         while remaining:
-            current_point = points[current]
-            distances = [np.linalg.norm(current_point - points[i]) for i in remaining]
-            next_idx = list(remaining)[np.argmin(distances)]
-            ordered_indices.append(next_idx)
-            current = next_idx
-            remaining.remove(current)
-            
-        return points[ordered_indices]
+            dists = [np.hypot(p[0] - ordered[-1][0], p[1] - ordered[-1][1]) for p in remaining]
+            ordered.append(remaining.pop(int(np.argmin(dists))))
+        return np.asarray(ordered)
+
+    else:
+        raise ValueError(f"Unknown ordering method: {method}")
+
 
 def calculate_polygon_area(points):
-    """
-    Calculate the area of a polygon using the shoelace formula.
-    
-    Args:
-        points: ordered array of points forming a polygon
-        
-    Returns:
-        area value
-    """
-    area = 0
-    for i in range(len(points)):
-        x1, y1 = points[i]
-        x2, y2 = points[(i + 1) % len(points)]
-        area += 0.5 * abs(x1*y2 - x2*y1)
-    return area
+    """Calculate polygon area via vectorized shoelace formula."""
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+        return 0.0
+    x, y = pts[:, 0], pts[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
 
 def calculate_convexity(points):
-    """
-    Calculate the convexity of a shape (actual area / convex hull area).
-    
-    Args:
-        points: array of 2D points
-        
-    Returns:
-        convexity value (0-1)
-    """
-    if len(points) < 3:
-        return 1.0
-        
+    """Compute actual area / convex hull area. Returns np.nan if degenerate."""
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+        return np.nan
     try:
-        # Calculate convex hull
-        hull = ConvexHull(points)
-        hull_area = hull.volume  # In 2D, volume is actually area
-        
-        # Order points for area calculation
-        ordered_pts = order_points(points, method="angular")
-        
-        # Calculate actual area
-        actual_area = calculate_polygon_area(ordered_pts)
-        
-        # Calculate convexity
-        return actual_area / hull_area if hull_area > 0 else 1.0
-    except:
-        return 1.0
-    
-# Replace/update the detect_gaps function:
+        hull = ConvexHull(pts)
+        if hull.volume < 1e-12:
+            return np.nan
+        hull_points = pts[hull.vertices]
+        hull_ordered = order_points(hull_points, method="angular")
+        actual = calculate_polygon_area(order_points(pts, method="angular"))
+        convex = calculate_polygon_area(hull_ordered)
+        return actual / convex if convex > 0 else np.nan
+    except Exception:
+        return np.nan
 
-def detect_gaps(points, threshold=2.5):
+
+def detect_gaps(points, threshold=2.5, ordered=True):
     """
-    Detect if there are abnormally large gaps in an ordered sequence of points.
-    
-    Args:
-        points: ordered array of points
-        threshold: multiplier of average gap to consider as large
-        
-    Returns:
-        tuple: (has_big_gap, gap_indices, gap_sizes)
+    Detect large gaps in sequence. Optionally enforce ordering first.
+    Returns (has_gap, indices_before_gap, gap_sizes).
     """
-    if len(points) < 3:
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
         return False, [], []
-        
-    # Calculate distances between consecutive points
-    gaps = []
-    distances = []
-    for i in range(len(points)):
-        pt1 = points[i]
-        pt2 = points[(i + 1) % len(points)]
-        dist = np.linalg.norm(pt2 - pt1)
-        gaps.append((i, dist))
-        distances.append(dist)
-    
-    # Use robust statistics (median absolute deviation)
-    median_dist = np.median(distances)
-    mad = np.median(np.abs(np.array(distances) - median_dist))
-    threshold_dist = median_dist + threshold * mad
-    
-    # Collect all significant gaps
-    gap_indices = []
-    gap_sizes = []
-    for i, dist in gaps:
-        if dist > threshold_dist:
-            gap_indices.append(i)
-            gap_sizes.append(dist)
-    
-    has_big_gap = len(gap_indices) > 0
-    
-    return has_big_gap, gap_indices, gap_sizes
+    if ordered:
+        pts = order_points(pts, method="angular")
 
-def process_cross_section(cross_section):
+    diffs = pts - np.roll(pts, -1, axis=0)
+    dists = np.hypot(diffs[:, 0], diffs[:, 1])
+    median = np.median(dists)
+    mad = np.median(np.abs(dists - median))
+    mad = mad if mad >= 1e-9 else median * 0.1
+    thresh = median + threshold * mad
+
+    idxs, sizes = zip(*[(i, d) for i, d in enumerate(dists) if d > thresh]) if np.any(dists > thresh) else ([], [])
+    return bool(idxs), list(idxs), list(sizes)
+
+
+def process_cross_section(cross_section, ordering_method="angular"):
     """
-    Process a cross-section to ensure points are properly ordered.
-    
-    Args:
-        cross_section: Array of 2D points
-        
-    Returns:
-        tuple or None: (segments, ordered_points) if successful, None otherwise
+    Given raw cross_section data, returns (segments, ordered_points) or None.
     """
+    pts = get_2d_points(cross_section)
+    if pts is None or len(pts) < 2:
+        return None
     try:
-        # Ensure points are in 2D
-        points_2d = get_2d_points(cross_section)
-        ordered_points = order_points(points_2d, method="nearest")
-        
-        # Create segments from consecutive points
-        segments = []
-        for i in range(len(ordered_points)):
-            next_i = (i + 1) % len(ordered_points)  # Wrap around for last point
-            segments.append((ordered_points[i], ordered_points[next_i]))
-        
-        return segments, ordered_points
-    
+        ordered = order_points(pts, method=ordering_method)
+        segs = [(tuple(ordered[i]), tuple(ordered[(i + 1) % len(ordered)])) for i in range(len(ordered))]
+        return segs, ordered
     except Exception as e:
-        print(f"Error processing cross-section: {e}")
+        print(f"Error in process_cross_section: {e}")
         return None
     
     ### Plotting functions
 
 # Replace the existing create_combined_cross_section_figure function with this:
 def create_combined_cross_section_figure(cross_sections, valid_sections, minor_radius, output_dir, closed_stomata=False):
-    """Create a single figure with all cross-sections in a grid layout, using boundary detection for closed stomata."""
-    if output_dir is None or sum(valid_sections) == 0:
+    """
+    Create a grid figure of individual cross-sections.
+    Only sections flagged as valid are plotted, with clear Plot→Section mapping.
+    """
+    # Nothing to do if no valid sections or no output directory
+    if not valid_sections or not any(valid_sections) or output_dir is None:
+        print("Skipping combined cross-section figure: no valid sections or missing output_dir.")
         return
 
-    valid_count = sum(valid_sections)
-    cols = min(5, valid_count)
-    rows = (valid_count + cols - 1) // cols
+    # Gather (section_index, points) for valid sections
+    valid_items = [
+        (i, get_2d_points(cs))
+        for i, (cs, ok) in enumerate(zip(cross_sections, valid_sections))
+        if ok and cs is not None
+    ]
+    if not valid_items:
+        print("Skipping combined cross-section figure: no usable cross-section data.")
+        return
 
-    fig = plt.figure(figsize=(4 * cols, 4 * rows))
-    fig.suptitle('All Cross-Sections Comparison (Boundary Split)', fontsize=16)
+    n = len(valid_items)
+    cols = min(5, n)
+    rows = (n + cols - 1) // cols
 
-    plot_idx = 1
-    valid_indices = [i for i, valid in enumerate(valid_sections) if valid]
+    fig = plt.figure(figsize=(4 * cols, 4 * rows), constrained_layout=True)
+    mapping_labels = []
 
-    # Add section index mapping as text in the figure
-    mapping_text = "Section Mapping: " + ", ".join([f"Plot {j+1}→Sec {i}" for j, i in enumerate(valid_indices)])
-    fig.text(0.5, 0.01, mapping_text, ha='center', fontsize=9)
-
-    for i, (cross_section, valid) in enumerate(zip(cross_sections, valid_sections)):
-        points_2d = get_2d_points(cross_section)
-        if not valid or cross_section is None or len(points_2d) < 5: # Need more points for boundary detection
-            continue
-
-        ax = fig.add_subplot(rows, cols, plot_idx)
-        ax.set_title(f'Plot {plot_idx}: Section {i}')
-        plot_idx += 1
-
-        original_center = np.mean(points_2d, axis=0)
-        centered = points_2d - original_center
-
-        selected_points = centered # Default
-        has_split = False # Flag if boundary split was successful
-
-        # --- Boundary Detection Splitting Logic (for closed_stomata) ---
-        if closed_stomata:
-            print(f"Section {i}: Applying boundary detection split.")
-            points_to_process = centered
-            initial_point_count = len(points_to_process)
-
-        
-            used_fallback = False
-            try:
-                # --- Projected Space Clustering Method ---
-                print(f"  Attempting Projected Space Clustering method...")
-
-                if len(points_to_process) < 10: # Need enough points for PCA and clustering
-                    raise ValueError("Not enough points for Projected Space Clustering.")
-
-                # 1. PCA to find Major Axis (Axis of elongation)
-                pca = PCA(n_components=2)
-                pca.fit(points_to_process)
-                v_major = pca.components_[0] # Axis of elongation
-                # v_minor = pca.components_[1] # Axis perpendicular to elongation
-                print(f"  Major axis vector (projection axis): [{v_major[0]:.3f}, {v_major[1]:.3f}]") # Changed print
-
-                # 2. Project points onto the MAJOR Axis
-                projections_1d = (points_to_process @ v_major).reshape(-1, 1) # Project onto MAJOR axis
-
-                # 3. 1D K-Means Clustering (k=2)
-                kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-                labels = kmeans.fit_predict(projections_1d)
-
-                # 4. Select Cluster based on centroid proximity to origin
-                group1_indices = np.where(labels == 0)[0]
-                group2_indices = np.where(labels == 1)[0]
-
-                if len(group1_indices) >= 5 and len(group2_indices) >= 5:
-                    group1 = points_to_process[group1_indices]
-                    group2 = points_to_process[group2_indices]
-
-                    centroid1 = np.mean(group1, axis=0)
-                    centroid2 = np.mean(group2, axis=0)
-
-                    if np.linalg.norm(centroid1) <= np.linalg.norm(centroid2):
-                        selected_points = group1
-                        print(f"  Projected Clustering split successful. Kept group 1 ({len(group1)} pts).")
-                    else:
-                        selected_points = group2
-                        print(f"  Projected Clustering split successful. Kept group 2 ({len(group2)} pts).")
-                    has_split = True
-                    used_fallback = False # Ensure fallback flag is false
-                else:
-                    print("  Projected Clustering split resulted in invalid groups. Reverting.")
-                    selected_points, has_split_fallback = _apply_proximity_fallback(centered, minor_radius, initial_point_count)
-                    if has_split_fallback: has_split = True; used_fallback = True
-
-            except Exception as e:
-                print(f"  Error during Projected Space Clustering method: {e}. Reverting.")
-                selected_points, has_split_fallback = _apply_proximity_fallback(centered, minor_radius, initial_point_count)
-                if has_split_fallback: has_split = True; used_fallback = True
-
-        # Order points using angular sorting - simpler and more predictable
-        ordered_points_plot = order_points(selected_points, method="angular")
-        print(f"  Ordering final {len(ordered_points_plot)} points for plotting using 'angular' method.")
-        
-        # Check for significant gaps
-        has_gaps, gap_indices, gap_sizes = detect_gaps(ordered_points_plot, threshold=3.0)
-        
-        # Define plot color
-        plot_color = 'g' if closed_stomata else 'b'
-
-        # Plot with special handling for gaps
-        if has_split or has_gaps:
-            print(f"  Plotting section {i} as open line.")
-            if has_gaps:
-                print(f"    Found {len(gap_indices)} significant gaps.")
-                
-                # If we have multiple gaps, split into segments
-                if len(gap_indices) > 0:
-                    segments = []
-                    start_idx = 0
-                    
-                    # Sort gap indices in descending order so we can remove segments properly
-                    sorted_gaps = sorted(gap_indices, reverse=True)
-                    
-                    # Create a copy of the points that we can modify
-                    points_copy = ordered_points_plot.copy()
-                    
-                    # Cut at each gap (starting from the end)
-                    for gap_idx in sorted_gaps:
-                        # If this is the gap between last and first point, handle specially
-                        if gap_idx == len(points_copy) - 1:
-                            # We'll handle this by plotting from the next starting point
-                            start_idx = 0
-                        else:
-                            # Split at this gap - the points before the gap form one segment
-                            segment = points_copy[start_idx:gap_idx+1]
-                            if len(segment) >= 2:  # Only add if segment has at least 2 points
-                                segments.append(segment)
-                            start_idx = gap_idx + 1
-                    
-                    # Add the final segment if needed
-                    if start_idx < len(points_copy):
-                        segment = points_copy[start_idx:]
-                        if len(segment) >= 2:
-                            segments.append(segment)
-                    
-                    # Plot each segment separately
-                    for j, segment in enumerate(segments):
-                        if len(segment) >= 2:
-                            ax.plot(segment[:, 0], segment[:, 1], f"{plot_color}-", linewidth=2)
-                            
-                            # Mark endpoints of segments
-                            if j == 0:
-                                ax.plot(segment[0, 0], segment[0, 1], f"{plot_color}o", markersize=5)
-                            if j == len(segments) - 1:
-                                ax.plot(segment[-1, 0], segment[-1, 1], f"{plot_color}x", markersize=6)
-                else:
-                    # No gaps found, just plot as a regular line
-                    ax.plot(ordered_points_plot[:, 0], ordered_points_plot[:, 1], 
-                           f"{plot_color}-", linewidth=2)
-            else:
-                # No gaps but has_split is True - plot as is
-                ax.plot(ordered_points_plot[:, 0], ordered_points_plot[:, 1], 
-                       f"{plot_color}-", linewidth=2)
-        else:
-            # Plot as closed loop
-            ax.plot(np.append(ordered_points_plot[:, 0], ordered_points_plot[0, 0]),
-                   np.append(ordered_points_plot[:, 1], ordered_points_plot[0, 1]),
-                   f"{plot_color}-", linewidth=2)
-        
-        # Plot individual points
-        ax.plot(ordered_points_plot[:, 0], ordered_points_plot[:, 1], 
-               f"{plot_color}.", markersize=3)
-
-             
-        # Plot reference circle
-        #ax.plot(circle_x, circle_y, 'k--', linewidth=1, alpha=0.7)
-
-        # Compute metrics based on the final selected points
-        #points_for_metrics = selected_points
-        #if len(points_for_metrics) > 0:
-        #    width = np.ptp(points_for_metrics[:, 0])
-        #    height = np.ptp(points_for_metrics[:, 1])
-        #    aspect = width / height if height > 0 else 0
-        #    try:
-        #        convexity_val2 = calculate_convexity(order_points(points_for_metrics, method="angular"))
-        #        props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}\nC: {convexity_val2:.2f}"
-        #    except Exception as e:
-        #        props_text = f"Pts: {len(points_for_metrics)}\nAR: {aspect:.2f}"
-        #else:
-        #     props_text = "Pts: 0"
-
-        #ax.text(0.05, 0.95, props_text, transform=ax.transAxes, verticalalignment='top',
-        #        fontsize=8, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+    for subplot_idx, (section_idx, pts) in enumerate(valid_items, start=1):
+        ax = fig.add_subplot(rows, cols, subplot_idx)
         ax.set_aspect('equal')
-        #ax.grid(True)
-        ax.set_xticklabels([])
-        ax.set_yticklabels([])
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f'Section {section_idx}', fontsize=10)
 
-    # Final figure adjustments and saving
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    if output_dir is not None:
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        save_path = os.path.join(output_dir, 'all_individual_cross_sections.png')
-        plt.savefig(save_path, dpi=150)
-        print(f"Saved grid figure with {plot_idx-1} cross-sections to {save_path}")
-    else:
-        plt.show()
+        # Center & angularly order
+        center = np.mean(pts, axis=0)
+        centered = pts - center
+        ordered = order_points(centered, method="angular")
+
+        # Plot closed loop
+        loop = np.vstack([ordered, ordered[0]])
+        ax.plot(loop[:,0], loop[:,1], 'b-')
+        ax.plot(ordered[:,0], ordered[:,1], 'ro', markersize=3)
+
+        mapping_labels.append(f'P{subplot_idx}→S{section_idx}')
+
+    # Super-title and mapping text
+    fig.suptitle('Combined Cross-Sections', fontsize=14)
+    fig.text(
+        0.5, 0.02,
+        ' '.join(mapping_labels),
+        ha='center', fontsize=8
+    )
+
+    # Write out
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, 'all_individual_cross_sections.png')
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
+    print(f"Saved combined cross-section grid to {save_path}")
 
-def create_visualizations(mesh, centerline_points, tangent_vectors, section_positions, 
-                         cross_sections, section_objects, section_transforms, raw_centerline_points, 
-                         inner_points, outer_points, minor_radius, valid_sections, 
+
+def create_visualizations(mesh, centerline_points, tangent_vectors, section_positions,
+                         cross_sections, section_objects, section_transforms, raw_centerline_points,
+                         inner_points, outer_points, minor_radius, valid_sections,
                          output_dir=None, closed_stomata=False):
-    """Create visualization figures for the analysis results."""
-    # Import plotly here to make it optional
+    """Create 3D (Plotly) and 2D (Matplotlib) visualizations for mesh and cross-sections."""
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.path import Path
+
+    # Ensure output directory
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # --- 1) 3D Plotly Visualization ---
     try:
         import plotly.graph_objects as go
         use_plotly = True
     except ImportError:
         use_plotly = False
-        
-    # 3D Visualization using plotly if available
+        print("Plotly not available; skipping 3D visualization.")
+
     if use_plotly:
-        # Convert mesh to plotly format
-        vertices = mesh.vertices
+        # Mesh trace
+        verts = mesh.vertices
         faces = mesh.faces
-        
-        i = faces[:, 0]
-        j = faces[:, 1]
-        k = faces[:, 2]
-        
-        # Create mesh3d object
         mesh_trace = go.Mesh3d(
-            x=vertices[:, 0],
-            y=vertices[:, 1],
-            z=vertices[:, 2],
-            i=i, j=j, k=k,
-            opacity=0.8,
-            color='green'
+            x=verts[:,0], y=verts[:,1], z=verts[:,2],
+            i=faces[:,0], j=faces[:,1], k=faces[:,2],
+            opacity=0.6, color='lightgreen', name='Mesh'
         )
-        
-        # Add raw centerline points
-        raw_centerline_trace = go.Scatter3d(
-            x=raw_centerline_points[:, 0],
-            y=raw_centerline_points[:, 1],
-            z=raw_centerline_points[:, 2],
-            mode='markers',
-            marker=dict(
-                size=4,
-                color='orange',
-            ),
+        # Centerline traces
+        raw_trace = go.Scatter3d(
+            x=raw_centerline_points[:,0],
+            y=raw_centerline_points[:,1],
+            z=raw_centerline_points[:,2],
+            mode='markers', marker=dict(size=4, color='orange'),
             name='Raw Centerline'
         )
-        
-        # Add fitted centerline points
-        centerline_trace = go.Scatter3d(
-            x=centerline_points[:, 0],
-            y=centerline_points[:, 1],
-            z=centerline_points[:, 2],
-            mode='markers+lines',
-            marker=dict(
-                size=5,
-                color='red',
-            ),
+        fit_trace = go.Scatter3d(
+            x=centerline_points[:,0],
+            y=centerline_points[:,1],
+            z=centerline_points[:,2],
+            mode='lines+markers', marker=dict(size=3, color='red'),
+            line=dict(width=2, color='red'),
             name='Fitted Centerline'
         )
-        
-        # Add section planes
-        section_traces = []
-        for i, (point, tangent, valid) in enumerate(zip(centerline_points, tangent_vectors, valid_sections)):
+        # Section planes and cross-section outlines
+        plane_traces, pts_traces = [], []
+        for idx, (pt, tan, valid) in enumerate(zip(centerline_points, tangent_vectors, valid_sections)):
             if not valid:
                 continue
-                
-            # Create a disc to represent the section plane
-            r = np.linspace(0, minor_radius * 2, 20)
-            theta = np.linspace(0, 2*np.pi, 36)
-            r_grid, theta_grid = np.meshgrid(r, theta)
-            
-            # Coordinates in the plane
-            x_disc = r_grid * np.cos(theta_grid)
-            y_disc = r_grid * np.sin(theta_grid)
-            
-            # Ensure we have a valid normal vector
-            if np.linalg.norm(tangent) < 1e-10:
-                continue
-                
-            # Find two orthogonal vectors in the plane
-            if np.abs(tangent[0]) > 0.9:
-                v1 = np.array([0, 1, 0])
-            else:
-                v1 = np.array([1, 0, 0])
-            
-            v1 = v1 - np.dot(v1, tangent) * tangent
-            v1 = v1 / np.linalg.norm(v1)
-            
-            v2 = np.cross(tangent, v1)
-            
-            # Transform disc to 3D
-            x_plane = point[0] + x_disc * v1[0] + y_disc * v2[0]
-            y_plane = point[1] + x_disc * v1[1] + y_disc * v2[1]
-            z_plane = point[2] + x_disc * v1[2] + y_disc * v2[2]
-            
-            # Create surface
-            section_trace = go.Surface(
-                x=x_plane,
-                y=y_plane,
-                z=z_plane,
-                colorscale=[[0, f'rgba(255,0,0,0.3)'], [1, f'rgba(255,0,0,0.3)']],
-                showscale=False,
-                opacity=0.3,
-                name=f'Section {i}'
+            # Create ring in plane
+            theta = np.linspace(0, 2*np.pi, 48)
+            xs = minor_radius * np.cos(theta)
+            ys = minor_radius * np.sin(theta)
+            # basis
+            v_norm = tan / np.linalg.norm(tan)
+            ref = np.array([1,0,0]) if abs(v_norm[0])<0.9 else np.array([0,1,0])
+            v1 = ref - v_norm*(ref.dot(v_norm)); v1 /= np.linalg.norm(v1)
+            v2 = np.cross(v_norm, v1)
+            ring3d = np.array([pt + x*v1 + y*v2 for x,y in zip(xs,ys)])
+            plane_traces.append(
+                go.Scatter3d(
+                    x=ring3d[:,0], y=ring3d[:,1], z=ring3d[:,2],
+                    mode='lines', line=dict(color='purple', width=2), name=f'Plane {idx}'
+                )
             )
-            section_traces.append(section_trace)
-
-        section_point_traces = []
-        for i, (cross_section, transform, valid, point, tangent) in enumerate(zip(
-                cross_sections, section_transforms, valid_sections, centerline_points, tangent_vectors)):
-            if not valid or cross_section is None:
+            # Cross-section outline
+            cs = cross_sections[idx]
+            pts2d = get_2d_points(cs)
+            if pts2d is None:
                 continue
-                
-            # Unpack the cross-section data - these are the already processed 2D points
-            processed_points_2d, original_points_3d = cross_section if isinstance(cross_section, tuple) else (cross_section, None)
-            
-            try:
-                # --- Start Modification ---
-                # Always calculate the correct order based on the processed 2D points first
-                center_2d = np.mean(processed_points_2d, axis=0)
-                centered_points_2d = processed_points_2d - center_2d
-                angles = np.arctan2(centered_points_2d[:, 1], centered_points_2d[:, 0])
-                sorted_indices = np.argsort(angles)
-
-                if original_points_3d is not None and len(original_points_3d) > 0:
-                    # Use original 3D points, but apply the calculated order for connectivity
-                    # Check if the number of points matches before applying indices
-                    if len(original_points_3d) == len(sorted_indices):
-                         points_3d = original_points_3d[sorted_indices]
-                         print(f"  Section {i}: Using ORDERED original 3D points ({len(points_3d)} points)")
-                    else:
-                         # Fallback if point counts mismatch (should not happen often with filtering)
-                         print(f"  Section {i}: Warning - Mismatch between original ({len(original_points_3d)}) and processed ({len(processed_points_2d)}) points. Using fallback.")
-                         # Use the fallback transformation (copied from below)
-                         ordered_centered_points_2d = centered_points_2d[sorted_indices]
-                         if np.abs(tangent[0]) > 0.9: v1 = np.array([0, 1, 0])
-                         else: v1 = np.array([1, 0, 0])
-                         v1 = v1 - np.dot(v1, tangent) * tangent; v1 /= np.linalg.norm(v1)
-                         v2 = np.cross(tangent, v1)
-                         points_3d = np.array([point + ordered_centered_points_2d[j, 0] * v1 + ordered_centered_points_2d[j, 1] * v2 for j in range(len(ordered_centered_points_2d))])
-
-                else:
-                    # FALLBACK: Reconstruct 3D points using the manual plane basis.
-                    print(f"  Section {i}: Warning - Original 3D points not available. Using fallback transformation.")
-                    # Use the CENTERED and ORDERED points for transformation
-                    ordered_centered_points_2d = centered_points_2d[sorted_indices]
-
-                    # Calculate the plane basis vectors (v1, v2)
-                    if np.abs(tangent[0]) > 0.9:
-                        v1 = np.array([0, 1, 0])
-                    else:
-                        v1 = np.array([1, 0, 0])
-                    v1 = v1 - np.dot(v1, tangent) * tangent
-                    v1 = v1 / np.linalg.norm(v1)
-                    v2 = np.cross(tangent, v1)
-
-                    # Transform the CENTERED points relative to the centerline point 'point'
-                    points_3d = np.array([
-                        point + ordered_centered_points_2d[j, 0] * v1 + ordered_centered_points_2d[j, 1] * v2
-                        for j in range(len(ordered_centered_points_2d))
-                    ])
-                    print(f"  Section {i}: Using transformed centered 2D points ({len(points_3d)} points)")
-                
-                # Create color based on section index for consistent coloring
-                color = plt.cm.hsv(i / len(valid_sections))
-                rgb_color = f'rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})'
-                
-                # Create visualization for the selected cross-section points
-                # Add the first point again at the end to close the loop
-                if len(points_3d) > 0: # Check if points_3d is not empty
-                    closed_points_3d = np.vstack([points_3d, points_3d[0]])
-                else:
-                    closed_points_3d = np.empty((0, 3)) # Handle empty case
-                
-                section_point_trace = go.Scatter3d(
-                    x=closed_points_3d[:, 0],
-                    y=closed_points_3d[:, 1],
-                    z=closed_points_3d[:, 2],
-                    mode='lines',  # Just use lines for a clean visualization
-                    line=dict(color=rgb_color, width=5),  # Thicker lines for visibility
-                    name=f'Section {i}'  # Consistent naming with section planes
+            centered2d = pts2d - pts2d.mean(axis=0)
+            ordered2d = order_points(centered2d)
+            outline3d = np.array([pt + p[0]*v1 + p[1]*v2 for p in ordered2d])
+            closed3d = np.vstack([outline3d, outline3d[0]])
+            pts_traces.append(
+                go.Scatter3d(
+                    x=closed3d[:,0], y=closed3d[:,1], z=closed3d[:,2],
+                    mode='lines', line=dict(color='blue', width=4), name=f'CS {idx}'
                 )
-                section_point_traces.append(section_point_trace)
-                
-                # Also add points for better visibility
-                points_trace = go.Scatter3d(
-                    x=points_3d[:, 0],
-                    y=points_3d[:, 1],
-                    z=points_3d[:, 2],
-                    mode='markers',
-                    marker=dict(
-                        size=4,
-                        color=rgb_color,
-                        symbol='circle',
-                    ),
-                    name=f'Section {i} Points',
-                    showlegend=False
-                )
-                section_point_traces.append(points_trace)
-                
-            except Exception as e:
-                print(f"Could not visualize section {i} points: {str(e)}")
-                print(f"  Debug info: {e.__class__.__name__}, processed_points_2d shape: {processed_points_2d.shape if processed_points_2d is not None else 'None'}")
-        # Update the figure creation to include these new traces
-        fig = go.Figure(data=[mesh_trace, raw_centerline_trace, centerline_trace] + section_traces + section_point_traces)
-        valid_indices = [i for i, valid in enumerate(valid_sections) if valid]
-        buttons = [
-            {
-                'label': 'Show All',
-                'method': 'update',
-                'args': [{'visible': [True] * len(fig.data)}]
-            }
-        ]
-
-        # Add buttons for individual sections
-        base_traces = 3  # mesh, raw_centerline, centerline
-        for i, valid in enumerate(valid_sections):
-            if not valid:
-                continue
-            
-            # Calculate indices within the visible traces
-            plane_idx = base_traces + valid_indices.index(i)
-            points_idx = base_traces + len(section_traces) + valid_indices.index(i)
-            
-            # Create a visibility list where only this section's plane and points are visible
-            visible = [True] * base_traces  # Always show mesh and centerlines
-            visible.extend([False] * (len(section_traces) + len(section_point_traces)))
-            
-            # Make this section's plane and points visible
-            if plane_idx < len(visible):
-                visible[plane_idx] = True
-            if points_idx < len(visible):
-                visible[points_idx] = True
-            
-            buttons.append({
-                'label': f'Section {i}',
-                'method': 'update',
-                'args': [{'visible': visible}]
-            })
-
-        # --- Update Button Generation Logic ---
-        num_base_traces = 3 # mesh_trace, raw_centerline_trace, centerline_trace
-        num_plane_traces = len(section_traces)
-        # Each section point visualization adds TWO traces (lines + markers)
-        num_point_traces_per_section = 2
-        total_traces = num_base_traces + num_plane_traces + len(section_point_traces)
-
-        buttons = [
-            {
-                'label': 'Show All',
-                'method': 'update',
-                'args': [{'visible': [True] * total_traces}]
-            }
-        ]
-
-        # Keep track of which index in the original loop corresponds to which trace index
-        valid_section_indices = [i for i, valid in enumerate(valid_sections) if valid]
-        plane_trace_map = {original_idx: trace_idx for trace_idx, original_idx in enumerate(valid_section_indices)}
-        # Point traces start after base traces and plane traces
-        point_trace_start_idx = num_base_traces + num_plane_traces
-        point_trace_map = {original_idx: point_trace_start_idx + trace_idx * num_point_traces_per_section
-                           for trace_idx, original_idx in enumerate(valid_section_indices)}
-
-        # Add buttons for individual sections
-        for original_idx in valid_section_indices:
-            visibility = [False] * total_traces
-            # Show base traces
-            visibility[0:num_base_traces] = [True] * num_base_traces
-
-            # Find the correct trace indices for this section
-            plane_idx = plane_trace_map.get(original_idx)
-            point_start_idx = point_trace_map.get(original_idx)
-
-            if plane_idx is not None:
-                 # Plane traces start right after base traces
-                visibility[num_base_traces + plane_idx] = True
-            if point_start_idx is not None:
-                # Show both line and marker traces for this section
-                visibility[point_start_idx] = True # Line trace
-                visibility[point_start_idx + 1] = True # Marker trace
-
-            buttons.append({
-                'label': f'Section {original_idx}',
-                'method': 'update',
-                'args': [{'visible': visibility}]
-            })
-        # --- End Update Button Generation Logic ---
-
-        # Update layout with buttons
-        fig.update_layout(
-            updatemenus=[{
-                'buttons': buttons,
-                'direction': 'down',
-                'showactive': True,
-                'x': 0.1,
-                'xanchor': 'left',
-                'y': 1.15,
-                'yanchor': 'top'
-            }],
-            # ... rest of layout settings ...
+            )
+        fig3d = go.Figure(data=[mesh_trace, raw_trace, fit_trace] + plane_traces + pts_traces)
+        fig3d.update_layout(
+            title='3D Stomata with Cross-Sections',
+            scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'),
+            margin=dict(l=0,r=0,t=40,b=0)
         )
+        if output_dir:
+            fig3d.write_html(os.path.join(output_dir, '3d_visualization.html'))
 
-        # Save or show the figure
-        # ... (rest of the function) ...
-            
-        
-        # Create figure with the traces
-        #fig = go.Figure(data=[mesh_trace, raw_centerline_trace, centerline_trace] + section_traces)
-        
-        # Update layout
-        fig.update_layout(title='3D Visualization of Stomata with Cross-Sections',
-                         scene=dict(
-                             xaxis_title='X',
-                             yaxis_title='Y',
-                             zaxis_title='Z'
-                         ))
-        
-        if output_dir is not None:
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-            fig.write_html(os.path.join(output_dir, '3d_visualization.html'))
-    
-    # 2D Visualizations using matplotlib
-    # Create a 2x3 grid of plots
-    fig = plt.figure(figsize=(15, 10))
-    fig.tight_layout(pad=3.0)
-    
-    # 6a. 3D view with section planes
-    ax_3d = fig.add_subplot(231, projection='3d')
-    ax_3d.set_title('3D View with Cross-Sections')
-    
-    # Draw centerline
-    ax_3d.plot(centerline_points[:, 0], centerline_points[:, 1], centerline_points[:, 2], 
-               'ro-', linewidth=2, markersize=4, label='Centerline')
-    
-    # Draw section planes as discs
-    for i, (point, tangent, valid) in enumerate(zip(centerline_points, tangent_vectors, valid_sections)):
+    # --- 2) 2D Matplotlib Grid ---
+    fig = plt.figure(figsize=(18, 12), constrained_layout=True)
+
+    # A) Top view XY with section lines
+    axA = fig.add_subplot(2,3,1)
+    axA.set_title('Top View (XY)')
+    axA.plot(centerline_points[:,0], centerline_points[:,1], 'ro-')
+    for pt, tan, valid in zip(centerline_points, tangent_vectors, valid_sections):
         if not valid:
             continue
-            
-        # Create a disc to represent the section plane
-        r = np.linspace(0, minor_radius * 1.5, 2)  # Just draw the edge
-        theta = np.linspace(0, 2*np.pi, 36)
-        r_grid, theta_grid = np.meshgrid(r, theta)
-        
-        # Coordinates in the plane
-        x_disc = r_grid * np.cos(theta_grid)
-        y_disc = r_grid * np.sin(theta_grid)
-        
-        # Ensure we have a valid normal vector
-        if np.linalg.norm(tangent) < 1e-10:
+        dir2d = tan[:2]
+        if np.linalg.norm(dir2d) < 1e-6:
             continue
-            
-        # Find two orthogonal vectors in the plane
-        if np.abs(tangent[0]) > 0.9:
-            v1 = np.array([0, 1, 0])
-        else:
-            v1 = np.array([1, 0, 0])
-        
-        v1 = v1 - np.dot(v1, tangent) * tangent
-        v1 = v1 / np.linalg.norm(v1)
-        
-        v2 = np.cross(tangent, v1)
-        
-        # Transform disc to 3D
-        for j in range(r_grid.shape[0]):
-            x_plane = point[0] + x_disc[j] * v1[0] + y_disc[j] * v2[0]
-            y_plane = point[1] + x_disc[j] * v1[1] + y_disc[j] * v2[1]
-            z_plane = point[2] + x_disc[j] * v1[2] + y_disc[j] * v2[2]
-            
-            if r_grid[j, 0] == r[-1]:  # Only draw the outer edge
-                ax_3d.plot(x_plane, y_plane, z_plane, 'g-', alpha=0.5)
-    
-    # Set reasonable aspect ratio
-    ax_3d.set_box_aspect([1, 1, 1])
-    
-    # 6b. Top view with section lines
-    ax_top = fig.add_subplot(232)
-    ax_top.set_title('Top View (XY) with Section Lines')
-    
-    # Draw central points
-    ax_top.plot(centerline_points[:, 0], centerline_points[:, 1], 'ro-', linewidth=2, markersize=4, label='Centerline')
-    
-    # Draw section lines from the center outward
-    for i, (point, tangent, valid) in enumerate(zip(centerline_points, tangent_vectors, valid_sections)):
-        if not valid:
+        dir2d /= np.linalg.norm(dir2d)
+        ortho = np.array([-dir2d[1], dir2d[0]])
+        L = minor_radius
+        seg = np.vstack([pt[:2] + L*ortho, pt[:2] - L*ortho])
+        axA.plot(seg[:,0], seg[:,1], 'g-')
+    axA.set_aspect('equal'); axA.grid(True)
+
+    # B) Raw cross-sections
+    axB = fig.add_subplot(2,3,2)
+    axB.set_title('Raw Cross-Sections')
+    for obj, valid in zip(section_objects, valid_sections):
+        if not valid or obj is None:
             continue
-            
-        # Project tangent vector to XY
-        tangent_xy = np.array([tangent[0], tangent[1], 0])
-        if np.linalg.norm(tangent_xy) > 0.01:
-            tangent_xy = tangent_xy / np.linalg.norm(tangent_xy)
-            
-            # Orthogonal vector in XY plane
-            ortho = np.array([-tangent_xy[1], tangent_xy[0], 0])
-            
-            # Draw section line
-            line_length = minor_radius * 3
-            line_start = point + ortho * line_length/2
-            line_end = point - ortho * line_length/2
-            
-            ax_top.plot([line_start[0], line_end[0]], [line_start[1], line_end[1]], 'g-', alpha=0.7)
-            
-            # Draw section number
-            if i % 2 == 0:  # Label every other section for clarity
-                text_pos = point + ortho * line_length/2 * 0.7
-                ax_top.text(text_pos[0], text_pos[1], str(i), fontsize=8, 
-                           horizontalalignment='center', verticalalignment='center')
-    
-    # Set equal aspect ratio
-    ax_top.set_aspect('equal')
-    ax_top.grid(True)
-    
-    # 6c. Raw cross-section shapes (without processing)
-    ax_raw = fig.add_subplot(233)
-    ax_raw.set_title('Original Cross-Sections')
-    
-    # Reference circle
-    circle_theta = np.linspace(0, 2*np.pi, 100)
-    circle_x = minor_radius * np.cos(circle_theta)
-    circle_y = minor_radius * np.sin(circle_theta)
-    
-    # Find a valid zero-angle section to use as reference
-    zero_idx = 0
-    while zero_idx < len(valid_sections) and not valid_sections[zero_idx]:
-        zero_idx += 1
-    
-    if sum(valid_sections) > 0:
-        # Plot each raw section
-        raw_points = None
-        for i, (section, valid) in enumerate(zip(section_objects, valid_sections)):
-            if not valid or section is None:
-                continue
-                
-            # Get 2D points
-            try:
-                # Convert section to 2D
-                path_2D, _ = section.to_planar()
-                points = path_2D.vertices
-                
-                # Store points for setting limits
-                if raw_points is None:
-                    raw_points = points
-                else:
-                    raw_points = np.vstack((raw_points, points))
-                
-                # Use angle-based coloring
-                color = plt.cm.hsv(i / len(section_objects))
-                
-                # Plot outline
-                ax_raw.plot(points[:, 0], points[:, 1], '-', color=color, alpha=0.8, 
-                           linewidth=1.5, label=f'Section {i}')
-                
-                # Mark center
-                center = np.mean(points, axis=0)
-                ax_raw.plot(center[0], center[1], 'o', color=color, markersize=4)
-            except Exception as e:
-                print(f"  Could not plot raw section {i}: {e}")
-        
-        # Add reference circle for section at 0 degrees
-        if valid_sections[zero_idx] and cross_sections[zero_idx] is not None:
-            ref_points = get_2d_points(cross_sections[zero_idx])
-            ref_center = np.mean(ref_points, axis=0)
-            ax_raw.plot(circle_x + ref_center[0], circle_y + ref_center[1], 'g--', linewidth=1, alpha=0.7)
+        p2d, _ = obj.to_planar()
+        axB.plot(p2d.vertices[:,0], p2d.vertices[:,1], alpha=0.7)
+    axB.set_aspect('equal'); axB.grid(True)
 
-            
-        # Set consistent limits
-        if raw_points is not None:
-            margin = np.max(np.ptp(raw_points, axis=0)) * 0.2
-            ax_raw.set_xlim(np.min(raw_points[:, 0]) - margin, np.max(raw_points[:, 0]) + margin)
-            ax_raw.set_ylim(np.min(raw_points[:, 1]) - margin, np.max(raw_points[:, 1]) + margin)
-        
-    # 6d. Cross-sections with improved connectivity
-    ax_all = fig.add_subplot(234)
-    ax_all.set_title('Processed Cross-Sections (Properly Connected)')
-
-    # Plot a reference circle
-    circle_theta = np.linspace(0, 2*np.pi, 100)
-    circle_x = minor_radius * np.cos(circle_theta)
-    circle_y = minor_radius * np.sin(circle_theta)
-    ax_all.plot(circle_x, circle_y, 'k--', linewidth=2, alpha=0.5, label='Reference Circle')
-
-
-
-    # Plot each processed section with proper connectivity
-    for i, (section_obj, cross_section, valid) in enumerate(zip(section_objects, cross_sections, valid_sections)):
-        if not valid or cross_section is None or section_obj is None:
+    # C) Processed cross-sections
+    axC = fig.add_subplot(2,3,3)
+    axC.set_title('Processed Cross-Sections')
+    for cs, valid in zip(cross_sections, valid_sections):
+        if not valid or cs is None:
             continue
-            
-        # Use angle-based color
-        color = plt.cm.hsv(i / len(valid_sections))
-        
-        try:
-            # Process the cross section to get properly ordered segments and points
-            points_2d = get_2d_points(cross_section)
-            result = process_cross_section(points_2d)
-            
-            if result is not None:
-                segments, ordered_points = result
-                
-                # Plot as a closed loop
-                x = np.append(ordered_points[:, 0], ordered_points[0, 0])
-                y = np.append(ordered_points[:, 1], ordered_points[0, 1])
-                ax_all.plot(x, y, '-', color=color, alpha=0.8, linewidth=1.5)
-                
-                # Mark center
-                center = np.mean(points_2d, axis=0)
-                ax_all.plot(center[0], center[1], 'o', color=color, markersize=4)
-        except Exception as e:
-            # Fall back to simple plotting if processing fails
-            print(f"Error plotting section {i}: {e}")
-            ax_all.plot(points_2d[:, 0], points_2d[:, 1], '-', color=color, 
-                        alpha=0.8, linewidth=1.5)
-    
-    # Set equal aspect ratio
-    ax_all.set_aspect('equal')
-    ax_all.grid(True)
-    
-    # Replace plot code for individual cross-sections (around line 900-910):
+        pts = get_2d_points(cs)
+        result = process_cross_section(pts)
+        if result:
+            _, ord_pts = result
+            loop = np.vstack([ord_pts, ord_pts[0]])
+            axC.plot(loop[:,0], loop[:,1])
+    axC.set_aspect('equal'); axC.grid(True)
 
-# 6e. Plot each cross-section individually
-    ax_ind = fig.add_subplot(235)
-    ax_ind.set_title('Individual Cross-Sections (Centered)')
-
-    # Update the individual cross-sections plot:
-
-    # Plot all processed sections with zero centerpoint for comparison
-    for i, (cross_section, valid) in enumerate(zip(cross_sections, valid_sections)):
-        if not valid or cross_section is None:
+    # D) Centered overlays
+    axD = fig.add_subplot(2,3,4)
+    axD.set_title('Centered Overlays')
+    for cs, valid in zip(cross_sections, valid_sections):
+        if not valid or cs is None:
             continue
-            
-        # Extract 2D points
-        points_2d = get_2d_points(cross_section)
-        # Center each section at the origin
-        center = np.mean(points_2d, axis=0)
-        centered = points_2d - center
-        
-        # Use angle-based color
-        color = plt.cm.hsv(i / len(valid_sections))
-        
-        try:
-            # Use nearest-neighbor ordering instead of angular sorting
-            ordered_points = order_points(centered, method="nearest")
-            
-            # Connect points in the correct order
-            ax_ind.plot(np.append(ordered_points[:, 0], ordered_points[0, 0]), 
-                    np.append(ordered_points[:, 1], ordered_points[0, 1]), 
-                    '-', color=color, alpha=0.8, linewidth=1.5, label=f'Section {i}')
-        except Exception as e:
-            # Fall back to simple plotting
-            print(f"Error plotting individual section {i}: {e}")
+        pts = get_2d_points(cs)
+        ord_pts = order_points(pts - pts.mean(axis=0))
+        loop = np.vstack([ord_pts, ord_pts[0]])
+        axD.plot(loop[:,0], loop[:,1], alpha=0.6)
+    axD.set_aspect('equal'); axD.grid(True)
 
-    # Plot reference circle
-    ax_ind.plot(circle_x, circle_y, 'k--', linewidth=2, alpha=0.5, label='Reference Circle')
-    
-    # Set equal aspect ratio and reasonable limits
-    ax_ind.set_aspect('equal')
-    ax_ind.grid(True)
-    
-    # 6f. Show example cross-section with details
-    ax_example = fig.add_subplot(236)
-    
-    # Find a good example (middle of the valid sections)
-    valid_indices = [i for i, v in enumerate(valid_sections) if v]
-    example_idx = valid_indices[len(valid_indices)//2] if valid_indices else 0
-    
-    # Replace plot code for example section (around line 935-940):
+    # E) Aspect ratio distribution
+    ar_vals = []
+    for cs, valid in zip(cross_sections, valid_sections):
+        if not valid or cs is None:
+            continue
+        pts = get_2d_points(cs)
+        cov = np.cov(pts.T)
+        eig = np.linalg.eigvalsh(cov)
+        if eig[1] > 1e-6:
+            ar_vals.append(eig[1] / eig[0])
+    axE = fig.add_subplot(2,3,5)
+    axE.set_title('Aspect Ratios')
+    if ar_vals:
+        axE.boxplot(ar_vals, vert=True, showfliers=True)
+    axE.grid(True)
 
-    if valid_sections[example_idx] and cross_sections[example_idx] is not None:
-        points_2d = get_2d_points(cross_sections[example_idx])
-        ax_example.set_title(f'Detailed View of Section {example_idx}')
-        
-        # Center the example
-        center = np.mean(points_2d, axis=0)
-        centered = points_2d - center
-        
-        # Sort points by angle for proper plotting
-        angles = np.arctan2(centered[:, 1], centered[:, 0])
-        sorted_indices = np.argsort(angles)
-        ordered_points = centered[sorted_indices]
-        
-        # Plot with points and vectors (ensure closed loop)
-        ax_example.plot(np.append(ordered_points[:, 0], ordered_points[0, 0]), 
-                    np.append(ordered_points[:, 1], ordered_points[0, 1]), 
-                    'b-', linewidth=2)
-        
-        # Mark points
-        ax_example.plot(ordered_points[:, 0], ordered_points[:, 1], 'ro', markersize=3)
-        
-        # Add indices for key points (every Nth point)
-        n = max(1, len(centered) // 10)
-        for i in range(0, len(centered), n):
-            ax_example.text(centered[i, 0], centered[i, 1], str(i), fontsize=8,
-                         ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7))
-        
-        # Calculate properties
-        width = np.max(centered[:, 0]) - np.min(centered[:, 0])
-        height = np.max(centered[:, 1]) - np.min(centered[:, 1])
-        aspect = width / height if height > 0 else 0
-        
-        # Add property box
-        props_text = (f"Points: {len(centered)}\n" 
-                      f"Width: {width:.2f}\n"
-                      f"Height: {height:.2f}\n"
-                      f"Aspect: {aspect:.2f}")
-        ax_example.text(0.05, 0.95, props_text, transform=ax_example.transAxes, 
-                      verticalalignment='top', bbox=dict(boxstyle='round', 
-                                                        facecolor='wheat', alpha=0.7))
-        
-        # Plot reference circle
-        ax_example.plot(circle_x, circle_y, 'g--', linewidth=1, alpha=0.7)
-        
-        # Set equal aspect ratio and reasonable limits
-        ax_example.set_aspect('equal')
+    # F) Example detailed view
+    axF = fig.add_subplot(2,3,6)
+    valid_idxs = [i for i,v in enumerate(valid_sections) if v]
+    if valid_idxs:
+        ex = valid_idxs[len(valid_idxs)//2]
+        pts = get_2d_points(cross_sections[ex])
+        ord_pts = order_points(pts - pts.mean(axis=0))
+        loop = np.vstack([ord_pts, ord_pts[0]])
+        axF.plot(loop[:,0], loop[:,1], 'b-')
+        axF.set_title(f'Section {ex}')
+    axF.set_aspect('equal'); axF.grid(True)
 
-    else:
-        ax_example.set_title('No Valid Example Section')
-    
-    ax_example.grid(True)
-    
-    # Save or show all visualizations
-    if output_dir is not None:
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        plt.savefig(os.path.join(output_dir, 'all_cross_sections.png'), dpi=150)
+    # Save or show
+    if output_dir:
+        fig.savefig(os.path.join(output_dir, 'all_cross_sections.png'), dpi=150)
+        plt.close(fig)
     else:
         plt.show()
-    plt.close(fig)
-
-    # Create individual figures for each cross-section
-    if output_dir is not None:
-        create_combined_cross_section_figure(cross_sections, valid_sections, minor_radius, output_dir, closed_stomata)
 
 def _apply_proximity_fallback(centered_points, minor_radius, initial_point_count):
     """
-    Applies the proximity filter/region growing as a fallback method for separating
-    inner boundary points from outer points.
-    
-    Args:
-        centered_points: Array of points centered around origin
-        minor_radius: Estimated minor radius of the structure
-        initial_point_count: Original number of points for comparison
-        
-    Returns:
-        (selected_points, has_filtered): Selected subset of points and whether filtering occurred
+    Region-growing fallback: returns filtered points only.
     """
-    print("  Applying proximity filter fallback...")
-    points_to_process = centered_points
-    
-    # Step 1: DBSCAN cleanup to remove outliers and find main clusters
+    import numpy as np
+    from scipy.cluster.hierarchy import fclusterdata  # fallback alternative
+
+    pts = np.asarray(centered_points)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+        return pts.copy()
+
+    # Step 1: DBSCAN noise removal
     try:
-        # Use 40% of minor radius as a reasonable neighborhood size
-        dbscan_eps = minor_radius * 0.40
-        clustering = DBSCAN(eps=dbscan_eps, min_samples=5).fit(points_to_process)
-        labels = clustering.labels_
-        unique_labels = np.unique(labels[labels != -1])
-        
-        if len(unique_labels) > 1:
-            # Multiple clusters found - select the one closest to origin
-            min_dist = float('inf')
-            best_label = -1
-            
-            for label in unique_labels:
-                cluster_points = points_to_process[labels == label]
-                if len(cluster_points) < 5:
-                    continue  # Skip tiny clusters
-                    
-                # Calculate distance from origin to cluster centroid
-                dist = np.linalg.norm(np.mean(cluster_points, axis=0))
-                if dist < min_dist:
-                    min_dist = dist
-                    best_label = label
-                    
-            if best_label != -1:
-                points_to_process = points_to_process[labels == best_label]
-            else:
-                # No good cluster found, just remove noise points
-                points_to_process = points_to_process[labels != -1]
-                
-        elif len(unique_labels) == 1:
-            # Only one cluster - keep it
-            points_to_process = points_to_process[labels == unique_labels[0]]
-            
-        elif len(labels[labels != -1]) > 5:
-            # No distinct clusters but some non-noise points exist
-            points_to_process = points_to_process[labels != -1]
-            
-        # If all points are noise or DBSCAN failed completely, keep original points
-        
-        # Store DBSCAN results
-        points_after_dbscan = points_to_process.copy()
-        print(f"  DBSCAN filtering: {len(centered_points)} → {len(points_after_dbscan)} points")
-        
-    except Exception as e:
-        print(f"  DBSCAN clustering failed: {e}")
-        points_after_dbscan = points_to_process.copy()
+        from scipy.spatial import KDTree
+        from sklearn.cluster import DBSCAN
+        eps = minor_radius * 0.4
+        db = DBSCAN(eps=eps, min_samples=3).fit(pts)
+        mask = db.labels_ != -1
+        pts_db = pts[mask]
+    except Exception:
+        pts_db = pts.copy()
 
-    # Early exit if too few points remain
-    if len(points_to_process) < 5:
-        print(f"  Too few points after DBSCAN ({len(points_to_process)}), returning early")
-        return points_to_process, (len(points_to_process) < initial_point_count)
+    # If DBSCAN removed too many, keep the larger set
+    if len(pts_db) < 3:
+        pts_db = pts.copy()
 
-    # Step 2: Region growing from core points
+    # Step 2: Region growing around origin
     try:
-        # Core identification - points close to origin
-        core_radius = minor_radius * 0.4  # 40% of minor radius defines the core region
-        distances_from_origin = np.linalg.norm(points_to_process, axis=1)
-        core_indices = np.where(distances_from_origin <= core_radius)[0]
-        
-        # Select starting points - either core points or closest to origin
-        start_indices = []
-        if len(core_indices) > 0:
-            start_indices = list(core_indices)
-        else:
-            # If no core points, use the 3 closest points (or fewer if < 3 points total)
-            k_closest = min(3, len(points_to_process))
-            start_indices = list(np.argsort(distances_from_origin)[:k_closest])
+        tree = KDTree(pts_db)
+        dists, _ = tree.query(pts_db, k=min(6, len(pts_db)))
+        med = np.median(dists[:,1] if dists.ndim>1 else dists)
+        thresh = med * 3.5
+        # BFS
+        from collections import deque
+        visited = set([0])
+        q = deque([0])
+        while q:
+            i = q.popleft()
+            for j in tree.query_ball_point(pts_db[i], r=thresh):
+                if j not in visited:
+                    visited.add(j); q.append(j)
+        pts_grown = pts_db[list(visited)]
+        if len(pts_grown) >= 3:
+            return pts_grown
+    except Exception:
+        pass
 
-        if start_indices:
-            # Create selection mask and KDTree just once
-            selection_mask = np.zeros(len(points_to_process), dtype=bool)
-            selection_mask[start_indices] = True
-            
-            # Build KD-Tree for efficient neighbor searches
-            grow_tree = KDTree(points_to_process)
-            
-            # Determine growth threshold based on median neighbor distance
-            try:
-                distances, _ = grow_tree.query(points_to_process, k=min(6, len(points_to_process)))
-                if distances.ndim > 1 and distances.shape[1] > 1:
-                    # Use median distance to nearest neighbor times 3.5 as growth threshold
-                    avg_neighbor_dist = np.median(distances[:, 1])
-                    growth_threshold = avg_neighbor_dist * 3.5
-                else:
-                    growth_threshold = minor_radius * 0.25
-            except Exception as e:
-                print(f"  Error calculating growth threshold: {e}")
-                growth_threshold = minor_radius * 0.25
-                
-            print(f"  Using growth threshold: {growth_threshold:.4f}")
+    # fallback to DBSCAN result
+    return pts_db
 
-            # Perform region growing using BFS
-            from collections import deque  # More efficient than list for queue operations
-            processed_indices = set(start_indices)
-            queue = deque(start_indices)
-            
-            while queue:
-                current_idx = queue.popleft()  # O(1) vs O(n) for list.pop(0)
-                neighbor_indices = grow_tree.query_ball_point(
-                    points_to_process[current_idx], r=growth_threshold)
-                
-                for neighbor_idx in neighbor_indices:
-                    if neighbor_idx not in processed_indices:
-                        selection_mask[neighbor_idx] = True
-                        processed_indices.add(neighbor_idx)
-                        queue.append(neighbor_idx)
-            
-            grown_points = points_to_process[selection_mask]
-            
-            # Verify growth produced reasonable results
-            if len(grown_points) < 10:
-                print(f"  Region growing produced too few points ({len(grown_points)}), reverting to DBSCAN result")
-                selected_points = points_after_dbscan
-            else:
-                print(f"  Region growing: {len(points_to_process)} → {len(grown_points)} points")
-                selected_points = grown_points
-        else:
-            # No starting points found (unlikely but possible)
-            print("  No starting points for region growing, using DBSCAN result")
-            selected_points = points_after_dbscan
-            
-    except Exception as e:
-        print(f"  Region growing failed: {e}")
-        selected_points = points_after_dbscan
-
-    # Determine if filtering occurred
-    has_filtered = (len(selected_points) < initial_point_count)
-    
-    print(f"  Proximity fallback finished. Selected {len(selected_points)} points. Filtered: {has_filtered}")
-    return selected_points, has_filtered
-
-
-# ... existing functions ...
 
 def load_and_align_mesh(file_path, align_axis='Y'):
-    """Loads a mesh, centers it, and optionally aligns its longest axis using PCA."""
+    """Load mesh, apply PCA inertia + optional axis swap, return mesh and full transform."""
     try:
-        mesh = trimesh.load_mesh(file_path, process=False)
+        mesh = trimesh.load_mesh(file_path)
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
-        if not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
-            print(f"  Warning: Invalid mesh data loaded from {file_path}.")
-            return None, np.eye(4)
-
-        vertices = mesh.vertices.copy()
-        center_orig = vertices.mean(axis=0)
-        vertices_centered = vertices - center_orig
-        mesh.vertices = vertices_centered # Start with centered mesh
-
-        final_transform_4x4 = np.eye(4) # Initialize transform
-
-        if align_axis and len(vertices_centered) >= 3:
-            print(f"  Aligning mesh from {file_path}...")
-            try:
-                pca = PCA(n_components=3); pca.fit(vertices_centered)
-                principal_axes = pca.components_; longest_axis = principal_axes[0]
-
-                if np.linalg.norm(longest_axis) < 1e-6:
-                    raise ValueError("PCA longest axis has near-zero length.")
-
-                if align_axis.upper() == 'X': target_axis = np.array([1.0, 0.0, 0.0])
-                elif align_axis.upper() == 'Y': target_axis = np.array([0.0, 1.0, 0.0])
-                elif align_axis.upper() == 'Z': target_axis = np.array([0.0, 0.0, 1.0])
-                else: raise ValueError(f"Invalid align_axis: {align_axis}")
-
-                transform_matrix = trimesh.geometry.align_vectors(longest_axis, target_axis)
-
-                rotation_3x3 = np.eye(3)
-                if transform_matrix is None: raise ValueError("align_vectors returned None.")
-                elif transform_matrix.shape == (3, 3): rotation_3x3 = transform_matrix
-                elif transform_matrix.shape == (4, 4): rotation_3x3 = transform_matrix[:3, :3]
-                else: raise ValueError(f"align_vectors returned unexpected shape: {transform_matrix.shape}")
-
-                final_transform_4x4[:3, :3] = rotation_3x3
-                vertices_aligned = trimesh.transform_points(vertices_centered, final_transform_4x4)
-                mesh.vertices = vertices_aligned # Update mesh vertices
-                print(f"  Mesh aligned. Longest axis ({longest_axis.round(3)}) aligned to {align_axis.upper()}.")
-
-            except Exception as pca_err:
-                print(f"  Warning: PCA alignment failed: {pca_err}. Using centered mesh.")
-                # mesh.vertices remains centered
-                final_transform_4x4 = np.eye(4) # Reset transform
-        elif align_axis:
-             print("  Warning: Not enough vertices for PCA alignment. Using centered mesh.")
-
-        return mesh, final_transform_4x4
-
+        # center
+        mesh.apply_translation(-mesh.centroid)
+        # inertia alignment
+        T = mesh.principal_inertia_transform
+        mesh.apply_transform(T)
+        # axis swap if needed
+        axes = {'X':0,'Y':1,'Z':2}
+        target = axes.get(align_axis, 1)
+        ext = mesh.extents
+        curr = int(np.argmax(ext))
+        import trimesh.transformations as tf
+        R = np.eye(4)
+        if curr!=target:
+            # rotate around cross axis
+            axis_map = {(0,1):('z',np.pi/2),(1,0):('z',-np.pi/2),
+                        (0,2):('y',-np.pi/2),(2,0):('y',np.pi/2),
+                        (1,2):('x',np.pi/2),(2,1):('x',-np.pi/2)}
+            key=(curr,target)
+            if key in axis_map:
+                ax,ang = axis_map[key]
+                vec={'x':[1,0,0],'y':[0,1,0],'z':[0,0,1]}[ax]
+                R = tf.rotation_matrix(ang, vec)
+                mesh.apply_transform(R)
+                
+        # NEW: Secondary alignment to standardize rotation around Y-axis
+        if mesh is not None and not mesh.is_empty:
+            # Take multiple cross-sections along Y to find the most elliptical one
+            best_angle = 0
+            best_ratio = 0
+            test_angles = np.linspace(0, np.pi, 18)  # Test 18 different angles (10° increments)
+            
+            # Sampling position near the center (can be adjusted)
+            sample_pos = np.array([0.0, 0.0, 0.0])
+            
+            for angle in test_angles:
+                # Create rotation matrix around Y-axis
+                rot = tf.rotation_matrix(angle, [0, 1, 0])
+                test_mesh = mesh.copy()
+                test_mesh.apply_transform(rot)
+                
+                # Take cross section
+                section = test_mesh.section(
+                    plane_origin=sample_pos,
+                    plane_normal=[0, 1, 0]
+                )
+                
+                if section is not None and len(section.entities) > 0:
+                    # Get 2D representation
+                    path_2D, _ = section.to_2D()
+                    if path_2D.vertices is not None and len(path_2D.vertices) >= 3:
+                        # Calculate aspect ratio using PCA
+                        pca = PCA(n_components=2).fit(path_2D.vertices)
+                        var = pca.explained_variance_
+                        if len(var) == 2 and var[1] > 1e-6:  # Avoid division by zero
+                            ratio = var[0] / var[1]
+                            # Choose orientation that gives most elliptical cross-section
+                            if ratio > best_ratio:
+                                best_ratio = ratio
+                                best_angle = angle
+            
+            if best_ratio > 1.0:  # Only rotate if we found a good orientation
+                # Apply the best rotation
+                final_rot = tf.rotation_matrix(best_angle, [0, 1, 0])
+                mesh.apply_transform(final_rot)
+                # Update the full transform
+                R = final_rot.dot(R)
+        
+        # recenter
+        mesh.apply_translation(-mesh.centroid)
+        # combine transforms
+        full_T = R.dot(T)
+        return mesh, full_T
     except Exception as e:
-        print(f"  Error loading/aligning mesh {file_path}: {e}")
-        return None, np.eye(4)
-    
+        print(f"Error in load_and_align_mesh: {e}")
+        return None, None
+
+
 def get_radial_dimensions(mesh, center=None, ray_count=36):
-    """Performs radial ray casting from the center to find inner/outer points."""
-    if center is None:
-        center = mesh.centroid
-
-    ray_angles = np.linspace(0, 2*np.pi, ray_count, endpoint=False)
-    inner_points = []
-    outer_points = []
-
-    for angle in ray_angles:
-        direction = np.array([np.cos(angle), np.sin(angle), 0.0])
-        # Ensure origin is a list/array of points
-        origins = np.array([center])
-        directions = np.array([direction])
-        try:
-            locations, _, _ = mesh.ray.intersects_location(origins, directions)
-            if len(locations) >= 2:
-                dists = np.linalg.norm(locations - center, axis=1)
-                sorted_idx = np.argsort(dists)
-                inner_points.append(locations[sorted_idx[0]])
-                outer_points.append(locations[sorted_idx[-1]])
-        except Exception as ray_err:
-             print(f"  Warning: Ray casting error at angle {np.degrees(angle):.1f}: {ray_err}")
-
-
-    if not inner_points or not outer_points:
-        print("  Warning: Ray casting failed to find sufficient inner/outer points.")
+    """Return inner, outer, centerline, avg_minor_radius or (None...)
+    """
+    import numpy as np
+    if mesh is None or mesh.is_empty:
         return None, None, None, None
+    c = center if center is not None else mesh.centroid
+    angles = np.linspace(0,2*np.pi,ray_count,endpoint=False)
+    inner, outer = [], []
+    for a in angles:
+        dir = np.array([np.cos(a),np.sin(a),0.])
+        pts, _, _ = mesh.ray.intersects_location([c],[dir])
+        if len(pts)>=2:
+            d = np.linalg.norm(pts - c,axis=1)
+            idx = np.argsort(d)
+            inner.append(pts[idx[0]]); outer.append(pts[idx[-1]])
+    if not inner:
+        return None, None, None, None
+    inner, outer = np.array(inner), np.array(outer)
+    raw_center = (inner+outer)/2    
+    avg = np.mean(np.linalg.norm(outer-inner,axis=1))/2
+    return inner, outer, raw_center, avg
 
-    inner_points = np.array(inner_points)
-    outer_points = np.array(outer_points)
-    raw_centerline_points = (inner_points + outer_points) / 2.0
-    avg_minor_radius = np.mean(np.linalg.norm(outer_points - inner_points, axis=1)) / 2.0
-
-    print(f"  Ray casting complete. Avg minor radius: {avg_minor_radius:.4f}")
-    return inner_points, outer_points, raw_centerline_points, avg_minor_radius
 
 def fit_centerline_ellipse(raw_centerline_points, center):
-    """Fits an ellipse to the 2D projection of centerline points."""
-    if raw_centerline_points is None or len(raw_centerline_points) < 3 or center is None:
-        return None, None, None # Cannot fit
-
-    xy_centerline = raw_centerline_points[:, :2]
-    center_xy = center[:2]
-    r = np.linalg.norm(xy_centerline - center_xy, axis=1)
-    theta = np.arctan2(xy_centerline[:, 1] - center_xy[1], xy_centerline[:, 0] - center_xy[0])
-
-    # Initial guess based on mean radius
-    major_radius_est = np.mean(r)
-    if major_radius_est <= 1e-6: return None, None, None # Avoid fitting zero radius
-    initial_guess = [major_radius_est, major_radius_est, 0]
-
+    """Fit ellipse to 2D projection, return (a,b,phi) or (None,...)."""
+    import numpy as np
+    from scipy.optimize import curve_fit
+    if raw_centerline_points is None or len(raw_centerline_points)<3:
+        return None, None, None
+    xy = raw_centerline_points[:,:2]
+    cen = center[:2]
+    r = np.linalg.norm(xy-cen,axis=1)
+    th = np.arctan2(xy[:,1]-cen[1], xy[:,0]-cen[0])
+    guess=[np.mean(r),np.mean(r),0.]
     try:
-        params, _ = curve_fit(ellipse, theta, r, p0=initial_guess) # Assumes ellipse function exists
-        cl_a, cl_b, cl_phi = params
-        cl_phi = cl_phi % np.pi # Keep angle in [0, pi)
+        params,_ = curve_fit(ellipse, th, r, p0=guess)
+        a,b,phi=params
+        if a<b:
+            a,b=b,a; phi=(phi+np.pi/2)%np.pi
+        return a,b,phi
+    except Exception:
+        return None, None, None
 
-        # Ensure cl_a is the semi-major axis
-        if cl_a < cl_b:
-            cl_a, cl_b = cl_b, cl_a
-            cl_phi = (cl_phi + np.pi/2) % np.pi
 
-        print(f"  Fitted centerline ellipse: a={cl_a:.3f}, b={cl_b:.3f}, phi={np.degrees(cl_phi):.1f}°")
-        return cl_a, cl_b, cl_phi
-    except Exception as e:
-        print(f"  Error fitting centerline ellipse: {e}")
-        return None, None, None  
-    
 def filter_section_points(points_2D, minor_radius, origin_2d_target, eps_factor=0.20, min_samples=3):
-    """Filters 2D section points using DBSCAN and proximity/containment checks."""
-    if points_2D is None or len(points_2D) < min_samples:
-        return np.empty((0, 2)), np.array([], dtype=bool) # Return empty array and mask
-
-    eps_value = minor_radius * eps_factor
-    try:
-        clustering = DBSCAN(eps=eps_value, min_samples=min_samples).fit(points_2D)
-        labels = clustering.labels_
-    except Exception as db_err:
-         print(f"  Warning: DBSCAN failed: {db_err}")
-         return points_2D, np.ones(len(points_2D), dtype=bool) # Return all points if DBSCAN fails
-
-    unique_labels = np.unique(labels)
-    valid_labels = unique_labels[unique_labels != -1]
-
-    best_label = -1
-    final_mask = np.zeros(len(points_2D), dtype=bool)
-
-    if len(valid_labels) > 0:
-        cluster_distances = {}
-        for label in valid_labels:
-            label_mask = (labels == label)
-            cluster_points_2d = points_2D[label_mask]
-            if len(cluster_points_2d) < min_samples: continue
-            distances = np.linalg.norm(cluster_points_2d - origin_2d_target, axis=1)
-            avg_distance = np.mean(distances)
-            cluster_distances[label] = avg_distance
-
-        if not cluster_distances: # No valid clusters after size check
-             print("  No substantial clusters found after DBSCAN.")
-             return np.empty((0, 2)), final_mask
-
-        sorted_labels = sorted(cluster_distances, key=cluster_distances.get)
-
-        for label in sorted_labels:
-            label_mask = (labels == label)
-            cluster_points_2d = points_2D[label_mask]
-
-            # Point-in-Polygon Check (Optional but good)
-            origin_is_inside = False
-            try:
-                ordered_cluster_pts = order_points(cluster_points_2d, method="angular") # Assumes order_points exists
-                path = Path(ordered_cluster_pts)
-                if path.contains_point(origin_2d_target):
-                    origin_is_inside = True
-                    print(f"  Cluster {label}: Origin is INSIDE polygon. Selecting.")
-                else:
-                    print(f"  Cluster {label}: Origin is OUTSIDE polygon. Skipping.")
-            except Exception as path_err:
-                print(f"  Warning: Point-in-polygon check failed for cluster {label}: {path_err}. Selecting based on distance.")
-                origin_is_inside = True # Select if check fails
-
-            if origin_is_inside:
-                best_label = label
-                final_mask = (labels == best_label)
-                break # Found suitable cluster
-
-        if best_label == -1:
-            print("  No suitable cluster found after distance and containment checks.")
-    else:
-        print("  No valid clusters found via DBSCAN.")
-
-    return points_2D[final_mask], final_mask
+    """Return filtered 2D points array only, with largest-cluster fallback."""
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+    pts = np.asarray(points_2D)
+    if pts.ndim!=2 or pts.shape[1]!=2 or len(pts)<min_samples:
+        return np.empty((0,2))
+    db = DBSCAN(eps=minor_radius*eps_factor, min_samples=min_samples).fit(pts)
+    labels = db.labels_
+    unique = [l for l in set(labels) if l!=-1]
+    if not unique:
+        return pts
+    # pick cluster containing origin or largest
+    best=None; best_size=0
+    for l in unique:
+        cluster=pts[labels==l]
+        size=len(cluster)
+        if best is None or size>best_size:
+            best, best_size = l, size
+    return pts[labels==best]
