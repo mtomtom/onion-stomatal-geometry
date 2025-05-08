@@ -336,7 +336,7 @@ def analyze_midpoint_cross_section(file_paths, output_dir=None, visualize=False)
 def create_combined_midpoint_2d_plot(results_data, output_path):
     print(f"\nCreating combined 2D overlay plot at: {output_path}")
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title('Combined Midpoint Cross-Sections (Centered, from Aligned Meshes)')
+    ax.set_title('Combined Midpoint Cross-Sections (Horizontally Aligned)')
     ax.set_aspect('equal')
     ax.grid(True)
     ax.set_xlabel("X (section 2D coords)")
@@ -353,29 +353,43 @@ def create_combined_midpoint_2d_plot(results_data, output_path):
     max_extent = 0
     
     for i, (file_path, data) in enumerate(valid_files_data.items()):
-        points_2d = data[0] # final_points_2D
-        center_pt = np.mean(points_2d, axis=0)
-        centered_points_for_plot = points_2d - center_pt
+        points_2d = data[0]  # final_points_2D
         
-        # Compute centroid of the points
-        pts = centered_points_for_plot
-        centroid = np.mean(pts, axis=0)
-
-        # Re‐center around (0,0), then angularly sort
-        recentered = pts - centroid
-        ordered = csf.order_points(recentered, method="nearest", center=np.array([0.0, 0.0]))
-
+        # Center the points
+        center_pt = np.mean(points_2d, axis=0)
+        centered_points = points_2d - center_pt
+        
+        # Find principal components to determine rotation angle
+        pca = PCA(n_components=2)
+        pca.fit(centered_points)
+        
+        # Get the angle of the first principal component (major axis)
+        # arctan2 gives angle in range [-pi, pi]
+        angle = np.arctan2(pca.components_[0, 1], pca.components_[0, 0])
+        
+        # Create rotation matrix to align major axis with x-axis (horizontal)
+        # We want to rotate by -angle to make it horizontal
+        rotation_matrix = np.array([
+            [np.cos(-angle), -np.sin(-angle)],
+            [np.sin(-angle), np.cos(-angle)]
+        ])
+        
+        # Apply rotation
+        rotated_points = centered_points @ rotation_matrix.T
+        
+        # Order points for clean perimeter visualization
+        ordered = csf.order_points(rotated_points, method="nearest")
+        
         # Close the loop
         if len(ordered) > 0:
             loop = np.vstack([ordered, ordered[0]])
             ax.plot(loop[:, 0], loop[:, 1], '-', color=colors[i],
                     linewidth=2, alpha=0.7, label=os.path.basename(file_path))
-
-            # Update max_extent as before
+            
+            # Update max_extent for plot limits
             current_max_extent = np.max(np.abs(ordered))
             if current_max_extent > max_extent:
                 max_extent = current_max_extent
-
                 
     if max_extent == 0: max_extent = 1.0
     limit = max_extent * 1.15
@@ -390,7 +404,7 @@ def create_combined_midpoint_2d_plot(results_data, output_path):
     try:
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
-        print(f"  Successfully saved combined 2D plot.")
+        print(f"  Successfully saved horizontally aligned combined 2D plot.")
     except Exception as e:
         print(f"  Error saving combined 2D plot: {e}")
     finally:
