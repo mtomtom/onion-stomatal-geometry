@@ -430,77 +430,85 @@ def load_and_align_mesh(file_path, align_axis='Y'):
         mesh = trimesh.load_mesh(file_path)
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
-        # center
-        mesh.apply_translation(-mesh.centroid)
-        # inertia alignment
-        T = mesh.principal_inertia_transform
-        mesh.apply_transform(T)
-        # axis swap if needed
-        axes = {'X':0,'Y':1,'Z':2}
-        target = axes.get(align_axis, 1)
-        ext = mesh.extents
-        curr = int(np.argmax(ext))
-        import trimesh.transformations as tf
-        R = np.eye(4)
-        if curr!=target:
-            # rotate around cross axis
-            axis_map = {(0,1):('z',np.pi/2),(1,0):('z',-np.pi/2),
-                        (0,2):('y',-np.pi/2),(2,0):('y',np.pi/2),
-                        (1,2):('x',np.pi/2),(2,1):('x',-np.pi/2)}
-            key=(curr,target)
-            if key in axis_map:
-                ax,ang = axis_map[key]
-                vec={'x':[1,0,0],'y':[0,1,0],'z':[0,0,1]}[ax]
-                R = tf.rotation_matrix(ang, vec)
-                mesh.apply_transform(R)
-                
-        # NEW: Secondary alignment to standardize rotation around Y-axis
-        if mesh is not None and not mesh.is_empty:
-            # Take multiple cross-sections along Y to find the most elliptical one
-            best_angle = 0
-            best_ratio = 0
-            test_angles = np.linspace(0, np.pi, 18)  # Test 18 different angles (10° increments)
-            
-            # Sampling position near the center (can be adjusted)
-            sample_pos = np.array([0.0, 0.0, 0.0])
-            
-            for angle in test_angles:
-                # Create rotation matrix around Y-axis
-                rot = tf.rotation_matrix(angle, [0, 1, 0])
-                test_mesh = mesh.copy()
-                test_mesh.apply_transform(rot)
-                
-                # Take cross section
-                section = test_mesh.section(
-                    plane_origin=sample_pos,
-                    plane_normal=[0, 1, 0]
-                )
-                
-                if section is not None and len(section.entities) > 0:
-                    # Get 2D representation
-                    path_2D, _ = section.to_2D()
-                    if path_2D.vertices is not None and len(path_2D.vertices) >= 3:
-                        # Calculate aspect ratio using PCA
-                        pca = PCA(n_components=2).fit(path_2D.vertices)
-                        var = pca.explained_variance_
-                        if len(var) == 2 and var[1] > 1e-6:  # Avoid division by zero
-                            ratio = var[0] / var[1]
-                            # Choose orientation that gives most elliptical cross-section
-                            if ratio > best_ratio:
-                                best_ratio = ratio
-                                best_angle = angle
-            
-            if best_ratio > 1.0:  # Only rotate if we found a good orientation
-                # Apply the best rotation
-                final_rot = tf.rotation_matrix(best_angle, [0, 1, 0])
-                mesh.apply_transform(final_rot)
-                # Update the full transform
-                R = final_rot.dot(R)
         
-        # recenter
-        mesh.apply_translation(-mesh.centroid)
-        # combine transforms
-        full_T = R.dot(T)
+        # --- START: MODIFICATIONS TO DISABLE ALIGNMENT ---
+        # # center
+        # mesh.apply_translation(-mesh.centroid)
+        # # inertia alignment
+        # T = mesh.principal_inertia_transform
+        # mesh.apply_transform(T)
+        # # axis swap if needed
+        # axes = {'X':0,'Y':1,'Z':2}
+        # target = axes.get(align_axis, 1)
+        # ext = mesh.extents
+        # curr = int(np.argmax(ext))
+        import trimesh.transformations as tf
+        # R = np.eye(4) # Initialize R as identity if other transforms are skipped
+        # if curr!=target:
+        #     # rotate around cross axis
+        #     axis_map = {(0,1):('z',np.pi/2),(1,0):('z',-np.pi/2),
+        #                 (0,2):('y',-np.pi/2),(2,0):('y',np.pi/2),
+        #                 (1,2):('x',np.pi/2),(2,1):('x',-np.pi/2)}
+        #     key=(curr,target)
+        #     if key in axis_map:
+        #         ax,ang = axis_map[key]
+        #         vec={'x':[1,0,0],'y':[0,1,0],'z':[0,0,1]}[ax]
+        #         R = tf.rotation_matrix(ang, vec)
+        #         mesh.apply_transform(R)
+                
+        # # NEW: Secondary alignment to standardize rotation around Y-axis
+        # if mesh is not None and not mesh.is_empty:
+        #     # Take multiple cross-sections along Y to find the most elliptical one
+        #     best_angle = 0
+        #     best_ratio = 0
+        #     test_angles = np.linspace(0, np.pi, 18)  # Test 18 different angles (10° increments)
+            
+        #     # Sampling position near the center (can be adjusted)
+        #     sample_pos = np.array([0.0, 0.0, 0.0])
+            
+        #     for angle in test_angles:
+        #         # Create rotation matrix around Y-axis
+        #         rot = tf.rotation_matrix(angle, [0, 1, 0])
+        #         test_mesh = mesh.copy()
+        #         test_mesh.apply_transform(rot)
+                
+        #         # Take cross section
+        #         section = test_mesh.section(
+        #             plane_origin=sample_pos,
+        #             plane_normal=[0, 1, 0]
+        #         )
+                
+        #         if section is not None and len(section.entities) > 0:
+        #             # Get 2D representation
+        #             path_2D, _ = section.to_2D()
+        #             if path_2D.vertices is not None and len(path_2D.vertices) >= 3:
+        #                 # Calculate aspect ratio using PCA
+        #                 from sklearn.decomposition import PCA # Ensure PCA is imported if this block is active
+        #                 pca = PCA(n_components=2).fit(path_2D.vertices)
+        #                 var = pca.explained_variance_
+        #                 if len(var) == 2 and var[1] > 1e-6:  # Avoid division by zero
+        #                     ratio = var[0] / var[1]
+        #                     # Choose orientation that gives most elliptical cross-section
+        #                     if ratio > best_ratio:
+        #                         best_ratio = ratio
+        #                         best_angle = angle
+            
+        #     if best_ratio > 1.0:  # Only rotate if we found a good orientation
+        #         # Apply the best rotation
+        #         final_rot = tf.rotation_matrix(best_angle, [0, 1, 0])
+        #         mesh.apply_transform(final_rot)
+        #         # Update the full transform
+        #         R = final_rot.dot(R)
+        
+        # # recenter
+        # mesh.apply_translation(-mesh.centroid)
+        # # combine transforms
+        # full_T = R.dot(T)
+
+        # If all alignment is disabled, full_T should be an identity matrix
+        full_T = np.eye(4)
+        # --- END: MODIFICATIONS TO DISABLE ALIGNMENT ---
+
         return mesh, full_T
     except Exception as e:
         print(f"Error in load_and_align_mesh: {e}")
