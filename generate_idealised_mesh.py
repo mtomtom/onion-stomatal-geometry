@@ -11,7 +11,7 @@ import cross_section_functions as csf
 
 # --- Import necessary functions ---
 try:
-    from midpoint_cross_sections import analyze_cross_section
+    from test_functions import analyze_cross_section
     from cross_section_functions import ellipse as fit_ellipse_func
 except ImportError as e:
     print(f"ERROR: Could not import necessary functions: {e}")
@@ -416,46 +416,134 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
 
     return single_cell, center
 
-
-def get_modulated_AR(theta_cl, cl_phi, AR_mid, AR_min, transition_power=2.0): # transition_power is now less relevant here
+def get_modulated_AR(theta_cl, cl_phi, AR_mid, AR_tip,
+                     bulge_width=0.2, preserve_area=False, minor_axis_ref=1.0):
     """
-    Calculates a modulated aspect ratio that maintains AR_mid along most of the guard cell
-    with a transition to AR_min only at the tips.
+    Calculate aspect ratio modulation along the guard cell curve.
+    
+    Args:
+        theta_cl: Current angle along centerline
+        cl_phi: Centerline orientation angle
+        AR_mid: Aspect ratio at midpoint (baseline)
+        AR_tip: Target aspect ratio at tips
+        bulge_width: Controls transition rate
+        preserve_area: If True, preserve cross-sectional area; if False, preserve major axis
+        minor_axis_ref: Reference minor axis length
+    
+    Returns:
+        tuple: (semi-major axis, semi-minor axis) for the cross-section
     """
-    if AR_mid <= AR_min:
-        return AR_mid  # No modulation needed
-
-    # Calculate angular distance from nearest major axis point (0 to pi/2)
+    # Relative position along arc from side (0) to tip (1)
     relative_angle = (theta_cl - cl_phi) % (2 * np.pi)
-    dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi))  # 0 at major, pi/2 at minor
-
-    # Normalize to 0-1 range (0 at sides, 1 at tips)
-    normalized_dist = dist_to_major / (np.pi/2)
-
-    # EXPLICIT CONTROL: Define exact threshold where transition begins
-    # --- INCREASE FLAT ZONE SIGNIFICANTLY ---
-    flat_zone = 0.6  # Stay at AR_mid for 95% of the distance from side to tip
-                      # Adjust this value (0.9 - 0.98)
-
-    if normalized_dist <= flat_zone:
-        # Within the flat zone - maintain AR_mid exactly
-        modulation = 0.0
+    dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi))
+    normalized_pos = dist_to_major / (np.pi / 2)  # 0 at sides, 1 at tips
+    
+    # Create tip-only modulation with threshold function
+    threshold = 0.7  # Only apply bulging in the outer 30% toward tips
+    if normalized_pos > threshold:
+        # Normalize position within the transition zone
+        zone_pos = (normalized_pos - threshold) / (1.0 - threshold)
+        # Apply stronger modulation in the transition zone
+        modulation = zone_pos**2 * (3 - 2 * zone_pos)
     else:
-        # In the transition zone - smooth curve
-        # Rescale position in transition zone to 0-1
-        transition_pos = (normalized_dist - flat_zone) / (1.0 - flat_zone)
-        # --- USE POWER > 1 FOR SLOWER INITIAL TRANSITION ---
-        # This makes modulation stay near 0 longer within the transition zone
-        modulation = transition_pos ** 4.0 # Try high power (e.g., 2.0, 4.0, 6.0)
+        modulation = 0.0  # No modulation (keep AR_mid) for most of the cell
+    
+    # Calculate modulated aspect ratio
+    current_AR = AR_mid - (AR_mid - AR_tip) * modulation
+    
+    # Calculate semi-axes based on area preservation choice
+    if preserve_area:
+        # Preserve area - adjust both axes to keep πab constant
+        A_ref = np.pi * AR_mid * (minor_axis_ref ** 2)
+        b = np.sqrt(A_ref / (np.pi * current_AR))
+        a = current_AR * b
+    else:
+        # Preserve major axis - only adjust minor axis
+        # Assuming a > b and a is aligned with the major axis
+        a_mid = AR_mid * minor_axis_ref
+        b_mid = minor_axis_ref
+        
+        # Keep the same major axis and only adjust minor axis
+        a = a_mid  # Major axis stays constant
+        b = a / current_AR  # Minor axis changes to achieve new AR
+    
+    return a, b
 
-    # Calculate final AR
-    current_AR = AR_mid - (AR_mid - AR_min) * modulation
-
-    # Debug output (keep this active)
-    print(f"  theta={np.degrees(theta_cl):.1f}, dist_major={np.degrees(dist_to_major):.1f}, " +
-          f"norm={normalized_dist:.3f}, mod={modulation:.4f}, AR={current_AR:.4f}")
-
-    return current_AR
+def visualize_modulation_distribution(params, output_path, threshold=0.7):
+    """
+    Visualizes how the normalized_pos and resulting modulation values
+    are distributed along the guard cell centerline.
+    """
+    try:
+        # Generate full centerline with high resolution
+        centerline_theta = np.linspace(0, 2*np.pi, 360)
+        centerline_r = fit_ellipse_func(centerline_theta, params['cl_a'], params['cl_b'], params['cl_phi'])
+        centerline_x = params['center_xy'][0] + centerline_r * np.cos(centerline_theta)
+        centerline_y = params['center_xy'][1] + centerline_r * np.sin(centerline_theta)
+        
+        # Calculate normalized_pos and modulation for each point
+        normalized_pos_values = []
+        modulation_values = []
+        
+        for theta in centerline_theta:
+            # Calculate normalized position (0 at sides, 1 at tips)
+            relative_angle = (theta - params['cl_phi']) % (2 * np.pi)
+            dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi))
+            normalized_pos = dist_to_major / (np.pi / 2)
+            
+            # Calculate modulation using the threshold function
+            if normalized_pos > threshold:
+                zone_pos = (normalized_pos - threshold) / (1.0 - threshold)
+                modulation = zone_pos ** 2
+            else:
+                modulation = 0.0
+                
+            normalized_pos_values.append(normalized_pos)
+            modulation_values.append(modulation)
+            
+        normalized_pos_values = np.array(normalized_pos_values)
+        modulation_values = np.array(modulation_values)
+        
+        # Create visualization with three plots
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Plot 1: Centerline colored by normalized_pos
+        sc1 = ax1.scatter(centerline_x, centerline_y, c=normalized_pos_values, cmap='viridis', s=30)
+        ax1.plot(centerline_x, centerline_y, 'k-', alpha=0.3)
+        ax1.set_title('Normalized Position (0=sides, 1=tips)')
+        ax1.set_xlabel('X'); ax1.set_ylabel('Y')
+        ax1.axis('equal')
+        fig.colorbar(sc1, ax=ax1)
+        
+        # Plot 2: Centerline colored by modulation value
+        sc2 = ax2.scatter(centerline_x, centerline_y, c=modulation_values, cmap='plasma', s=30)
+        ax2.plot(centerline_x, centerline_y, 'k-', alpha=0.3)
+        ax2.set_title(f'Modulation Value (Threshold={threshold})')
+        ax2.set_xlabel('X'); ax2.set_ylabel('Y')
+        ax2.axis('equal')
+        fig.colorbar(sc2, ax=ax2)
+        
+        # Plot 3: Values vs Angular position
+        ax3.plot(centerline_theta, normalized_pos_values, 'b-', label='Normalized Position')
+        ax3.axhline(y=threshold, color='r', linestyle='--', label=f'Threshold ({threshold})')
+        ax3.plot(centerline_theta, modulation_values, 'g-', label='Modulation Value')
+        ax3.set_title('Position Values vs Angular Position')
+        ax3.set_xlabel('Angle along centerline (radians)')
+        ax3.set_ylabel('Value')
+        ax3.grid(True)
+        ax3.legend()
+        
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close(fig)
+        
+        print(f"  Modulation visualization saved to: {output_path}")
+        return True
+        
+    except Exception as e:
+        print(f"  Error creating modulation visualization: {e}")
+        traceback.print_exc()
+        return False
 
 def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerline_segments=64,
                                        num_cross_section_points=64, visualize_steps=True,
@@ -480,6 +568,11 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
         if visualize_steps:
             print("STEP 3: Visualizing centerline (Bulging)...")
             # (Add simplified visualization code here if desired, similar to standard Step 3)
+            viz_dir = os.path.dirname(output_path)
+            if viz_dir and not os.path.exists(viz_dir):
+                os.makedirs(viz_dir)
+            modulation_viz_path = os.path.join(viz_dir, f'modulation_distribution_{os.path.basename(output_path)}.png')
+            visualize_modulation_distribution(params, modulation_viz_path, threshold=0.7)
             try:
                 fig, ax1 = plt.subplots(1, 1, figsize=(7, 7))
                 centerline_theta = np.linspace(0, 2*np.pi, 100)
@@ -516,10 +609,13 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
         half_theta_angles = np.linspace(params['cl_phi'], params['cl_phi'] + np.pi, len(half_centerline)) # Recalculate angles for modulation
 
         for i, theta_cl in enumerate(half_theta_angles):
-            current_AR = get_modulated_AR(theta_cl, params['cl_phi'] + np.pi/2, params['AR_mid'], min_aspect_ratio, transition_power)
-            current_cs_b = np.sqrt(params['target_area'] / (np.pi * current_AR))
-            current_cs_a = current_AR * current_cs_b
-
+            # When preserve_area=True, get_modulated_AR returns (a,b) not AR
+            current_cs_a, current_cs_b = get_modulated_AR(theta_cl, params['cl_phi'] + np.pi/2, 
+                        params['AR_mid'], min_aspect_ratio,
+                        bulge_width=0.2, preserve_area=False, minor_axis_ref=params['cs_b_mid'])
+            
+            # No need to recalculate - the function already did the area-preserving calculation
+            
             cs_x = current_cs_a * np.cos(cs_base_angles)
             cs_y = current_cs_b * np.sin(cs_base_angles)
             cs_vertices = np.column_stack([cs_x, cs_y])
