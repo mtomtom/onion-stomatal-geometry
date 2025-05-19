@@ -18,7 +18,7 @@ except ImportError as e:
     analyze_cross_section = None
     fit_ellipse_func = None
 
-def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=False):
+def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=False, pca_width_scale_factor=1.0):
     """
     Helper function to perform Steps 1 & 2:
     - Load mesh, get center.
@@ -94,7 +94,6 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
         if pca_minor_std_dev is None:
              raise ValueError("Could not determine cross-section width from midpoint analysis.")
 
-        pca_width_scale_factor = 1.36 # Keep consistent
         cs_b_mid = pca_minor_std_dev * pca_width_scale_factor
         cs_a_mid = cs_b_mid * AR_mid
         if cs_a_mid < cs_b_mid: cs_a_mid, cs_b_mid = cs_b_mid, cs_a_mid
@@ -336,7 +335,7 @@ def _generate_swept_mesh_with_caps(half_centerline, cross_section_polygons, num_
         return None
 
 def generate_single_guard_cell(input_file_path, output_path, num_centerline_segments=64,
-                              num_cross_section_points=64, visualize_steps=True):
+                              num_cross_section_points=64, visualize_steps=True, pca_width_scale_factor=1.0):
     """
     Generates a SINGLE guard cell with a CONSTANT cross-section using helper functions.
     """
@@ -346,7 +345,7 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
 
     try:
         # --- Steps 1 & 2: Get Parameters ---
-        params = _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=visualize_steps)
+        params = _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=visualize_steps, pca_width_scale_factor=pca_width_scale_factor)
         if params is None: return None, None
         center = params['center'] # Store center for return
 
@@ -444,7 +443,7 @@ def get_modulated_AR(theta_cl, cl_phi, AR_mid, AR_tip,
         # Normalize position within the transition zone
         zone_pos = (normalized_pos - threshold) / (1.0 - threshold)
         # Apply stronger modulation in the transition zone
-        modulation = zone_pos**2 * (3 - 2 * zone_pos)
+        modulation = zone_pos**2
     else:
         modulation = 0.0  # No modulation (keep AR_mid) for most of the cell
     
@@ -547,7 +546,7 @@ def visualize_modulation_distribution(params, output_path, threshold=0.7):
 
 def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerline_segments=64,
                                        num_cross_section_points=64, visualize_steps=True,
-                                       min_aspect_ratio=1.1, transition_power=2.0):
+                                       min_aspect_ratio=1.1, transition_power=2.0, preserve_area=True, pca_width_scale_factor=1.0):
     """
     Generates a SINGLE guard cell with VARYING cross-section using helper functions.
     """
@@ -557,7 +556,11 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
 
     try:
         # --- Steps 1 & 2: Get Parameters ---
-        params = _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=visualize_steps)
+        params = _get_guard_cell_parameters(
+            input_file_path,
+            visualize_midpoint_analysis=visualize_steps,
+            pca_width_scale_factor=pca_width_scale_factor
+        )
         if params is None: return None, None
         center = params['center'] # Store center for return
 
@@ -612,7 +615,7 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
             # When preserve_area=True, get_modulated_AR returns (a,b) not AR
             current_cs_a, current_cs_b = get_modulated_AR(theta_cl, params['cl_phi'] + np.pi/2, 
                         params['AR_mid'], min_aspect_ratio,
-                        bulge_width=0.2, preserve_area=False, minor_axis_ref=params['cs_b_mid'])
+                        bulge_width=0.2, preserve_area=preserve_area, minor_axis_ref=params['cs_b_mid'])
             
             # No need to recalculate - the function already did the area-preserving calculation
             
@@ -648,8 +651,6 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
         return None, None # Return None, None on error
 
     return single_cell, center
-
-# ... (rest of the file, including create_full_stomata_from_half and __main__) ...
 
 
 def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
@@ -789,16 +790,19 @@ def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
 
 # --- Modified Example Usage ---
 if __name__ == '__main__':
-    # --- Select ONE file to process ---
+    ## Set the important parameters
 
-    mesh_list = ["Meshes/OBJ/Ac_DA_1_3.obj", "Meshes/OBJ/Ac_DA_1_2.obj", "Meshes/OBJ/Ac_DA_1_5.obj",
-        "Meshes/OBJ/Ac_DA_1_4.obj", "Meshes/OBJ/Ac_DA_3_7.obj", "Meshes/OBJ/Ac_DA_3_6.obj",
-        "Meshes/OBJ/Ac_DA_3_4.obj", "Meshes/OBJ/Ac_DA_3_3.obj", "Meshes/OBJ/Ac_DA_3_2.obj",
-        "Meshes/OBJ/Ac_DA_3_1.obj", "Meshes/OBJ/Ac_DA_2_7.obj", "Meshes/OBJ/Ac_DA_2_6b.obj",
-        "Meshes/OBJ/Ac_DA_2_6a.obj", "Meshes/OBJ/Ac_DA_2_4.obj", "Meshes/OBJ/Ac_DA_2_3.obj",
-        "Meshes/OBJ/Ac_DA_1_8_mesh.obj", "Meshes/OBJ/Ac_DA_1_6.obj"]
+    preserve_area = True
+    pca_width_scale_factor = 1.21
+
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_3.obj", "Meshes/Onion_OBJ/Ac_DA_1_2.obj", "Meshes/Onion_OBJ/Ac_DA_1_5.obj",
+        "Meshes/Onion_OBJ/Ac_DA_1_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_7.obj", "Meshes/Onion_OBJ/Ac_DA_3_6.obj",
+        "Meshes/Onion_OBJ/Ac_DA_3_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_3.obj", "Meshes/Onion_OBJ/Ac_DA_3_2.obj",
+        "Meshes/Onion_OBJ/Ac_DA_3_1.obj", "Meshes/Onion_OBJ/Ac_DA_2_7.obj", "Meshes/Onion_OBJ/Ac_DA_2_6b.obj",
+        "Meshes/Onion_OBJ/Ac_DA_2_6a.obj", "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj","Meshes/Onion_OBJ/Ac_DA_2_1.obj",
+        "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"]
     
-    mesh_list = ["Meshes/OBJ/Ac_DA_1_5.obj"]
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_2_6a.obj"]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory
@@ -830,7 +834,8 @@ if __name__ == '__main__':
                 single_cell_output_std, # Use the correct variable
                 num_centerline_segments=128, # Use higher resolution for smoother curves
                 num_cross_section_points=64,
-                visualize_steps=True
+                visualize_steps=True,
+                pca_width_scale_factor=pca_width_scale_factor # Adjust this value as needed
             )
             print("-" * 20)
 
@@ -856,7 +861,9 @@ if __name__ == '__main__':
                 num_cross_section_points=64,
                 visualize_steps=True,
                 min_aspect_ratio=1.0, # Adjust this value as needed (e.g., 1.0 for circular ends)
-                transition_power=1.0
+                transition_power=1.0,
+                preserve_area=preserve_area,
+                pca_width_scale_factor=pca_width_scale_factor # Adjust this value as needed
             )
             print("-" * 20)
 
