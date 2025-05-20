@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
 import os
 import trimesh
 from sklearn.decomposition import PCA
@@ -9,7 +10,7 @@ from test_functions import get_radial_dimensions, filter_section_points
 from helper_functions import (_smooth_centerline_savgol, 
                              _project_plane_origin_to_2d, 
                              _calculate_pca_metrics,
-                             order_points)
+                             order_points, _determine_midpoint_plane, _determine_tip_plane_v2)
 import edge_detection as ed
 
 def analyze_centerline_sections(mesh_file, 
@@ -49,155 +50,172 @@ def analyze_centerline_sections(mesh_file,
     mesh = ed_output['mesh_object']
     shared_wall_points = ed_output.get('shared_wall_points')
     pore_center = ed_output.get('pore_center_coords')
-    ray_origin_for_radial_cast = np.array([0.0, 0.0, 0.0])  # Default
-    
-    if pore_center is not None:
-        ray_origin_for_radial_cast = pore_center
-        print(f"  Using pore center from ED as ray origin: {ray_origin_for_radial_cast.round(3)}")
-    else:
-        print("  Warning: Pore center not available. Defaulting to [0,0,0].")
-    
-    # Perform radial ray casting
-    print(f"  Performing radial ray casting from origin: {ray_origin_for_radial_cast.round(3)}")
-    ray_count = 45  # Number of rays for radial casting
+    ray_origin_for_radial_cast = pore_center 
+    print(f"  Performing radial ray casting from origin: {ray_origin_for_radial_cast.round(3) if ray_origin_for_radial_cast is not None else 'mesh centroid (default)'}")
+    ray_count = 45 # Example, adjust as needed
     inner_points, outer_points, raw_centerline_points_from_radial, minor_radius = get_radial_dimensions(
         mesh, center=ray_origin_for_radial_cast, ray_count=ray_count
-    )
-    
-    if (inner_points is None or outer_points is None or 
-        raw_centerline_points_from_radial is None or minor_radius is None):
-        print("  Error: Could not determine dimensions via radial ray casting.")
-        return None
-    
-    print(f"  Estimated Minor Radius: {minor_radius:.3f}")
-    
-    # Smooth the centerline from radial ray casting
+    ) 
     smoothed_centerline = _smooth_centerline_savgol(raw_centerline_points_from_radial)
     if smoothed_centerline is None:
         smoothed_centerline = raw_centerline_points_from_radial
     
-    # Step 2.5: Find tip and midpoint positions along centerline
-    print("  Finding tip and midpoint positions...")
+    if smoothed_centerline is None or len(smoothed_centerline) < 2: # Need at least 2 points for a segment
+        print("  Error: Not enough points in initial smoothed centerline for analysis.")
+        return None
+
+    # Get ED centerline for _determine_tip_plane_v2 if available
+    estimated_centerline_3d_from_ed = ed_output.get('estimated_centerline_points')
+
+    # --- Determine Tip and Midpoint Plane Origins using Helper Functions ---
+    print("  Determining robust tip and midpoint plane origins...")
+    midpoint_plane_origin_3d, _ = _determine_midpoint_plane(
+        smoothed_centerline, 
+        pore_center # This is detected_pore_center_3d_ed from ed_output
+    )
+
+    tip_plane_origin_3d, _, _ = _determine_tip_plane_v2(
+        smoothed_centerline,
+        pore_center, # detected_pore_center_3d_ed
+        shared_wall_points,
+        minor_radius,
+        inner_points, # inner_points_for_refinement
+        min_tip_distance=0.05, # Adjustable: min distance to slide from initial tip
+        estimated_centerline_3d_from_ed=estimated_centerline_3d_from_ed
+    )
+
+    if tip_plane_origin_3d is None or midpoint_plane_origin_3d is None:
+        print("  Error: Could not determine robust tip or midpoint plane origins. Cannot proceed.")
+        return None
     
-    # Find the tip (minimum Y-coordinate)
-    y_coordinates = smoothed_centerline[:, 1]
-    tip_idx = np.argmin(y_coordinates)
-    tip_position = smoothed_centerline[tip_idx]
-    print(f"  Initial tip position (min Y): {tip_position.round(3)}")
+    print(f"  Robust Tip Plane Origin: {tip_plane_origin_3d.round(3)}")
+    print(f"  Robust Midpoint Plane Origin: {midpoint_plane_origin_3d.round(3)}")
+
+    # --- Find closest points on the (radial) smoothed_centerline to these origins ---
+    actual_tip_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline - tip_plane_origin_3d, axis=1))
+    actual_mid_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline - midpoint_plane_origin_3d, axis=1))
+
+    if actual_tip_cl_idx == actual_mid_cl_idx:
+        print("  Error: Tip and Midpoint plane origins map to the same point on the centerline. Cannot form a segment.")
+        # Fallback or error: For now, let's try to use a small segment if this happens,
+        # or you might want to return None.
+        # As a minimal fallback, take a few points around the tip.
+        # This part might need more sophisticated handling based on your data.
+        # For now, let's assume they are distinct enough. If not, the path logic below might be short.
+        if len(smoothed_centerline) > 1:
+             # Attempt to take a very short segment if they are identical
+            _start_idx = actual_tip_cl_idx
+            _end_idx = (actual_tip_cl_idx + 1) % len(smoothed_centerline)
+            if _start_idx == _end_idx and len(smoothed_centerline) > 1: # single point centerline
+                 print("  Single point centerline after tip/midpoint mapping. Cannot proceed.")
+                 return None
+            elif _start_idx == _end_idx: # still same
+                 actual_mid_cl_idx = _end_idx # try to force a segment of 1
+            else: # if distinct after +1
+                 actual_mid_cl_idx = _end_idx
+
+
+    print(f"  Closest CL idx to Tip Origin: {actual_tip_cl_idx} (Point: {smoothed_centerline[actual_tip_cl_idx].round(3)})")
+    print(f"  Closest CL idx to Mid Origin: {actual_mid_cl_idx} (Point: {smoothed_centerline[actual_mid_cl_idx].round(3)})")
+
+    # --- Extract the shortest path segment on smoothed_centerline (loop) ---
+    N_cl = len(smoothed_centerline)
     
-    # Find the midpoint (closest to pore center's Y-coordinate)
-    midpoint_idx = None
-    if pore_center is not None:
-        target_y_for_midpoint = pore_center[1]
-        midpoint_idx = np.argmin(np.abs(y_coordinates - target_y_for_midpoint))
-        midpoint_position = smoothed_centerline[midpoint_idx]
-        print(f"  Midpoint position (at pore Y): {midpoint_position.round(3)}")
+    path1_indices = []
+    curr = actual_tip_cl_idx
+    count1 = 0
+    while True:
+        path1_indices.append(curr)
+        count1 += 1
+        if curr == actual_mid_cl_idx: break
+        if count1 > N_cl : # Safety break if loop doesn't terminate
+            print("  Warning: Path 1 extraction exceeded centerline length.")
+            path1_indices = list(range(N_cl)) # Fallback to full centerline
+            break 
+        curr = (curr + 1) % N_cl
+
+    path2_indices = []
+    curr = actual_tip_cl_idx
+    count2 = 0
+    while True:
+        path2_indices.append(curr)
+        count2 += 1
+        if curr == actual_mid_cl_idx: break
+        if count2 > N_cl: # Safety break
+            print("  Warning: Path 2 extraction exceeded centerline length.")
+            path2_indices = list(range(N_cl)) # Fallback to full centerline
+            break
+        curr = (curr - 1 + N_cl) % N_cl # Ensure positive index before modulo
+
+    final_path_indices = []
+    if len(path1_indices) <= len(path2_indices):
+        final_path_indices = path1_indices
+        print(f"  Selected Path 1 (length {len(path1_indices)}) for centerline segment.")
     else:
-        # If no pore center, use maximum Y as an approximation
-        midpoint_idx = np.argmax(y_coordinates)
-        midpoint_position = smoothed_centerline[midpoint_idx]
-        print(f"  Midpoint position (max Y): {midpoint_position.round(3)}")
+        final_path_indices = path2_indices
+        print(f"  Selected Path 2 (length {len(path2_indices)}) for centerline segment.")
+
+    if not final_path_indices: # Should not happen if N_cl >=1
+        print("  Error: Could not determine a valid path between tip and midpoint.")
+        return None
+
+    centerline_segment_for_analysis = smoothed_centerline[final_path_indices]
     
-    # MODIFY: Calculate initial tangent at tip for shift direction
-    if len(smoothed_centerline) > 1:
-        if 0 < tip_idx < len(smoothed_centerline) - 1:
-            # Use central difference for interior point
-            tangent_vec = smoothed_centerline[tip_idx + 1] - smoothed_centerline[tip_idx - 1]
-        elif tip_idx == 0:
-            # Forward difference for first point
-            tangent_vec = smoothed_centerline[1] - smoothed_centerline[0]
+    if len(centerline_segment_for_analysis) < 2:
+        print(f"  Error: Extracted centerline segment has too few points ({len(centerline_segment_for_analysis)}). Cannot proceed.")
+        return None
+        
+    print(f"  Extracted new centerline segment for analysis with {len(centerline_segment_for_analysis)} points.")
+    
+    # Replace the original smoothed_centerline with this new segment for all subsequent analysis
+    smoothed_centerline = centerline_segment_for_analysis
+    
+    # --- Step 4: Get total centerline segment length for normalization (this part remains similar) ---
+    # Ensure smoothed_centerline now refers to the extracted segment
+    centerline_segments_diff = np.diff(smoothed_centerline, axis=0)
+    segment_lengths = np.linalg.norm(centerline_segments_diff, axis=1)
+    
+    # Handle cases where segment_lengths might be empty (if smoothed_centerline has < 2 points)
+    if len(segment_lengths) == 0: # Implies smoothed_centerline has 0 or 1 point
+        if len(smoothed_centerline) == 1: # Single point segment
+            normalized_distances = np.array([0.0]) # Or handle as an error
+            print("  Warning: Centerline segment is a single point. Normalization may be trivial.")
+        else: # Zero points
+            print("  Error: Centerline segment is empty after path extraction.")
+            return None
+    else:
+        # total_length = np.sum(segment_lengths) # Not strictly needed for normalized_distances
+        cumulative_distances = np.zeros(len(smoothed_centerline))
+        cumulative_distances[1:] = np.cumsum(segment_lengths) # Start cumsum from the first segment
+
+        if cumulative_distances[-1] == 0: # Avoid division by zero if total length is 0 (e.g. all points identical)
+            if len(smoothed_centerline) > 0:
+                normalized_distances = np.zeros(len(smoothed_centerline))
+                print("  Warning: Total length of centerline segment is zero. Normalized distances set to 0.")
+            else: # Should have been caught earlier
+                print("  Error: Centerline segment is empty and has zero length.")
+                return None
         else:
-            # Backward difference for last point
-            tangent_vec = smoothed_centerline[-1] - smoothed_centerline[-2]
-            
-        tangent_norm = np.linalg.norm(tangent_vec)
-        if tangent_norm > 1e-9:
-            tangent = tangent_vec / tangent_norm
-        else:
-            tangent = np.array([0.0, 1.0, 0.0])  # Default fallback
-    else:
-        tangent = np.array([0.0, 1.0, 0.0])  # Default for single point
-    
-    # MODIFY: Move a minimum distance from tip along tangent
-    min_tip_distance = 0.05  # Adjust this value as needed
-    if pore_center is not None:
-        # Project pore_center onto the line defined by tip and tangent
-        v = pore_center - tip_position
-        along = float(np.dot(v, tangent))
-        
-        # Determine maximum slide based on minor radius
-        max_slide = minor_radius if minor_radius and minor_radius > 0 else 0.5
-        
-        # Ensure we move at least min_tip_distance
-        min_slide = min_tip_distance
-        if max_slide < min_slide:
-            max_slide = min_slide
-            
-        # Clamp the shift amount
-        along_clamped = np.clip(along, min_slide, max_slide)
-        
-        # Calculate adjusted tip position
-        adjusted_tip_position = tip_position + along_clamped * tangent
-        
-        # Find centerline point closest to this adjusted position
-        distances = np.linalg.norm(smoothed_centerline - adjusted_tip_position, axis=1)
-        adjusted_tip_idx = np.argmin(distances)
-        print(f"  Adjusted tip position (offset from min Y): {smoothed_centerline[adjusted_tip_idx].round(3)}")
-        
-        # Use adjusted tip as new starting point
-        tip_idx = adjusted_tip_idx
-        tip_position = smoothed_centerline[tip_idx]
-    else:
-        print("  No pore center available for tip adjustment")
-    
-    # Ensure midpoint_idx > tip_idx for proper path extraction
-    if midpoint_idx < tip_idx:
-        # We need to adjust the indices to get the right path
-        # This handles the case where the tip is later in the array than the midpoint
-        midpoint_idx += len(smoothed_centerline)
-    
-    # Extract the path from tip to midpoint
-    path_indices = []
-    current_idx = tip_idx
-    
-    # Add indices wrapping around the end of the array if needed
-    while current_idx % len(smoothed_centerline) != midpoint_idx % len(smoothed_centerline):
-        path_indices.append(current_idx % len(smoothed_centerline))
-        current_idx += 1
-    
-    path_indices.append(midpoint_idx % len(smoothed_centerline))  # Add midpoint
-    
-    # Extract the centerline segment
-    centerline_segment = smoothed_centerline[path_indices]
-    print(f"  Extracted path from tip to midpoint with {len(centerline_segment)} points")
-    
-    # Replace the full centerline with just this segment
-    smoothed_centerline = centerline_segment
-    
-    # Step 4: Get total centerline segment length for normalization
-    centerline_segments = np.diff(smoothed_centerline, axis=0)
-    segment_lengths = np.linalg.norm(centerline_segments, axis=1)
-    total_length = np.sum(segment_lengths)
+            normalized_distances = cumulative_distances / cumulative_distances[-1]
+
+    total_points = len(smoothed_centerline) # This is now the length of the new segment
     
     # Step 5: Sample positions along the centerline segment
     sampled_positions = []
     sampled_tangents = []
     normalized_positions = []
     
-    # Better sampling approach: use equal arc-length sampling along the tip-to-midpoint segment
-    total_points = len(smoothed_centerline)
-    indices = np.linspace(0, total_points-1, num_sections).astype(int)
-    
-    # Precompute all normalized positions (tip=0.0, midpoint=1.0)
-    cumulative_distances = np.zeros(total_points)
-    for i in range(1, total_points):
-        segment = smoothed_centerline[i] - smoothed_centerline[i-1]
-        cumulative_distances[i] = cumulative_distances[i-1] + np.linalg.norm(segment)
-    
-    normalized_distances = cumulative_distances / cumulative_distances[-1]
-    
-    for i in indices:
-        # Get position along centerline
+    # Create evenly spaced PHYSICAL positions
+    target_positions = np.linspace(0, 1.0, num_sections)
+    sampled_indices = []
+
+    # For each target position, find the closest actual point
+    for target in target_positions:
+        idx = np.argmin(np.abs(normalized_distances - target))
+        sampled_indices.append(idx)
+
+    # Use these indices to get positions and calculate tangents
+    for i in sampled_indices:
         position = smoothed_centerline[i]
         sampled_positions.append(position)
         
@@ -228,7 +246,7 @@ def analyze_centerline_sections(mesh_file,
         # Create a Poly3DCollection to render the mesh
         from mpl_toolkits.mplot3d.art3d import Poly3DCollection
         mesh_triangles = vertices[faces]
-        mesh_collection = Poly3DCollection(mesh_triangles, alpha=0.15, edgecolor='gray', 
+        mesh_collection = Poly3DCollection(mesh_triangles, alpha=0.5, edgecolor='gray', 
                                           linewidth=0.1, facecolor='lightgray')
         ax.add_collection3d(mesh_collection)
         
@@ -301,12 +319,12 @@ def analyze_centerline_sections(mesh_file,
         ])
         
         # Set view limits based on center point and reduced max_range
-        ax.set_xlim(center[0] - max_range/2, center[0] + max_range/2)
-        ax.set_ylim(center[1] - max_range/2, center[1] + max_range/2)
-        ax.set_zlim(center[2] - max_range/2, center[2] + max_range/2)
+        #ax.set_xlim(center[0] - max_range/2, center[0] + max_range/2)
+        #ax.set_ylim(center[1] - max_range/2, center[1] + max_range/2)
+        #ax.set_zlim(center[2] - max_range/2, center[2] + max_range/2)
         
         # Adjust the view angle for better visualization
-        ax.view_init(elev=25, azim=40)
+        ax.view_init(elev=90, azim=90)
         
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
@@ -323,9 +341,21 @@ def analyze_centerline_sections(mesh_file,
     widths = []
     section_points_list = []
     section_data_3d = []
+
+    print("DEBUG: >>> Entering MAIN SECTIONING LOOP <<<")
+    print(f"DEBUG: sampled_positions length: {len(sampled_positions)}")
+    print(f"DEBUG: sampled_tangents length: {len(sampled_tangents)}")
+    print(f"DEBUG: normalized_positions length: {len(normalized_positions)}")
     
     for idx, (position, tangent, norm_pos) in enumerate(zip(sampled_positions, sampled_tangents, normalized_positions)):
         print(f"  Analyzing section {idx+1}/{len(sampled_positions)} at position {norm_pos:.2f}")
+
+        # Add this reference vector calculation EARLY
+        ref = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(ref, tangent)) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(ref, tangent)) > 0.9:
+                ref = np.array([0.0, 0.0, 1.0])
         
         # IMPROVED SECTION CREATION
         # Ensure tangent is non-zero
@@ -380,31 +410,51 @@ def analyze_centerline_sections(mesh_file,
             widths.append(None)
             section_points_list.append(None)
             continue
+
+        # After section creation
+        if section is not None:
+            print(f"  Section {idx+1}: Created successfully with {len(section.entities)} entities")
+
+        # After 2D conversion
+        print(f"  Section {idx+1}: 2D projection has {len(points_2D)} points")
+
+        
             
         # Get plane origin in 2D for filtering
-        plane_origin_2d, _ = _project_plane_origin_to_2d(position, transform_2d_to_3d, points_2D)
-        
+        plane_origin_2d, transform_3d_to_2d = _project_plane_origin_to_2d(position, transform_2d_to_3d, points_2D) # CORRECTED LINE
+
         # Get inner/outer points for this section (needed for minor_radius)
-        _, _, _, minor_radius = get_radial_dimensions(mesh, center=position)
-        
-        if minor_radius is None:
-            print(f"  Could not determine radius for section {idx+1}")
+        # _, _, _, section_minor_radius = get_radial_dimensions(mesh, center=position_val) # OLD: per-section calculation
+
+        # NEW: USE THE GLOBALLY ESTIMATED MINOR RADIUS FOR FILTERING
+        # The global 'minor_radius' is already defined earlier in the function.
+        if minor_radius is None: # This checks the global minor_radius calculated earlier
+            print(f"  [CRITICAL FAIL] Global minor_radius is None. Cannot proceed with section {idx+1}.")
             aspect_ratios.append(None)
             widths.append(None)
             section_points_list.append(None)
             continue
+        else:
+            # Use the global minor_radius for filtering this section
+            current_minor_radius_for_filtering = minor_radius
+            print(f"    Using global minor_radius for filtering section {idx+1}: {current_minor_radius_for_filtering:.3f}")
             
-        # Filter the section points to get clean outline
-        filtered_points_2D, _ = filter_section_points(
+        # Filter the section points to get clean outline (around line 416)
+        # Make sure to pass current_minor_radius_for_filtering
+        filtered_points_2D, filter_mask = filter_section_points( # Capture filter_mask
             points_2D, 
-            minor_radius,
+            current_minor_radius_for_filtering, # Use the global minor_radius
             plane_origin_2d,
-            eps_factor=0.15,
-            min_samples=3
+            eps_factor=0.15, # Original value, can be tuned
+            min_samples=3    # Original value, can be tuned
         )
+        # print(f"    Filter mask sum for section {idx+1}: {np.sum(filter_mask)}") # Optional debug
+
+        # After filtering (around line 423)
+        print(f"  Section {idx+1}: After filtering: {len(filtered_points_2D)} points from {len(points_2D)}")
         
         if len(filtered_points_2D) < 3:
-            print(f"  Section {idx+1} has too few points after filtering")
+            print(f"  [FAIL] Section {idx+1} has too few points ({len(filtered_points_2D)}) after filtering. Skipping section.")
             aspect_ratios.append(None)
             widths.append(None)
             section_points_list.append(None)
@@ -413,13 +463,18 @@ def analyze_centerline_sections(mesh_file,
         # Calculate aspect ratio and width 
         aspect_ratio, pca_width = _calculate_pca_metrics(filtered_points_2D, "section")
 
+        print(f"  Section {idx+1}: position {norm_pos:.2f}, " 
+              f"valid={aspect_ratio is not None}, "
+              f"AR={(f'{aspect_ratio:.2f}' if aspect_ratio is not None else 'None')}")
+
+
         # Store the values
         aspect_ratios.append(aspect_ratio)
         widths.append(pca_width)
         section_points_list.append(filtered_points_2D)
         
         # After calculating aspect_ratio and width, add:
-        if aspect_ratio <= 1.6:
+        if aspect_ratio <= 30.0:
             # Store section data for 3D visualization
             # Transform 2D points back to 3D for visualization
             v1 = np.cross(tangent, ref)
@@ -434,11 +489,12 @@ def analyze_centerline_sections(mesh_file,
                 section_points_3d.append(p3d)
                 
             section_data_3d.append({
-                'points_3d': np.array(section_points_3d),
+                'points_2d': filtered_points_2D,
                 'position': position,
                 'tangent': tangent,
                 'norm_pos': norm_pos,
-                'aspect_ratio': aspect_ratio
+                'aspect_ratio': aspect_ratio,
+                'transform': transform_2d_to_3d  # Add this line to store the transform
             })
         
     # Step 7: Create visualizations
@@ -485,7 +541,6 @@ def analyze_centerline_sections(mesh_file,
             os.path.join(output_dir, f"{base_name}_section_montage.png")
         )
         
-        # NEW: Create 3D visualization with actual cross-sections
         if section_data_3d:
             fig = plt.figure(figsize=(12, 10))
             ax = fig.add_subplot(111, projection='3d')
@@ -496,8 +551,8 @@ def analyze_centerline_sections(mesh_file,
             
             from mpl_toolkits.mplot3d.art3d import Poly3DCollection
             mesh_triangles = vertices[faces]
-            mesh_collection = Poly3DCollection(mesh_triangles, alpha=0.1, edgecolor='gray', 
-                                              linewidth=0.05, facecolor='lightgray')
+            mesh_collection = Poly3DCollection(mesh_triangles, alpha=0.5, edgecolor='gray', 
+                                            linewidth=0.05, facecolor='lightgray')
             ax.add_collection3d(mesh_collection)
             
             # Plot centerline
@@ -507,14 +562,29 @@ def analyze_centerline_sections(mesh_file,
             # Plot cross-sections
             cmap = plt.cm.plasma
             for idx, section in enumerate(section_data_3d):
-                points_3d = section['points_3d']
+                points_2d = section['points_2d']  # Get the 2D points
+                transform = section['transform']  # Get the transform matrix
                 norm_pos = section['norm_pos']
                 
                 # Create color based on position
                 color = cmap(norm_pos)
                 
                 # Order points for clean visualization
-                # For 3D we'll just close the loop of the existing points
+                ordered_points_2d = order_points(points_2d, method="angular")
+                
+                # Transform 2D points back to 3D using the stored transform matrix
+                points_3d = []
+                for pt_2d in ordered_points_2d:
+                    # Create homogeneous coordinates
+                    pt_2d_h = np.array([pt_2d[0], pt_2d[1], 0.0, 1.0])  # Add z=0 and w=1
+                    # Apply transformation
+                    pt_3d_h = transform.dot(pt_2d_h)
+                    # Convert back from homogeneous
+                    points_3d.append(pt_3d_h[:3])
+                
+                points_3d = np.array(points_3d)
+                
+                # Close the loop for plotting
                 pts_closed = np.vstack([points_3d, points_3d[0]])
                 
                 # Draw outline
@@ -529,8 +599,8 @@ def analyze_centerline_sections(mesh_file,
                 # Add small label with position
                 pos = section['position']
                 ax.text(pos[0], pos[1], pos[2], f"{norm_pos:.2f}", 
-                       fontsize=8, color='white', 
-                       horizontalalignment='center', verticalalignment='center')
+                    fontsize=8, color='white', 
+                    horizontalalignment='center', verticalalignment='center')
             
             # Add sampled points
             positions = np.array([s['position'] for s in section_data_3d])
@@ -545,12 +615,12 @@ def analyze_centerline_sections(mesh_file,
                 np.ptp(smoothed_centerline[:, 2])
             ])
             
-            ax.set_xlim(center[0] - max_range/2, center[0] + max_range/2)
-            ax.set_ylim(center[1] - max_range/2, center[1] + max_range/2)
-            ax.set_zlim(center[2] - max_range/2, center[2] + max_range/2)
+            #ax.set_xlim(center[0] - max_range/2, center[0] + max_range/2)
+            #ax.set_ylim(center[1] - max_range/2, center[1] + max_range/2)
+            #ax.set_zlim(center[2] - max_range/2, center[2] + max_range/2)
             
             # Set good viewing angle
-            ax.view_init(elev=30, azim=45)
+            ax.view_init(elev=60, azim=90)
             
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
@@ -562,6 +632,110 @@ def analyze_centerline_sections(mesh_file,
             plt.savefig(in_situ_path, dpi=200)
             plt.close(fig)
             print(f"  Created 3D cross-section visualization: {in_situ_path}")
+
+        # --- START: New Plotly 3D HTML Plot ---
+            try:
+                import plotly.graph_objects as go
+
+                plotly_traces = []
+                
+                # Add Mesh
+                plotly_traces.append(go.Mesh3d(
+                    x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+                    i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+                    opacity=0.4, color='lightgrey', name='Mesh' 
+                ))
+
+                # Add Centerline
+                plotly_traces.append(go.Scatter3d(
+                    x=smoothed_centerline[:, 0], y=smoothed_centerline[:, 1], z=smoothed_centerline[:, 2],
+                    mode='lines+markers', line=dict(color='black', width=5), marker=dict(size=3, color='black'),
+                    name='Centerline'
+                ))
+
+                # Add Cross-Sections
+                cmap_plotly = matplotlib.colormaps['plasma'] # Use the same colormap
+                
+                section_annotations = []
+
+                for idx, section_data in enumerate(section_data_3d):
+                    points_2d = section_data['points_2d']
+                    transform_matrix = section_data['transform']
+                    norm_pos = section_data['norm_pos']
+                    section_position_3d = section_data['position'] # Get the 3D position of the section
+
+                    # Use the same color mapping as Matplotlib
+                    # Convert RGBA from plt.cm.plasma to a Plotly compatible string 'rgb(r,g,b)' or 'rgba(r,g,b,a)'
+                    rgba_color = cmap_plotly(norm_pos) 
+                    plotly_color_str = f'rgba({int(rgba_color[0]*255)}, {int(rgba_color[1]*255)}, {int(rgba_color[2]*255)}, {rgba_color[3]})'
+
+
+                    ordered_points_2d = order_points(points_2d, method="angular")
+                    
+                    points_3d_list = []
+                    for pt_2d in ordered_points_2d:
+                        pt_2d_h = np.array([pt_2d[0], pt_2d[1], 0.0, 1.0])
+                        pt_3d_h = transform_matrix.dot(pt_2d_h)
+                        points_3d_list.append(pt_3d_h[:3])
+                    
+                    if not points_3d_list:
+                        continue
+
+                    points_3d_array = np.array(points_3d_list)
+                    
+                    # Close the loop for outline
+                    outline_3d_closed = np.vstack([points_3d_array, points_3d_array[0]])
+                    
+                    plotly_traces.append(go.Scatter3d(
+                        x=outline_3d_closed[:, 0], y=outline_3d_closed[:, 1], z=outline_3d_closed[:, 2],
+                        mode='lines', line=dict(color=plotly_color_str, width=4),
+                        name=f'Section {idx} (Pos: {norm_pos:.2f})'
+                    ))
+                    
+                    # Add text label for the section position
+                    section_annotations.append(dict(
+                        showarrow=False,
+                        x=section_position_3d[0],
+                        y=section_position_3d[1],
+                        z=section_position_3d[2],
+                        text=f"{norm_pos:.2f}",
+                        font=dict(color="white", size=10),
+                        bgcolor="rgba(0,0,0,0.5)" # Semi-transparent background for better visibility
+                    ))
+
+                # Add sampled points (positions on centerline where sections are taken)
+                sampled_plot_positions = np.array([s['position'] for s in section_data_3d])
+                if len(sampled_plot_positions) > 0:
+                    plotly_traces.append(go.Scatter3d(
+                        x=sampled_plot_positions[:, 0], y=sampled_plot_positions[:, 1], z=sampled_plot_positions[:, 2],
+                        mode='markers', marker=dict(size=5, color='blue', symbol='circle'),
+                        name='Sampled Positions'
+                    ))
+
+                fig_plotly = go.Figure(data=plotly_traces)
+                
+                fig_plotly.update_layout(
+                    title=f'Interactive 3D Cross-Sections - {os.path.basename(mesh_file)}',
+                    scene=dict(
+                        xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
+                        aspectmode='data', # Ensures correct aspect ratio
+                        camera=dict(
+                            eye=dict(x=1.5, y=1.5, z=1.5) # Adjust camera for a good initial view
+                        ),
+                        annotations=section_annotations
+                    ),
+                    margin=dict(l=0, r=0, b=0, t=40)
+                )
+                
+                plotly_html_path = os.path.join(output_dir, f"{base_name}_3d_sections_interactive.html")
+                fig_plotly.write_html(plotly_html_path)
+                print(f"  Created interactive 3D cross-section visualization (HTML): {plotly_html_path}")
+
+            except ImportError:
+                print("  Plotly is not installed. Skipping interactive 3D HTML plot.")
+            except Exception as e_plotly:
+                print(f"  Error creating Plotly 3D HTML plot: {e_plotly}")
+            # --- END: New Plotly 3D HTML Plot ---
     
     # Return comprehensive results
     return {
@@ -576,7 +750,7 @@ def create_section_montage(section_points_list, positions, aspect_ratios, output
     # Determine how many valid sections we have
     valid_sections = [(i, points) for i, points in enumerate(section_points_list) 
                      if points is not None and aspect_ratios[i] is not None 
-                     and aspect_ratios[i] <= 1.6]
+                     and aspect_ratios[i] <= 30.0]
     
     if len(valid_sections) == 0:
         print("  No valid sections to create montage")
@@ -656,6 +830,9 @@ if __name__ == "__main__":
          "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj",
         "Meshes/Onion_OBJ/Ac_DA_1_8_mesh.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"
     ]
+
+    ## Test with a single file
+    #files_to_process = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
     output_dir = "centerline_results"
     
     # Initialize storage for collected results
@@ -675,13 +852,15 @@ if __name__ == "__main__":
         )
         
         if results:
+            all_results[mesh_name] = results
             print("\nAnalysis complete. Results summary:")
             valid_ars = [ar for ar in results['aspect_ratios'] if ar is not None]
             print(f"  - Number of valid sections: {len(valid_ars)} / {len(results['positions'])}")
-            print(f"  - Aspect ratio range: {min(valid_ars):.2f} - {max(valid_ars):.2f}")
             
-            # Store results for combined plot
-            all_results[mesh_name] = results
+            if valid_ars:  # Add this check
+                print(f"  - Aspect ratio range: {min(valid_ars):.2f} - {max(valid_ars):.2f}")
+            else:
+                print("  - No valid aspect ratios found. Section analysis failed.")
     
     # After processing all files, create a combined aspect ratio plot with average
     if all_results:
