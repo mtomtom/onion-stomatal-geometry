@@ -620,25 +620,64 @@ def _perform_oriented_truncation(final_points_2D_input, # Points after DBSCAN & 
     
     return final_points_2D_after_trunc, updated_final_mask, debug_projected_cl_2d_output, debug_reference_y_val_output
 
-def _calculate_pca_metrics(points_2d_for_pca, section_location_name="section"):
-    """Calculates PCA-based aspect ratio and minor axis standard deviation."""
+def _calculate_pca_metrics(points_2d_for_pca, section_location_name="section", reference_orientation_vector=None):
+    """Calculates PCA-based aspect ratio and width.
+    If reference_orientation_vector is provided, AR is relative to that orientation.
+    """
     aspect_ratio_pca = None
-    pca_minor_std_dev_val = None
+    pca_aligned_width = None # This will be the length of the axis perpendicular to the reference orientation
+
     if points_2d_for_pca is not None and len(points_2d_for_pca) >= 3:
         try:
             pca = PCA(n_components=2)
             pca.fit(points_2d_for_pca)
-            std_devs = np.sqrt(pca.explained_variance_)
-            if std_devs[1] > 1e-9:
-                aspect_ratio_pca = std_devs[0] / std_devs[1]
-                pca_minor_std_dev_val = std_devs[1]
-                print(f"  PCA Results ({section_location_name}): AR={aspect_ratio_pca:.3f}, Width(b)={pca_minor_std_dev_val:.3f}")
+            
+            # Lengths along the principal components of the current section
+            len_pc1 = np.sqrt(pca.explained_variance_[0])
+            len_pc2 = np.sqrt(pca.explained_variance_[1])
+
+            if reference_orientation_vector is None:
+                # Original behavior: AR is always >= 1
+                if len_pc2 > 1e-9:
+                    aspect_ratio_pca = len_pc1 / len_pc2
+                    pca_aligned_width = len_pc2 
+                else:
+                    aspect_ratio_pca = np.inf
+                    pca_aligned_width = len_pc2
             else:
-                print(f"  Warning ({section_location_name}): Minor axis std dev near zero ({std_devs[1]:.2e}). AR undefined.")
-                aspect_ratio_pca = np.inf
-                pca_minor_std_dev_val = std_devs[1]
+                # New behavior: Align with reference_orientation_vector
+                current_pc1_vector = pca.components_[0]
+                current_pc2_vector = pca.components_[1]
+
+                # Compare absolute dot products to find which current PC is more aligned with the reference
+                # (Handles 180-degree ambiguity)
+                dot_product_pc1_ref = np.abs(np.dot(current_pc1_vector, reference_orientation_vector))
+                dot_product_pc2_ref = np.abs(np.dot(current_pc2_vector, reference_orientation_vector))
+
+                length_along_ref_orientation = 0.0
+                length_perpendicular_to_ref_orientation = 0.0
+
+                if dot_product_pc1_ref >= dot_product_pc2_ref:
+                    # Current PC1 is more aligned with the reference "long" axis
+                    length_along_ref_orientation = len_pc1
+                    length_perpendicular_to_ref_orientation = len_pc2
+                else:
+                    # Current PC2 is more aligned with the reference "long" axis
+                    length_along_ref_orientation = len_pc2
+                    length_perpendicular_to_ref_orientation = len_pc1
+                
+                if length_perpendicular_to_ref_orientation > 1e-9:
+                    aspect_ratio_pca = length_along_ref_orientation / length_perpendicular_to_ref_orientation
+                else:
+                    aspect_ratio_pca = np.inf if length_along_ref_orientation > 1e-9 else 0 # Or handle as None/NaN
+                
+                pca_aligned_width = length_perpendicular_to_ref_orientation
+
+            print(f"  PCA Results ({section_location_name}): AR={aspect_ratio_pca:.3f}, ConsistentWidth(b)={pca_aligned_width:.3f}")
+
         except Exception as pca_err:
             print(f"  Error calculating PCA results ({section_location_name}): {pca_err}")
     elif points_2d_for_pca is not None and len(points_2d_for_pca) > 0:
         print(f"  Not enough points ({len(points_2d_for_pca)}) for PCA in {section_location_name} section.")
-    return aspect_ratio_pca, pca_minor_std_dev_val
+    
+    return aspect_ratio_pca, pca_aligned_width
