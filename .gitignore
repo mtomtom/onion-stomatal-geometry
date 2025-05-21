@@ -1,1 +1,7 @@
+<<<<<<< HEAD
+=======
+__pycache__/
+*.pyc
+.DS_store
+>>>>>>> a9339ee56928525affd6e1b0c28286b90a80dab7
 results/
