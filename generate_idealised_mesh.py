@@ -793,7 +793,7 @@ if __name__ == '__main__':
     ## Set the important parameters
 
     preserve_area = True
-    pca_width_scale_factor = 1.21
+    pca_width_scale_factor = 1.29
 
     mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_3.obj", "Meshes/Onion_OBJ/Ac_DA_1_2.obj", "Meshes/Onion_OBJ/Ac_DA_1_5.obj",
         "Meshes/Onion_OBJ/Ac_DA_1_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_7.obj", "Meshes/Onion_OBJ/Ac_DA_3_6.obj",
@@ -802,7 +802,7 @@ if __name__ == '__main__':
         "Meshes/Onion_OBJ/Ac_DA_2_6a.obj", "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj","Meshes/Onion_OBJ/Ac_DA_2_1.obj",
         "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"]
     
-    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_2_6a.obj"]
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory

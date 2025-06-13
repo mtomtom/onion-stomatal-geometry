@@ -1,6 +1,84 @@
 from scipy.signal import savgol_filter
 import numpy as np
 from sklearn.decomposition import PCA
+import numpy as np
+from skimage.measure import EllipseModel, ransac
+from scipy.spatial import ConvexHull
+
+def fit_ellipse_robust(points_2d, residual_threshold=1.0, max_trials=100):
+    """
+    Fits an ellipse to a set of 2D points using RANSAC for robustness to outliers.
+    Returns: 
+        A tuple: (ellipse_parameters, inlier_ratio)
+        ellipse_parameters: (center, minor_axis_length, major_axis_length, angle_rad_of_major_axis) or None
+        inlier_ratio: Float between 0 and 1, or 0.0 if fitting fails.
+    residual_threshold: Maximum distance for a data point to be classified as an inlier.
+    max_trials: Number of RANSAC iterations.
+    """
+    if points_2d is None or len(points_2d) < 5:
+        return None, 0.0 # Return None for params, 0.0 for inlier ratio
+
+    try:
+        model_robust, inliers_mask = ransac(
+            points_2d,
+            EllipseModel,
+            min_samples=5,
+            residual_threshold=residual_threshold,
+            max_trials=max_trials,
+        )
+        
+        if model_robust is None or not isinstance(inliers_mask, np.ndarray) or not inliers_mask.any():
+            return None, 0.0
+
+        xc, yc, a_semi, b_semi, theta_rad = model_robust.params
+        
+        if b_semi > a_semi:
+            major_semi_axis = b_semi
+            minor_semi_axis = a_semi
+            angle_major_axis_rad = theta_rad + np.pi / 2.0
+        else:
+            major_semi_axis = a_semi
+            minor_semi_axis = b_semi
+            angle_major_axis_rad = theta_rad
+            
+        angle_major_axis_rad = angle_major_axis_rad % np.pi
+        if angle_major_axis_rad < 0:
+            angle_major_axis_rad += np.pi
+
+        num_inliers = np.sum(inliers_mask)
+        total_points = len(points_2d)
+        inlier_ratio = num_inliers / total_points if total_points > 0 else 0.0
+
+        ellipse_params_tuple = (np.array([xc, yc]), minor_semi_axis * 2.0, major_semi_axis * 2.0, angle_major_axis_rad)
+        return ellipse_params_tuple, inlier_ratio
+        
+    except Exception as e:
+        # print(f"  Fit Ellipse (RANSAC): Exception - {e}")
+        return None, 0.0
+
+def generate_ellipse_points(center, minor_axis_len, major_axis_len, angle_rad, num_points=100):
+    """Generates points on an ellipse given its parameters."""
+    t = np.linspace(0, 2 * np.pi, num_points)
+    semi_minor = minor_axis_len / 2.0
+    semi_major = major_axis_len / 2.0
+    
+    ellipse_x_unrotated = semi_major * np.cos(t)
+    ellipse_y_unrotated = semi_minor * np.sin(t)
+    
+    # Rotation matrix for major axis alignment
+    # If angle_rad is for major axis:
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    # Check if major axis was originally aligned with x or y before rotation in fit_ellipse_robust logic
+    # The angle from fit_ellipse_robust is for the major axis.
+    # So, we treat semi_major along x and semi_minor along y in the unrotated frame, then rotate.
+    
+    x_rotated = cos_a * ellipse_x_unrotated - sin_a * ellipse_y_unrotated
+    y_rotated = sin_a * ellipse_x_unrotated + cos_a * ellipse_y_unrotated
+    
+    points = np.vstack((x_rotated + center[0], y_rotated + center[1])).T
+    return points
 
 def order_points(points, method="nearest", center=None):
     """
