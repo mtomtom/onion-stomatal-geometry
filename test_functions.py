@@ -553,18 +553,38 @@ def analyze_cross_section(file_paths,
         # --- Step 8: Store results ---
         # Ensure we have both 2D and corresponding 3D points for a successful result.
         # transform_2d_to_3d is also crucial for interpreting the 2D points in 3D space.
-        if len(final_points_2D) > 0 and len(final_original_points_3D) == len(final_points_2D) and transform_2d_to_3d is not None:
+        if len(final_points_2D) > 0 and \
+           len(final_original_points_3D) == len(final_points_2D) and \
+           transform_2d_to_3d is not None and \
+           detected_pore_center_3d_ed is not None and \
+           plane_origin is not None and \
+           tangent is not None: # Ensure new items are also valid
             print(f"  Successfully extracted {section_location} section with {len(final_points_2D)} points.")
-            results[file_path] = (final_points_2D, final_original_points_3D, transform_2d_to_3d, aspect_ratio, pca_minor_std_dev)
+            results[file_path] = (
+                final_points_2D, 
+                final_original_points_3D, 
+                transform_2d_to_3d, 
+                aspect_ratio, 
+                pca_minor_std_dev,
+                detected_pore_center_3d_ed, # Add pore center
+                plane_origin,               # Add section 3D origin
+                tangent                     # Add section 3D normal
+            )
         else:
-            if len(points_2D) > 0 and len(final_points_2D) == 0 : # Had initial section points but filtered to none
-                print(f"  {section_location.capitalize()} section resulted in 0 points after all filtering.")
+            error_msg = f"  {section_location.capitalize()} section processing failed"
+            if len(points_2D) > 0 and len(final_points_2D) == 0 :
+                error_msg += ": resulted in 0 points after all filtering."
             elif len(final_points_2D) > 0 and len(final_original_points_3D) != len(final_points_2D):
-                 print(f"  {section_location.capitalize()} section processing failed: Mismatch between final 2D ({len(final_points_2D)}) and 3D ({len(final_original_points_3D)}) points.")
+                 error_msg += f": Mismatch between final 2D ({len(final_points_2D)}) and 3D ({len(final_original_points_3D)}) points."
             elif transform_2d_to_3d is None and len(final_points_2D) > 0:
-                 print(f"  {section_location.capitalize()} section processing failed: Missing 2D-to-3D transformation.")
+                 error_msg += ": Missing 2D-to-3D transformation."
+            elif detected_pore_center_3d_ed is None:
+                error_msg += ": Missing detected pore center for orientation."
+            elif plane_origin is None or tangent is None:
+                error_msg += ": Missing plane origin or normal for orientation."
             else: # General failure or very few initial points
-                 print(f"  {section_location.capitalize()} section processing failed or yielded no usable data.")
+                 error_msg += " or yielded no usable data."
+            print(error_msg)
             results[file_path] = None # Mark as failed
 
         if visualize and location_output_dir and results[file_path] is not None:
@@ -663,105 +683,135 @@ def analyze_cross_section(file_paths,
 def create_combined_2d_plot(results_data, output_path, location_name='Unknown'):
     """
     Creates a combined 2D plot overlaying all valid cross-sections.
+    Orients by highest Z point, then by pore center for consistent sidedness.
     """
     print(f"\nCreating combined 2D overlay plot ({location_name}) at: {output_path}")
 
-    # Filter for valid results that have 2D points
-    valid_files = [
-        f for f, data in results_data.items()
-        if data is not None and isinstance(data, tuple) and len(data) > 0 and data[0] is not None and len(data[0]) > 0
-    ]
+    # Filter for valid results that have 2D points and necessary orientation data
+    valid_files_data = []
+    for f, data in results_data.items():
+        if data is not None and isinstance(data, tuple) and len(data) == 8 and \
+           data[0] is not None and len(data[0]) > 0 and \
+           data[1] is not None and len(data[1]) > 0 and \
+           data[2] is not None and \
+           data[5] is not None and data[6] is not None and data[7] is not None: # Check for new items
+            valid_files_data.append((f, data))
 
-    if not valid_files:
-        print(f"  No valid data with 2D points to plot for {location_name}.")
+    if not valid_files_data:
+        print(f"  No valid data with 2D points and orientation info to plot for {location_name}.")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 10)) # Adjust figure size as needed
+    fig, ax = plt.subplots(figsize=(10, 10)) 
     ax.set_aspect('equal')
-    ax.set_title(f'Combined {location_name} Cross-Sections (Overlay)\n Y vs. X')
-    ax.set_xlabel("X-axis") # Corresponds to ordered_points[:, 0]
-    ax.set_ylabel("Y-axis") # Corresponds to ordered_points[:, 1]
+    ax.set_title(f'Combined {location_name} Cross-Sections (Overlay)\n Y vs. X (Oriented by Z-Max & Pore Center)')
+    ax.set_xlabel("X-axis") 
+    ax.set_ylabel("Y-axis") 
 
-    # This is where your selected code block begins
-    colors = plt.cm.viridis(np.linspace(0, 1, len(valid_files)))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(valid_files_data)))
     max_extent = 0
-    for i, file_path in enumerate(valid_files):
-        # results_data[file_path] is expected to be a tuple:
-        # (final_points_2D, final_original_points_3D, transform_2d_to_3d, aspect_ratio, pca_minor_std_dev)
-        points_2d = results_data[file_path][0] # Get final_points_2D
-        original_points_3d = results_data[file_path][1]  # Get original 3D points
+    for i, (file_path, file_data) in enumerate(valid_files_data):
+        points_2d = file_data[0]
+        original_points_3d = file_data[1]
+        transform_2d_to_3d_matrix = file_data[2]
+        # aspect_ratio = file_data[3] # Not used in this plot directly
+        # pca_minor_std_dev = file_data[4] # Not used in this plot directly
+        pore_center_ref = file_data[5]
+        section_origin_3d_ref = file_data[6]
+        section_normal_3d_ref = file_data[7]
 
-        if points_2d is None or len(points_2d) < 3:
+
+        if points_2d is None or len(points_2d) < 3: # Should be caught by filter, but good check
             print(f"  Skipping {os.path.basename(file_path)} for combined plot: not enough 2D points.")
             continue
             
-        # Ensure points_2d and original_points_3d have the same length
         if len(points_2d) != len(original_points_3d):
             print(f"  Warning: 2D and 3D points count mismatch for {os.path.basename(file_path)}.")
             continue
  
-        center_pt = np.mean(points_2d, axis=0)
-        centered_points = points_2d - center_pt
+        center_pt_2d = np.mean(points_2d, axis=0)
+        centered_points_2d = points_2d - center_pt_2d
 
-        # REPLACE the landmark selection with Z-coordinate based approach:
-        # Find highest Z point in 3D space
-        z_coords = original_points_3d[:, 2]
-        highest_z_idx = np.argmax(z_coords)
-        landmark = centered_points[highest_z_idx]  # Use this 2D point as landmark
+        # --- Primary Orientation: Highest Z point up ---
+        z_coords_3d = original_points_3d[:, 2]
+        highest_z_idx = np.argmax(z_coords_3d)
+        # Landmark is the 2D point (already centered) corresponding to highest 3D Z
+        landmark_for_primary_rotation = centered_points_2d[highest_z_idx] 
         
-        print(f"  Using highest Z point as landmark for {os.path.basename(file_path)}")
+        current_angle_primary = np.arctan2(landmark_for_primary_rotation[1], landmark_for_primary_rotation[0])
+        target_angle_primary = np.pi/2  # 90 degrees = top (positive Y)
+        rotation_angle_primary = target_angle_primary - current_angle_primary
         
-        # Calculate angle to rotate so landmark is at the top (90 degrees)
-        current_angle = np.arctan2(landmark[1], landmark[0])
-        target_angle = np.pi/2  # 90 degrees = top
-        rotation_angle = target_angle - current_angle
-        
-        # Create rotation matrix
-        cos_theta = np.cos(rotation_angle)
-        sin_theta = np.sin(rotation_angle)
-        rotation_matrix = np.array([
-            [cos_theta, -sin_theta],
-            [sin_theta, cos_theta]
+        cos_theta_p = np.cos(rotation_angle_primary)
+        sin_theta_p = np.sin(rotation_angle_primary)
+        primary_rotation_matrix = np.array([
+            [cos_theta_p, -sin_theta_p],
+            [sin_theta_p, cos_theta_p]
         ])
         
-        # Apply rotation to align landmark to top
-        rotated_points = np.dot(centered_points, rotation_matrix.T)
+        # Apply primary rotation
+        rotated_points_primary = np.dot(centered_points_2d, primary_rotation_matrix.T)
         
-        # Order the rotated points for plotting
-        ordered_points = order_points(rotated_points, method="angular")
-        #ordered_points = order_points(centered_points, method="angular") # Ensure points are ordered for a closed polygon
+        # --- Secondary Orientation: Consistent Sidedness using Pore Center ---
+        final_rotated_points = rotated_points_primary.copy() # Start with primarily rotated points
 
-        # Plotting: X is ordered_points[:, 0], Y is ordered_points[:, 1]
-        # The selection had X and Y swapped in the ax.plot call, which might be intentional
-        # depending on the desired orientation.
-        # Original from selection: ax.plot(Y, X)
-        # Standard: ax.plot(X, Y)
-        # Let's stick to the selection's X/Y swap for now, assuming it was deliberate.
-        # If you want X on horizontal and Y on vertical, it should be:
-        # ax.plot(np.append(ordered_points[:, 0], ordered_points[0, 0]),
-        #         np.append(ordered_points[:, 1], ordered_points[0, 1]), ...)
+        if pore_center_ref is not None and section_origin_3d_ref is not None and section_normal_3d_ref is not None:
+            radial_vector_3d = section_origin_3d_ref - pore_center_ref
+            # Project to section plane
+            radial_vector_on_plane_3d = radial_vector_3d - np.dot(radial_vector_3d, section_normal_3d_ref) * section_normal_3d_ref
+            norm_rvop = np.linalg.norm(radial_vector_on_plane_3d)
+
+            if norm_rvop > 1e-6:
+                radial_vector_on_plane_3d /= norm_rvop
+
+                # Transform this 3D plane vector to original 2D coords of the section
+                # These are the 3D vectors for the section's 2D X and Y axes
+                section_x_axis_3d = transform_2d_to_3d_matrix[:3, 0] 
+                section_y_axis_3d = transform_2d_to_3d_matrix[:3, 1]
+                
+                comp_x_orig_2d = np.dot(radial_vector_on_plane_3d, section_x_axis_3d)
+                comp_y_orig_2d = np.dot(radial_vector_on_plane_3d, section_y_axis_3d)
+                ref_vec_orig_2d = np.array([comp_x_orig_2d, comp_y_orig_2d])
+                
+                norm_ref_vec_orig_2d = np.linalg.norm(ref_vec_orig_2d)
+                if norm_ref_vec_orig_2d > 1e-6:
+                    ref_vec_orig_2d /= norm_ref_vec_orig_2d
+
+                    # Apply the primary rotation to this 2D reference vector
+                    # ref_vec_after_primary_rotation = np.dot(ref_vec_orig_2d, primary_rotation_matrix.T)
+                    ref_vec_after_primary_rotation = primary_rotation_matrix @ ref_vec_orig_2d
+
+
+                    # Check if the X component is negative, if so, flip horizontally
+                    # We want the radial vector (pointing "out" from pore) to generally point to +X (right)
+                    if ref_vec_after_primary_rotation[0] < -1e-5: # Small tolerance for zero
+                        final_rotated_points[:, 0] *= -1 # Flip X-coordinates
+                        # print(f"    File {os.path.basename(file_path)}: Flipped horizontally.")
+            # else:
+                # print(f"    File {os.path.basename(file_path)}: Radial vector for side orientation is zero. Skipping flip.")
+        # else:
+            # print(f"    File {os.path.basename(file_path)}: Missing data for secondary orientation. Skipping flip.")
+
+
+        # Order the final rotated points for plotting
+        ordered_points = order_points(final_rotated_points, method="angular")
 
         ax.plot(np.append(ordered_points[:, 0], ordered_points[0, 0]),
             np.append(ordered_points[:, 1], ordered_points[0, 1]),
             '-', color=colors[i], linewidth=1.5, alpha=0.7, label=os.path.basename(file_path))
         
-        # Calculate max_extent based on the actual plotted values (swapped)
-        current_max_x_plot = np.max(np.abs(ordered_points[:, 1])) # Y values are plotted on X
-        current_max_y_plot = np.max(np.abs(ordered_points[:, 0])) # X values are plotted on Y
+        current_max_x_plot = np.max(np.abs(ordered_points[:, 0])) 
+        current_max_y_plot = np.max(np.abs(ordered_points[:, 1])) 
         max_extent = max(max_extent, current_max_x_plot, current_max_y_plot)
 
-
-    if max_extent == 0: # Handle case where no valid points were plotted
+    if max_extent == 0: 
         print(f"  No points were plotted for {location_name}, cannot set limits.")
     else:
         limit = max_extent * 1.1
-        # Axis limits should correspond to the data plotted on them.
-        # Since Y was plotted first (horizontal) and X second (vertical):
-        ax.set_xlim(-limit, limit) # Limits for the horizontal axis (which displayed ordered_points[:, 1])
-        ax.set_ylim(-limit, limit) # Limits for the vertical axis (which displayed ordered_points[:, 0])
+        ax.set_xlim(-limit, limit) 
+        ax.set_ylim(-limit, limit) 
 
-    if len(valid_files) <= 10:
-        ax.legend(loc='upper right', fontsize=8) # Adjusted font size
+    if len(valid_files_data) <= 10:
+        ax.legend(loc='upper right', fontsize=8) 
     else:
         print("  Legend omitted for combined plot due to large number of files.")
 
@@ -981,7 +1031,16 @@ if __name__ == "__main__":
         "Meshes/Onion_OBJ/Ac_DA_3_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_3.obj", "Meshes/Onion_OBJ/Ac_DA_3_2.obj",
         "Meshes/Onion_OBJ/Ac_DA_3_1.obj", "Meshes/Onion_OBJ/Ac_DA_2_7.obj",
          "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj",
-        "Meshes/Onion_OBJ/Ac_DA_1_8_mesh.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"
+        "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj","Meshes/Onion_OBJ/Ac_DA_2_1_mesh2.obj","Meshes/OBJ/Ac_DA_2_6b.obj", "Meshes/OBJ/Ac_DA_2_6a.obj"
+    ]
+
+    files_to_process = [
+        "Meshes/Onion_OBJ/Ac_DA_1_3.obj", "Meshes/Onion_OBJ/Ac_DA_1_2.obj", "Meshes/Onion_OBJ/Ac_DA_1_5.obj",
+        "Meshes/Onion_OBJ/Ac_DA_1_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_7.obj", "Meshes/Onion_OBJ/Ac_DA_3_6.obj",
+        "Meshes/Onion_OBJ/Ac_DA_3_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_3.obj", "Meshes/Onion_OBJ/Ac_DA_3_2.obj",
+        "Meshes/Onion_OBJ/Ac_DA_3_1.obj", "Meshes/Onion_OBJ/Ac_DA_2_7.obj",
+         "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj",
+        "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"
     ]
 
     # files_to_process = [

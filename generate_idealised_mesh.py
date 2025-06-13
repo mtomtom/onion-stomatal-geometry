@@ -8,10 +8,12 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import math
 import cross_section_functions as csf
+from helper_functions import order_points
 
 # --- Import necessary functions ---
 try:
     from test_functions import analyze_cross_section
+    from full_length_AR_analysis import analyze_centerline_sections
     from cross_section_functions import ellipse as fit_ellipse_func
 except ImportError as e:
     print(f"ERROR: Could not import necessary functions: {e}")
@@ -80,16 +82,30 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
 
         if midpoint_results and input_file_path in midpoint_results and midpoint_results[input_file_path]:
              analysis_data_tuple = midpoint_results[input_file_path]
-             if isinstance(analysis_data_tuple, tuple) and len(analysis_data_tuple) >= 5:
+             # analysis_data_tuple is (final_points_2D, final_original_points_3D, transform_2d_to_3d,
+             #                         aspect_ratio, pca_minor_std_dev, detected_pore_center_3d_ed,
+             #                         plane_origin, tangent)
+             if isinstance(analysis_data_tuple, tuple) and len(analysis_data_tuple) == 8: # Check for 8 elements
                  ar = analysis_data_tuple[3]
                  width_measure = analysis_data_tuple[4]
                  if ar is not None and np.isfinite(ar):
                      AR_mid = ar
-                     if AR_mid < 1.0: AR_mid = 1.0 / AR_mid
+                     if AR_mid < 1.0: AR_mid = 1.0 / AR_mid # Ensure AR >= 1
                  if width_measure is not None and np.isfinite(width_measure) and width_measure > 1e-9:
                      pca_minor_std_dev = width_measure
-             else: print("  Warning: Midpoint analysis returned unexpected data format.")
-        else: print("  Warning: Midpoint analysis failed or returned no data.")
+                 
+                 # Store the input mesh's midpoint cross-section data
+                 params['input_midpoint_cs_2d'] = analysis_data_tuple[0]
+                 params['input_midpoint_cs_3d_orig'] = analysis_data_tuple[1]
+                 params['input_midpoint_cs_transform'] = analysis_data_tuple[2]
+                 # analysis_data_tuple[3] is aspect_ratio
+                 # analysis_data_tuple[4] is pca_minor_std_dev
+                 params['input_midpoint_pore_center'] = analysis_data_tuple[5] # detected_pore_center_3d_ed for input mesh
+                 params['input_midpoint_plane_origin'] = analysis_data_tuple[6] # plane_origin for input mesh's CS
+                 params['input_midpoint_plane_normal'] = analysis_data_tuple[7] # tangent for input mesh's CS
+
+             else: print("  Warning: Midpoint analysis of input mesh returned unexpected data format.")
+        else: print("  Warning: Midpoint analysis of input mesh failed or returned no data.")
 
         if pca_minor_std_dev is None:
              raise ValueError("Could not determine cross-section width from midpoint analysis.")
@@ -114,6 +130,129 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
         return None
     
 # ... (after _get_guard_cell_parameters) ...
+
+def _orient_cs_data(cs_points_2d, cs_original_points_3d, cs_transform_2d_to_3d, 
+                    cs_pore_center_ref, cs_plane_origin_3d_ref, cs_plane_normal_3d_ref):
+    """Orients 2D cross-section data for plotting."""
+    if cs_points_2d is None or len(cs_points_2d) < 3 or \
+       cs_original_points_3d is None or len(cs_original_points_3d) != len(cs_points_2d) or \
+       cs_transform_2d_to_3d is None or cs_pore_center_ref is None or \
+       cs_plane_origin_3d_ref is None or cs_plane_normal_3d_ref is None:
+        print("    _orient_cs_data: Insufficient data for orientation.")
+        return None
+
+    center_pt_2d = np.mean(cs_points_2d, axis=0)
+    centered_points_2d = cs_points_2d - center_pt_2d
+
+    # Primary Orientation: Highest Z point up
+    z_coords_3d = cs_original_points_3d[:, 2]
+    highest_z_idx = np.argmax(z_coords_3d)
+    landmark_for_primary_rotation = centered_points_2d[highest_z_idx]
+    
+    current_angle_primary = np.arctan2(landmark_for_primary_rotation[1], landmark_for_primary_rotation[0])
+    target_angle_primary = np.pi/2
+    rotation_angle_primary = target_angle_primary - current_angle_primary
+    
+    cos_theta_p = np.cos(rotation_angle_primary)
+    sin_theta_p = np.sin(rotation_angle_primary)
+    primary_rotation_matrix = np.array([[cos_theta_p, -sin_theta_p], [sin_theta_p, cos_theta_p]])
+    rotated_points_primary = np.dot(centered_points_2d, primary_rotation_matrix.T)
+    
+    final_rotated_points = rotated_points_primary.copy()
+
+    # Secondary Orientation (Sidedness)
+    try:
+        radial_vector_3d = cs_plane_origin_3d_ref - cs_pore_center_ref
+        # Project radial vector onto the section plane (defined by cs_plane_normal_3d_ref)
+        radial_vector_on_plane_3d = radial_vector_3d - np.dot(radial_vector_3d, cs_plane_normal_3d_ref) * cs_plane_normal_3d_ref
+        norm_rvop = np.linalg.norm(radial_vector_on_plane_3d)
+
+        if norm_rvop > 1e-6:
+            radial_vector_on_plane_3d /= norm_rvop
+            
+            # Transform this 3D plane vector to the original 2D coords of the section
+            section_x_axis_3d = cs_transform_2d_to_3d[:3, 0] # X-axis of the 2D section in 3D space
+            section_y_axis_3d = cs_transform_2d_to_3d[:3, 1] # Y-axis of the 2D section in 3D space
+            
+            comp_x_orig_2d = np.dot(radial_vector_on_plane_3d, section_x_axis_3d)
+            comp_y_orig_2d = np.dot(radial_vector_on_plane_3d, section_y_axis_3d)
+            ref_vec_orig_2d = np.array([comp_x_orig_2d, comp_y_orig_2d])
+            
+            norm_ref_vec_orig_2d = np.linalg.norm(ref_vec_orig_2d)
+            if norm_ref_vec_orig_2d > 1e-6:
+                ref_vec_orig_2d /= norm_ref_vec_orig_2d
+
+                # Apply the primary rotation to this 2D reference vector
+                ref_vec_after_primary_rotation = primary_rotation_matrix @ ref_vec_orig_2d
+                
+                # If the reference vector (pointing "outward") is now pointing left, flip
+                if ref_vec_after_primary_rotation[0] < -1e-5: # Check X component
+                    final_rotated_points[:, 0] *= -1
+    except Exception as e_orient_side:
+        print(f"    Warning during secondary orientation: {e_orient_side}")
+        # Proceed with only primary orientation if secondary fails
+    
+    return order_points(final_rotated_points, method="angular")
+
+
+def create_midpoint_cs_overlay_plot(input_cs_tuple, idealised_cs_tuple, 
+                                    output_plot_path, base_name, mesh_type_name):
+    """
+    Creates an overlay plot of input (confocal) and idealised midpoint cross-sections.
+    Each tuple: (points_2d, original_points_3d, transform_2d_to_3d, 
+                 pore_center_ref, plane_origin_3d_ref, plane_normal_3d_ref)
+    """
+    print(f"  Attempting to create CS overlay plot for {base_name} ({mesh_type_name})...")
+    oriented_input_cs = _orient_cs_data(*input_cs_tuple) if input_cs_tuple else None
+    oriented_idealised_cs = _orient_cs_data(*idealised_cs_tuple) if idealised_cs_tuple else None
+
+    if oriented_input_cs is None and oriented_idealised_cs is None:
+        print(f"    Cannot create CS overlay for {base_name} ({mesh_type_name}): no valid data for either section.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_aspect('equal')
+    ax.set_title(f'Midpoint Cross-Section Overlay: {base_name} ({mesh_type_name})\nConfocal (Blue) vs Idealised (Red)')
+    ax.set_xlabel("X-axis (Oriented)")
+    ax.set_ylabel("Y-axis (Oriented)")
+    ax.grid(True, alpha=0.5)
+
+    max_extent = 0
+
+    if oriented_input_cs is not None and len(oriented_input_cs) > 0:
+        ax.plot(np.append(oriented_input_cs[:, 0], oriented_input_cs[0, 0]),
+                np.append(oriented_input_cs[:, 1], oriented_input_cs[0, 1]),
+                'b-', linewidth=1.5, alpha=0.8, label='Confocal CS')
+        ax.plot(oriented_input_cs[:, 0], oriented_input_cs[:, 1], 'b.', markersize=3)
+        current_max = np.max(np.abs(oriented_input_cs))
+        if np.isfinite(current_max): max_extent = max(max_extent, current_max)
+
+
+    if oriented_idealised_cs is not None and len(oriented_idealised_cs) > 0:
+        ax.plot(np.append(oriented_idealised_cs[:, 0], oriented_idealised_cs[0, 0]),
+                np.append(oriented_idealised_cs[:, 1], oriented_idealised_cs[0, 1]),
+                'r-', linewidth=1.5, alpha=0.8, label='Idealised CS')
+        ax.plot(oriented_idealised_cs[:, 0], oriented_idealised_cs[:, 1], 'r.', markersize=3)
+        current_max = np.max(np.abs(oriented_idealised_cs))
+        if np.isfinite(current_max): max_extent = max(max_extent, current_max)
+    
+    if max_extent > 0 and np.isfinite(max_extent):
+        limit = max_extent * 1.15
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+    else: # Fallback if max_extent is not usable
+        ax.autoscale(enable=True, axis='both', tight=False)
+
+
+    ax.legend()
+    try:
+        plt.tight_layout()
+        plt.savefig(output_plot_path, dpi=150)
+        print(f"  Saved midpoint CS overlay plot to: {output_plot_path}")
+    except Exception as e_save:
+        print(f"  Error saving CS overlay plot: {e_save}")
+    finally:
+        plt.close(fig)
 
 def _calculate_half_centerline(cl_a, cl_b, cl_phi, center_xy, center_z, num_segments):
     """Calculates the 3D points for the half-centerline path parallel to the major axis."""
@@ -401,6 +540,65 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
         )
         if single_cell is None: raise ValueError("Failed to generate swept mesh with caps.")
 
+        # --- Create Midpoint Cross-Section Overlay Plot ---
+        if visualize_steps and single_cell is not None and \
+           params.get('input_midpoint_cs_2d') is not None:
+            print("  Generating midpoint cross-section overlay plot (Standard)...")
+            try:
+                # 1. Analyze the generated idealised_cell at its midpoint
+                idealised_plane_origin = params['center'] 
+                # Plane normal for idealised CS is along the major axis of the centerline ellipse
+                idealised_plane_normal = np.array([np.cos(params['cl_phi']), np.sin(params['cl_phi']), 0.0])
+
+                idealised_section = single_cell.section(plane_origin=idealised_plane_origin, plane_normal=idealised_plane_normal)
+                
+                idealised_cs_tuple = None
+                if idealised_section and hasattr(idealised_section, 'vertices') and len(idealised_section.vertices) >=3:
+                    idealised_path_2D, idealised_transform_2d_to_3d = idealised_section.to_2D()
+                    idealised_cs_points_2d = idealised_path_2D.vertices
+                    idealised_cs_original_points_3d = idealised_section.vertices.copy()
+                    
+                    idealised_cs_tuple = (
+                        idealised_cs_points_2d,
+                        idealised_cs_original_points_3d,
+                        idealised_transform_2d_to_3d,
+                        params['center'], # Pore center for idealised is its own geometric center
+                        idealised_plane_origin, # Origin of the idealised section plane
+                        idealised_plane_normal  # Normal of the idealised section plane
+                    )
+                else:
+                    print("    Could not generate valid cross-section for the idealised (Standard) mesh.")
+
+                input_cs_tuple = (
+                    params.get('input_midpoint_cs_2d'),
+                    params.get('input_midpoint_cs_3d_orig'),
+                    params.get('input_midpoint_cs_transform'),
+                    params.get('input_midpoint_pore_center'),
+                    params.get('input_midpoint_plane_origin'),
+                    params.get('input_midpoint_plane_normal')
+                )
+                
+                if input_cs_tuple[0] is not None and idealised_cs_tuple is not None:
+                    base_name_plot = os.path.splitext(os.path.basename(input_file_path))[0]
+                    overlay_plot_filename = f"cs_overlay_{base_name_plot}_std.png"
+                    overlay_plot_path = os.path.join(os.path.dirname(output_path), overlay_plot_filename)
+                    
+                    create_midpoint_cs_overlay_plot(
+                        input_cs_tuple,
+                        idealised_cs_tuple,
+                        overlay_plot_path,
+                        base_name_plot,
+                        "Standard"
+                    )
+                elif input_cs_tuple[0] is None:
+                    print("    Skipping CS overlay: Missing input confocal mesh CS data.")
+                elif idealised_cs_tuple is None:
+                    print("    Skipping CS overlay: Missing idealised mesh CS data.")
+
+            except Exception as e_overlay:
+                print(f"    Error generating midpoint CS overlay plot (Standard): {e_overlay}")
+                traceback.print_exc()
+
         # --- Step 6: Export ---
         print("STEP 6: Exporting single guard cell (Standard)...")
         output_dir = os.path.dirname(output_path)
@@ -415,56 +613,69 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
 
     return single_cell, center
 
-def get_modulated_AR(theta_cl, cl_phi, AR_mid, AR_tip,
-                     bulge_width=0.2, preserve_area=False, minor_axis_ref=1.0):
+def get_modulated_AR(theta_cl, cl_phi_of_midpoint, AR_mid, AR_tip_target,
+                     preserve_area=False, minor_axis_ref=1.0):
     """
     Calculate aspect ratio modulation along the guard cell curve.
+    Convention for normalized_pos: 0.0 at the tip, 1.0 at the midpoint of the half-cell.
+    
+    Modulation Logic:
+    - AR = AR_mid at normalized_pos = 1.0 (midpoint of half-cell).
+    - AR decreases linearly from AR_mid to AR_tip_target as normalized_pos goes from 1.0 down to transition_point_norm_pos.
+    - AR stays at AR_tip_target from transition_point_norm_pos down to 0.0 (tip).
     
     Args:
-        theta_cl: Current angle along centerline
-        cl_phi: Centerline orientation angle
-        AR_mid: Aspect ratio at midpoint (baseline)
-        AR_tip: Target aspect ratio at tips
-        bulge_width: Controls transition rate
-        preserve_area: If True, preserve cross-sectional area; if False, preserve major axis
-        minor_axis_ref: Reference minor axis length
+        theta_cl: Current angle along the half-centerline sweep.
+        cl_phi_of_midpoint: Angle corresponding to the midpoint of the half-centerline sweep.
+        AR_mid: Aspect ratio at the true midpoint of the guard cell.
+        AR_tip_target: The target aspect ratio for the tip region (e.g., min AR from confocal).
+        preserve_area: If True, preserve cross-sectional area; if False, preserve major axis.
+        minor_axis_ref: Reference minor axis length (cs_b_mid from params).
     
     Returns:
-        tuple: (semi-major axis, semi-minor axis) for the cross-section
+        tuple: (semi-major axis, semi-minor axis) for the cross-section.
     """
-    # Relative position along arc from side (0) to tip (1)
-    relative_angle = (theta_cl - cl_phi) % (2 * np.pi)
-    dist_to_major = min(relative_angle % np.pi, np.pi - (relative_angle % np.pi))
-    normalized_pos = dist_to_major / (np.pi / 2)  # 0 at sides, 1 at tips
+    angular_dist_from_midpoint = abs(theta_cl - cl_phi_of_midpoint) 
+    normalized_pos = 1.0 - (angular_dist_from_midpoint / (np.pi / 2.0))
+    normalized_pos = min(max(normalized_pos, 0.0), 1.0)
+
+    AR_at_midpoint = AR_mid
+    # AR_at_tip_region is now AR_tip_target, passed as an argument
     
-    # Create tip-only modulation with threshold function
-    threshold = 0.7  # Only apply bulging in the outer 30% toward tips
-    if normalized_pos > threshold:
-        # Normalize position within the transition zone
-        zone_pos = (normalized_pos - threshold) / (1.0 - threshold)
-        # Apply stronger modulation in the transition zone
-        modulation = zone_pos**2
-    else:
-        modulation = 0.0  # No modulation (keep AR_mid) for most of the cell
+    transition_point_norm_pos = 0.2 
+
+    if normalized_pos >= transition_point_norm_pos: 
+        denominator = 1.0 - transition_point_norm_pos
+        if abs(denominator) < 1e-9: 
+            current_AR = AR_at_midpoint
+        else:
+            current_AR = AR_tip_target + \
+                         (normalized_pos - transition_point_norm_pos) * \
+                         (AR_at_midpoint - AR_tip_target) / denominator
+    else: 
+        current_AR = AR_tip_target
     
-    # Calculate modulated aspect ratio
-    current_AR = AR_mid - (AR_mid - AR_tip) * modulation
-    
-    # Calculate semi-axes based on area preservation choice
+    if current_AR < 1.0 and current_AR > 1e-6: # Ensure AR is >= 1 if it's a valid positive number
+        current_AR = 1.0 / current_AR
+    elif current_AR <= 1e-6: # Handle potentially zero or negative AR from calculation
+        current_AR = 1.0
+
+
     if preserve_area:
-        # Preserve area - adjust both axes to keep πab constant
-        A_ref = np.pi * AR_mid * (minor_axis_ref ** 2)
-        b = np.sqrt(A_ref / (np.pi * current_AR))
-        a = current_AR * b
+        A_ref = np.pi * (AR_mid * minor_axis_ref) * minor_axis_ref 
+        if abs(current_AR) < 1e-9: 
+            b = minor_axis_ref 
+            a = current_AR * b 
+        else:
+            b = np.sqrt(A_ref / (np.pi * current_AR))
+            a = current_AR * b
     else:
-        # Preserve major axis - only adjust minor axis
-        # Assuming a > b and a is aligned with the major axis
-        a_mid = AR_mid * minor_axis_ref
-        b_mid = minor_axis_ref
-        
-        # Keep the same major axis and only adjust minor axis
-        a = a_mid  # Major axis stays constant
-        b = a / current_AR  # Minor axis changes to achieve new AR
+        a_mid_ref = AR_mid * minor_axis_ref 
+        a = a_mid_ref  
+        if abs(current_AR) < 1e-9:
+            b = minor_axis_ref 
+        else:
+            b = a / current_AR  
     
     return a, b
 
@@ -546,55 +757,103 @@ def visualize_modulation_distribution(params, output_path, threshold=0.7):
 
 def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerline_segments=64,
                                        num_cross_section_points=64, visualize_steps=True,
-                                       min_aspect_ratio=1.1, transition_power=2.0, preserve_area=True, pca_width_scale_factor=1.0):
+                                       preserve_area=True, pca_width_scale_factor=1.0): # Removed min_aspect_ratio, transition_power
     """
-    Generates a SINGLE guard cell with VARYING cross-section using helper functions.
+    Generates a SINGLE guard cell with VARYING cross-section.
+    Tip AR is based on the minimum AR from the input confocal mesh.
     """
-    print(f"\nGenerating SINGLE BULGING guard cell (Min AR={min_aspect_ratio:.2f}, Power={transition_power:.2f}) for: {input_file_path}")
     single_cell = None
     center = None
 
     try:
-        # --- Steps 1 & 2: Get Parameters ---
+        # --- Steps 1 & 2: Get Parameters (Midpoint AR, etc.) ---
         params = _get_guard_cell_parameters(
             input_file_path,
             visualize_midpoint_analysis=visualize_steps,
             pca_width_scale_factor=pca_width_scale_factor
         )
         if params is None: return None, None
-        center = params['center'] # Store center for return
+        center = params['center'] 
+        AR_mid = params['AR_mid']
 
-        if params['AR_mid'] <= min_aspect_ratio:
-            print(f"  Warning: Midpoint AR ({params['AR_mid']:.4f}) <= Min AR ({min_aspect_ratio:.2f}). No bulging will occur.")
+        # --- Determine Target Tip AR from full confocal mesh analysis ---
+        target_tip_AR = None
+        if analyze_centerline_sections is not None:
+            print("  Analyzing full confocal mesh to determine minimum AR for tip region...")
+            temp_viz_dir = None
+            if visualize_steps:
+                base_name_for_temp = os.path.splitext(os.path.basename(input_file_path))[0]
+                temp_viz_dir = os.path.join(os.path.dirname(output_path), f"temp_confocal_analysis_{base_name_for_temp}")
+
+            confocal_analysis_results = analyze_centerline_sections(
+                input_file_path, # Pass as positional argument
+                num_sections=25,
+                visualize=visualize_steps,
+                output_dir=temp_viz_dir
+            )
+            if confocal_analysis_results and 'section_definitions' in confocal_analysis_results:
+                all_confocal_ars = [
+                    s['aspect_ratio'] for s in confocal_analysis_results['section_definitions']
+                    if s and 'aspect_ratio' in s and s['aspect_ratio'] is not None and np.isfinite(s['aspect_ratio'])
+                ]
+                if all_confocal_ars:
+                    raw_min_ar = min(all_confocal_ars)
+                    # Ensure AR >= 1.0
+                    if raw_min_ar < 1.0 and raw_min_ar > 1e-6 : target_tip_AR = 1.0 / raw_min_ar
+                    elif raw_min_ar <= 1e-6: target_tip_AR = 1.0 
+                    else: target_tip_AR = raw_min_ar
+                    print(f"  Minimum AR from confocal mesh analysis: {target_tip_AR:.4f}")
+        
+        if target_tip_AR is None:
+            fallback_tip_AR = AR_mid * (1.2/1.4) # Previous fallback
+            print(f"  Warning: Could not determine min AR from confocal. Using fallback tip AR: {fallback_tip_AR:.4f}")
+            target_tip_AR = fallback_tip_AR
+        
+        # Ensure target_tip_AR is not greater than AR_mid
+        if target_tip_AR > AR_mid:
+            print(f"  Warning: Confocal min AR ({target_tip_AR:.4f}) is greater than AR_mid ({AR_mid:.4f}). Clamping tip AR to AR_mid * (1.2/1.4).")
+            target_tip_AR = min(target_tip_AR, AR_mid * (1.2/1.4)) # Use the smaller of the two, or a fraction of AR_mid
+            if target_tip_AR > AR_mid : target_tip_AR = AR_mid # Final safety clamp
+
+        print(f"\nGenerating SINGLE BULGING guard cell (Midpoint AR={AR_mid:.2f}, Target Tip AR={target_tip_AR:.2f}) for: {input_file_path}")
+        if AR_mid < target_tip_AR: # Check if midpoint AR is less than tip AR
+            print(f"  Warning: Midpoint AR ({AR_mid:.4f}) < Target Tip AR ({target_tip_AR:.4f}). This might lead to unexpected shapes.")
+
 
         # --- Step 3: Visualization (Optional - simplified) ---
         if visualize_steps:
+            # ... (visualization code for centerline ellipse - can remain as is) ...
+            # The visualize_modulation_distribution might need an update to reflect the new AR profile
+            # if you want its plot to be accurate for the get_modulated_AR function.
+            # For now, it will plot based on its internal threshold logic.
             print("STEP 3: Visualizing centerline (Bulging)...")
-            # (Add simplified visualization code here if desired, similar to standard Step 3)
-            viz_dir = os.path.dirname(output_path)
-            if viz_dir and not os.path.exists(viz_dir):
-                os.makedirs(viz_dir)
-            modulation_viz_path = os.path.join(viz_dir, f'modulation_distribution_{os.path.basename(output_path)}.png')
-            visualize_modulation_distribution(params, modulation_viz_path, threshold=0.7)
+            viz_dir_main = os.path.dirname(output_path) # Use main output path for these viz
+            if viz_dir_main and not os.path.exists(viz_dir_main):
+                os.makedirs(viz_dir_main)
+            
+            # Centerline ellipse plot
             try:
-                fig, ax1 = plt.subplots(1, 1, figsize=(7, 7))
-                centerline_theta = np.linspace(0, 2*np.pi, 100)
-                centerline_r = fit_ellipse_func(centerline_theta, params['cl_a'], params['cl_b'], params['cl_phi'])
-                centerline_x = params['center_xy'][0] + centerline_r * np.cos(centerline_theta)
-                centerline_y = params['center_xy'][1] + centerline_r * np.sin(centerline_theta)
-                ax1.plot(centerline_x, centerline_y, 'b-', label='Full centerline')
-                major_axis_x = [params['center_xy'][0] - 1.1*params['cl_a']*np.cos(params['cl_phi']), params['center_xy'][0] + 1.1*params['cl_a']*np.cos(params['cl_phi'])]
-                major_axis_y = [params['center_xy'][1] - 1.1*params['cl_a']*np.sin(params['cl_phi']), params['center_xy'][1] + 1.1*params['cl_a']*np.sin(params['cl_phi'])]
-                ax1.plot(major_axis_x, major_axis_y, 'g--', linewidth=1, label='Major axis')
-                ax1.scatter(params['center_xy'][0], params['center_xy'][1], color='black', s=50, label='Center')
-                ax1.set_title('Centerline Ellipse (Bulging)'); ax1.set_xlabel('X'); ax1.set_ylabel('Y')
-                ax1.axis('equal'); ax1.grid(True); ax1.legend()
-                viz_dir = os.path.dirname(output_path);
-                if viz_dir and not os.path.exists(viz_dir): os.makedirs(viz_dir)
-                viz_path = os.path.join(viz_dir, f'visualization_bulging_step3_{os.path.basename(output_path)}.png')
-                plt.tight_layout(); plt.savefig(viz_path); plt.close(fig)
-                print(f"  Centerline visualization saved to: {viz_path}")
-            except Exception as e: print(f"  Error during visualization: {e}")
+                fig_cl, ax_cl = plt.subplots(1, 1, figsize=(7, 7))
+                # ... (plotting code for centerline_ellipse as before) ...
+                centerline_theta_plot = np.linspace(0, 2*np.pi, 100)
+                centerline_r_plot = fit_ellipse_func(centerline_theta_plot, params['cl_a'], params['cl_b'], params['cl_phi'])
+                centerline_x_plot = params['center_xy'][0] + centerline_r_plot * np.cos(centerline_theta_plot)
+                centerline_y_plot = params['center_xy'][1] + centerline_r_plot * np.sin(centerline_theta_plot)
+                ax_cl.plot(centerline_x_plot, centerline_y_plot, 'b-', label='Full centerline')
+                major_axis_x_plot = [params['center_xy'][0] - 1.1*params['cl_a']*np.cos(params['cl_phi']), params['center_xy'][0] + 1.1*params['cl_a']*np.cos(params['cl_phi'])]
+                major_axis_y_plot = [params['center_xy'][1] - 1.1*params['cl_a']*np.sin(params['cl_phi']), params['center_xy'][1] + 1.1*params['cl_a']*np.sin(params['cl_phi'])]
+                ax_cl.plot(major_axis_x_plot, major_axis_y_plot, 'g--', linewidth=1, label='Major axis')
+                ax_cl.scatter(params['center_xy'][0], params['center_xy'][1], color='black', s=50, label='Center')
+                ax_cl.set_title(f'Centerline Ellipse (Bulging) - {os.path.basename(input_file_path)}'); ax_cl.set_xlabel('X'); ax_cl.set_ylabel('Y')
+                ax_cl.axis('equal'); ax_cl.grid(True); ax_cl.legend()
+                cl_viz_path = os.path.join(viz_dir_main, f'centerline_ellipse_bulging_{os.path.basename(output_path)}.png')
+                plt.tight_layout(); plt.savefig(cl_viz_path); plt.close(fig_cl)
+                print(f"  Centerline ellipse visualization saved to: {cl_viz_path}")
+            except Exception as e_cl_viz: print(f"  Error during centerline ellipse visualization: {e_cl_viz}")
+
+            # Modulation distribution plot (uses its own internal logic, may not match get_modulated_AR exactly)
+            # modulation_viz_path = os.path.join(viz_dir_main, f'modulation_distribution_{os.path.basename(output_path)}.png')
+            # visualize_modulation_distribution(params, modulation_viz_path, threshold=0.7)
 
 
         # --- Step 4: Define HALF centerline and VARYING cross-sections ---
@@ -606,18 +865,19 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
         )
         if half_centerline is None: raise ValueError("Failed to calculate half centerline.")
 
-        # Generate list of varying cross-section polygons
         cross_section_polygons = []
         cs_base_angles = np.linspace(0, 2*np.pi, num_cross_section_points, endpoint=False)
-        half_theta_angles = np.linspace(params['cl_phi'], params['cl_phi'] + np.pi, len(half_centerline)) # Recalculate angles for modulation
+        half_theta_angles = np.linspace(params['cl_phi'], params['cl_phi'] + np.pi, len(half_centerline))
 
         for i, theta_cl in enumerate(half_theta_angles):
-            # When preserve_area=True, get_modulated_AR returns (a,b) not AR
-            current_cs_a, current_cs_b = get_modulated_AR(theta_cl, params['cl_phi'] + np.pi/2, 
-                        params['AR_mid'], min_aspect_ratio,
-                        bulge_width=0.2, preserve_area=preserve_area, minor_axis_ref=params['cs_b_mid'])
-            
-            # No need to recalculate - the function already did the area-preserving calculation
+            current_cs_a, current_cs_b = get_modulated_AR(
+                theta_cl, 
+                params['cl_phi'] + np.pi/2, 
+                AR_mid, 
+                target_tip_AR, # Pass the determined target tip AR
+                preserve_area=preserve_area, 
+                minor_axis_ref=params['cs_b_mid']
+            )
             
             cs_x = current_cs_a * np.cos(cs_base_angles)
             cs_y = current_cs_b * np.sin(cs_base_angles)
@@ -629,26 +889,74 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
             cross_section_polygons.append(poly)
         print(f"  Generated {len(cross_section_polygons)} varying cross-section polygons.")
 
+        # --- Step 5 & 6 (Mesh Generation, Export, Overlay Plot) ---
+        # ... (The rest of the function, including _generate_swept_mesh_with_caps call, export,
+        #      and the idealised CS overlay plot generation can remain largely the same,
+        #      just ensure variable names are consistent if you copy-paste from standard cell gen.)
+
         # --- Step 5: Generate Mesh and Caps ---
         single_cell = _generate_swept_mesh_with_caps(
             half_centerline,
-            cross_section_polygons, # Pass list of polygons
+            cross_section_polygons, 
             num_cross_section_points,
             params['cl_phi']
         )
         if single_cell is None: raise ValueError("Failed to generate swept mesh with caps.")
 
+        # --- Create Midpoint Cross-Section Overlay Plot for Bulging Mesh ---
+        if visualize_steps and single_cell is not None and \
+           params.get('input_midpoint_cs_2d') is not None:
+            print("  Generating midpoint cross-section overlay plot (Bulging)...")
+            try:
+                idealised_plane_origin_bulge = params['center'] 
+                idealised_plane_normal_bulge = np.array([np.cos(params['cl_phi']), np.sin(params['cl_phi']), 0.0])
+                idealised_section_bulge = single_cell.section(plane_origin=idealised_plane_origin_bulge, plane_normal=idealised_plane_normal_bulge)
+                
+                idealised_cs_tuple_bulge = None
+                if idealised_section_bulge and hasattr(idealised_section_bulge, 'vertices') and len(idealised_section_bulge.vertices) >=3:
+                    idealised_path_2D_bulge, idealised_transform_2d_to_3d_bulge = idealised_section_bulge.to_2D()
+                    idealised_cs_tuple_bulge = (
+                        idealised_path_2D_bulge.vertices,
+                        idealised_section_bulge.vertices.copy(),
+                        idealised_transform_2d_to_3d_bulge,
+                        params['center'], 
+                        idealised_plane_origin_bulge, 
+                        idealised_plane_normal_bulge  
+                    )
+                else: print("    Could not generate valid CS for the idealised (Bulging) mesh.")
+
+                input_cs_tuple = (
+                    params.get('input_midpoint_cs_2d'), params.get('input_midpoint_cs_3d_orig'),
+                    params.get('input_midpoint_cs_transform'), params.get('input_midpoint_pore_center'),
+                    params.get('input_midpoint_plane_origin'), params.get('input_midpoint_plane_normal')
+                )
+                
+                if input_cs_tuple[0] is not None and idealised_cs_tuple_bulge is not None:
+                    base_name_plot = os.path.splitext(os.path.basename(input_file_path))[0]
+                    overlay_plot_filename = f"cs_overlay_{base_name_plot}_bulge_{'pa' if preserve_area else 'np'}.png"
+                    overlay_plot_path = os.path.join(os.path.dirname(output_path), overlay_plot_filename)
+                    
+                    create_midpoint_cs_overlay_plot(
+                        input_cs_tuple, idealised_cs_tuple_bulge,
+                        overlay_plot_path, base_name_plot, f"Bulging ({'AreaP' if preserve_area else 'MajorAxisP'})"
+                    )
+                # ... (else print skip messages) ...
+            except Exception as e_overlay_b:
+                print(f"    Error generating midpoint CS overlay plot (Bulging): {e_overlay_b}")
+                traceback.print_exc()
+
         # --- Step 6: Export ---
         print("STEP 6: Exporting single guard cell (Bulging)...")
-        output_dir = os.path.dirname(output_path)
-        if output_dir and not os.path.exists(output_dir): os.makedirs(output_dir)
+        output_dir_export = os.path.dirname(output_path)
+        if output_dir_export and not os.path.exists(output_dir_export): os.makedirs(output_dir_export)
         single_cell.export(file_obj=output_path, file_type='ply', encoding='ascii')
         print(f"  Successfully saved single guard cell to: {output_path}")
+
 
     except Exception as e:
         print(f"  Error generating bulging single guard cell: {e}")
         traceback.print_exc()
-        return None, None # Return None, None on error
+        return None, None 
 
     return single_cell, center
 
@@ -792,8 +1100,6 @@ def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
 if __name__ == '__main__':
     ## Set the important parameters
 
-    preserve_area = True
-    pca_width_scale_factor = 1.21
 
     mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_3.obj", "Meshes/Onion_OBJ/Ac_DA_1_2.obj", "Meshes/Onion_OBJ/Ac_DA_1_5.obj",
         "Meshes/Onion_OBJ/Ac_DA_1_4.obj", "Meshes/Onion_OBJ/Ac_DA_3_7.obj", "Meshes/Onion_OBJ/Ac_DA_3_6.obj",
@@ -802,19 +1108,27 @@ if __name__ == '__main__':
         "Meshes/Onion_OBJ/Ac_DA_2_6a.obj", "Meshes/Onion_OBJ/Ac_DA_2_4.obj", "Meshes/Onion_OBJ/Ac_DA_2_3.obj","Meshes/Onion_OBJ/Ac_DA_2_1.obj",
         "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"]
     
-    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_2_6a.obj"]
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj", "Meshes/Onion_OBJ/Ac_DA_1_3.obj",
+        "Meshes/Onion_OBJ/Ac_DA_1_4.obj","Meshes/Onion_OBJ/Ac_DA_1_5.obj","Meshes/Onion_OBJ/Ac_DA_1_6.obj","Meshes/Onion_OBJ/Ac_DA_1_8.obj","Meshes/Onion_OBJ/Ac_DA_2_1_mesh2.obj","Meshes/Onion_OBJ/Ac_DA_2_4.obj","Meshes/Onion_OBJ/Ac_DA_2_6a.obj", "Meshes/Onion_OBJ/Ac_DA_2_6b.obj", "Meshes/Onion_OBJ/Ac_DA_2_7.obj","Meshes/Onion_OBJ/Ac_DA_3_1.obj"]
+    
+    scaling_factors = [1.27, 1.22, 1.25, 1.24, 1.33, 1.28, 1.49, 1.4, 1.21, 1.44, 1.33, 1.25]
+
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_5.obj"]
+    scaling_factors = [1.24]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory
 
-    for file_to_process in mesh_list:
+    for file_to_process, sf in zip(mesh_list, scaling_factors):
         #file_to_process = "Meshes/OBJ/Ac_DA_1_3.obj" # Example file
         base_name = os.path.splitext(os.path.basename(file_to_process))[0]
 
         single_cell_output_std = os.path.join(results_dir, f"single_guard_cell_{base_name}_std.ply")
         full_stomata_output_std = os.path.join(results_dir, f"full_stomata_{base_name}_std.ply")
-        single_cell_output_bulge = os.path.join(results_dir, f"single_guard_cell_{base_name}_bulge.ply")
-        full_stomata_output_bulge = os.path.join(results_dir, f"full_stomata_{base_name}_bulge.ply")
+        single_cell_output_bulge_preserved = os.path.join(results_dir, f"single_guard_cell_{base_name}_bulge_preserved.ply")
+        full_stomata_output_bulge_preserved = os.path.join(results_dir, f"full_stomata_{base_name}_bulge_preserved.ply")
+        single_cell_output_bulge_not_preserved = os.path.join(results_dir, f"single_guard_cell_{base_name}_bulge_not_preserved.ply")
+        full_stomata_output_bulge_not_preserved = os.path.join(results_dir, f"full_stomata_{base_name}_bulge_not_preserved.ply")
 
         # Create results directory if needed
         if not os.path.exists(results_dir):
@@ -835,7 +1149,7 @@ if __name__ == '__main__':
                 num_centerline_segments=128, # Use higher resolution for smoother curves
                 num_cross_section_points=64,
                 visualize_steps=True,
-                pca_width_scale_factor=pca_width_scale_factor # Adjust this value as needed
+                pca_width_scale_factor=sf # Adjust this value as needed
             )
             print("-" * 20)
 
@@ -850,29 +1164,58 @@ if __name__ == '__main__':
                 print("\nSkipping STANDARD full stomata creation due to errors in single cell generation.")
 
 
-            # --- Generate the BULGING single guard cell ---
+            # --- Generate the BULGING single guard cell with preserved cross sectional area---
+            preserve_area = True
             print("\n" + "=" * 30)
             print("GENERATING BULGING MESH")
             print("=" * 30)
-            single_cell_mesh_bulge, center_point_bulge = generate_single_bulging_guard_cell(
+            single_cell_mesh_bulge_p, center_point_bulge_p = generate_single_bulging_guard_cell( # Renamed variables
                 input_file_path=file_to_process,
-                output_path=single_cell_output_bulge, # Now this variable is defined
-                num_centerline_segments=128, # Keep consistent resolution
+                output_path=single_cell_output_bulge_preserved, 
+                num_centerline_segments=128, 
                 num_cross_section_points=64,
                 visualize_steps=True,
-                min_aspect_ratio=1.0, # Adjust this value as needed (e.g., 1.0 for circular ends)
-                transition_power=1.0,
+                # min_aspect_ratio=1.0, # REMOVED
+                # transition_power=1.0, # REMOVED
                 preserve_area=preserve_area,
-                pca_width_scale_factor=pca_width_scale_factor # Adjust this value as needed
+                pca_width_scale_factor=sf 
             )
             print("-" * 20)
 
             # --- Create the BULGING full stomata ---
-            if single_cell_mesh_bulge is not None and center_point_bulge is not None:
+            if single_cell_mesh_bulge_p is not None and center_point_bulge_p is not None:
                 create_full_stomata_from_half(
-                    single_cell_mesh_bulge,
-                    center_point_bulge, # Use the center calculated during its generation
-                    full_stomata_output_bulge # Now this variable is defined
+                    single_cell_mesh_bulge_p,
+                    center_point_bulge_p, 
+                    full_stomata_output_bulge_preserved 
+                )
+            else:
+                print("\nSkipping BULGING full stomata creation due to errors in single cell generation.")
+
+            # --- Generate the BULGING single guard cell without preserving the cross sectional area---
+            preserve_area = False
+            print("\n" + "=" * 30)
+            print("GENERATING BULGING MESH")
+            print("=" * 30)
+            single_cell_mesh_bulge_np, center_point_bulge_np = generate_single_bulging_guard_cell( # Renamed variables
+                input_file_path=file_to_process,
+                output_path=single_cell_output_bulge_not_preserved, 
+                num_centerline_segments=128, 
+                num_cross_section_points=64,
+                visualize_steps=True,
+                # min_aspect_ratio=1.0, # REMOVED
+                # transition_power=1.0, # REMOVED
+                preserve_area=preserve_area,
+                pca_width_scale_factor=sf 
+            )
+            print("-" * 20)
+
+            # --- Create the BULGING full stomata ---
+            if single_cell_mesh_bulge_np is not None and center_point_bulge_np is not None:
+                create_full_stomata_from_half(
+                    single_cell_mesh_bulge_np,
+                    center_point_bulge_np, 
+                    full_stomata_output_bulge_not_preserved
                 )
             else:
                 print("\nSkipping BULGING full stomata creation due to errors in single cell generation.")

@@ -360,10 +360,11 @@ def analyze_centerline_sections(mesh_file,
         plt.savefig(width_plot_path, dpi=150); plt.close(fig_w)
         
         create_section_montage(
-            section_points_list, 
+            raw_section_data_list,
             final_normalized_positions, # Use the consistent normalized positions
             aspect_ratios, # Use the final aspect ratios
-            os.path.join(output_dir, f"{base_name_for_outputs}_section_montage.png")
+            os.path.join(output_dir, f"{base_name_for_outputs}_section_montage.png"),
+            pore_center_for_orientation=pore_center
         )
         
         # Matplotlib 3D plot (uses section_data_3d populated in Stage 3)
@@ -484,86 +485,163 @@ def analyze_centerline_sections(mesh_file,
             except Exception as e_plotly: print(f"  Error creating Plotly 3D HTML plot: {e_plotly}")
     
     return {
-        'positions': final_normalized_positions, # Use the consistent normalized positions
-        'aspect_ratios': aspect_ratios,    # Now with reference orientation
-        'widths': widths,                  # Now consistent with reference
+        'positions': final_normalized_positions,
+        'aspect_ratios': aspect_ratios,
+        'widths': widths,
         'section_points': section_points_list, 
-        'centerline': smoothed_centerline  # The analyzed centerline segment
+        'centerline': smoothed_centerline,
+        'raw_section_data_items': raw_section_data_list, # ADD THIS LINE
+        'minor_radius': minor_radius # ADD THIS LINE (use the actual variable name for average minor radius)
     }
 
-def create_section_montage(section_points_list, positions, aspect_ratios, output_path):
-    # Determine how many valid sections we have
-    valid_sections = [(i, points) for i, points in enumerate(section_points_list) 
-                     if points is not None and aspect_ratios[i] is not None 
-                     and aspect_ratios[i] <= 30.0]
+def create_section_montage(all_section_data_items, positions, aspect_ratios, output_path, pore_center_for_orientation=None):
+    # Filter for valid sections that have points_2d, transform, and a valid aspect_ratio
+    valid_section_tuples = [] # Will store (original_index, section_data_dict)
+    for original_idx, data_item in enumerate(all_section_data_items):
+        if (data_item is not None and
+            data_item.get('points_2d') is not None and
+            len(data_item['points_2d']) >= 3 and # Need at least 3 points for a polygon
+            data_item.get('transform') is not None and # Need transform for 3D Z-point
+            aspect_ratios[original_idx] is not None and
+            abs(aspect_ratios[original_idx]) <= 30.0): # Ensure AR is reasonable
+            valid_section_tuples.append((original_idx, data_item))
     
-    if len(valid_sections) == 0:
-        print("  No valid sections to create montage")
+    if not valid_section_tuples:
+        print("  No valid sections with necessary data to create montage.")
         return
         
-    # Create grid layout
-    n_sections = len(valid_sections)
-    cols = min(5, n_sections)
-    rows = (n_sections + cols - 1) // cols
+    n_valid_sections = len(valid_section_tuples)
+    cols = min(5, n_valid_sections)
+    rows = (n_valid_sections + cols - 1) // cols # Calculate rows needed
     
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*3, rows*3))
-    fig.suptitle("Cross-Sections Along Centerline", fontsize=16)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3.2)) # Adjusted height slightly
+    fig.suptitle("Cross-Sections Along Centerline (Oriented by Highest Z-Point)", fontsize=16)
     
-    # Flatten axes if needed
-    if rows == 1 and cols == 1:
-        axes = np.array([axes])
-    elif rows == 1 or cols == 1:
-        axes = axes.flatten()
+    if rows == 1 and cols == 1: axes = np.array([axes]) # Ensure axes is always iterable
+    elif rows == 1 or cols == 1: axes = axes.flatten() # Flatten if 1D array of axes
     
-    # Calculate the maximum extent across all valid sections for consistent scaling
-    all_points = np.vstack([points for _, points in valid_sections])
-    max_extent = np.max(np.abs(all_points)) * 1.1
-    
-    for i, (idx, points) in enumerate(valid_sections):
-        if i >= len(axes.flatten()):
-            break
-            
-        row = i // cols
-        col = i % cols
-        ax = axes[row, col] if rows > 1 and cols > 1 else axes[i]
+    all_rotated_points_for_scaling = []
+
+    for original_idx, section_item_data in valid_section_tuples:
+        current_points_2d = section_item_data['points_2d']
+        transform_2d_to_3d = section_item_data['transform']
+        section_pos_3d = section_item_data['position_3d'] # Origin of the section plane
+        section_normal_3d = section_item_data['tangent_3d'] # Normal to the section plane
         
-        if points is not None and len(points) >= 3:
-            # Order points for a clean polygon
-            ordered_points = order_points(points, method="angular")
+        # Convert 2D points to 3D to find the highest Z point
+        points_3d_list = []
+        for pt_2d in current_points_2d:
+            pt_2d_h = np.array([pt_2d[0], pt_2d[1], 0.0, 1.0]) 
+            pt_3d_h = transform_2d_to_3d.dot(pt_2d_h)
+            points_3d_list.append(pt_3d_h[:3]) 
+        section_points_3d = np.array(points_3d_list)
+
+        if not section_points_3d.size:
+            all_rotated_points_for_scaling.append(None)
+            print(f"  Warning: Section {original_idx} resulted in no 3D points for montage.")
+            continue
             
-            # Plot outline and close the loop
-            ax.plot(
-                np.append(ordered_points[:, 0], ordered_points[0, 0]),
-                np.append(ordered_points[:, 1], ordered_points[0, 1]),
+        # Find the 2D point corresponding to the highest Z in 3D
+        highest_z_idx_in_section = np.argmax(section_points_3d[:, 2])
+        landmark_2d_for_rotation = current_points_2d[highest_z_idx_in_section] 
+        
+        mean_2d = np.mean(current_points_2d, axis=0)
+        centered_section_points_2d = current_points_2d - mean_2d
+        centered_landmark_2d = landmark_2d_for_rotation - mean_2d
+        
+        angle_of_highest_pt_vec = np.arctan2(centered_landmark_2d[1], centered_landmark_2d[0])
+        target_angle_up = np.pi / 2  
+        rotation_rad_primary = target_angle_up - angle_of_highest_pt_vec
+        
+        cos_r_p, sin_r_p = np.cos(rotation_rad_primary), np.sin(rotation_rad_primary)
+        primary_rotation_matrix = np.array([[cos_r_p, -sin_r_p], [sin_r_p, cos_r_p]])
+        rotated_centered_pts_2d = (primary_rotation_matrix @ centered_section_points_2d.T).T
+        
+        # --- Secondary Orientation (Flipping based on pore_center) ---
+        if pore_center_for_orientation is not None:
+            # 1. Calculate 3D radial vector from pore to section origin, project to plane
+            radial_vector_3d = section_pos_3d - pore_center_for_orientation
+            radial_vector_on_plane_3d = radial_vector_3d - np.dot(radial_vector_3d, section_normal_3d) * section_normal_3d
+            norm_rvop = np.linalg.norm(radial_vector_on_plane_3d)
+
+            if norm_rvop > 1e-6:
+                radial_vector_on_plane_3d /= norm_rvop
+
+                # 2. Transform this 3D plane vector to original 2D coords of the section
+                x_axis_2d_in_3d = transform_2d_to_3d[:3, 0]
+                y_axis_2d_in_3d = transform_2d_to_3d[:3, 1]
+                
+                comp_x_orig_2d = np.dot(radial_vector_on_plane_3d, x_axis_2d_in_3d)
+                comp_y_orig_2d = np.dot(radial_vector_on_plane_3d, y_axis_2d_in_3d)
+                ref_vec_orig_2d = np.array([comp_x_orig_2d, comp_y_orig_2d])
+                
+                norm_ref_vec_orig_2d = np.linalg.norm(ref_vec_orig_2d)
+                if norm_ref_vec_orig_2d > 1e-6:
+                    ref_vec_orig_2d /= norm_ref_vec_orig_2d
+
+                    # 3. Apply the primary rotation to this 2D reference vector
+                    ref_vec_after_primary_rotation = (primary_rotation_matrix @ ref_vec_orig_2d.T).T
+
+                    # 4. Check if the X component is negative, if so, flip horizontally
+                    # We want the radial vector (pointing "out" from pore) to generally point to +X (right)
+                    if ref_vec_after_primary_rotation[0] < -1e-5: # Small tolerance for zero
+                        rotated_centered_pts_2d[:, 0] *= -1
+                        # print(f"    Section {original_idx}: Flipped horizontally for consistent side orientation.")
+            # else:
+                # print(f"    Section {original_idx}: Radial vector for side orientation is zero or too small. Skipping flip.")
+        # else:
+            # print(f"    Pore center not provided. Skipping secondary (side) orientation for section {original_idx}.")
+
+        all_rotated_points_for_scaling.append(rotated_centered_pts_2d)
+
+    # Calculate the maximum extent across all valid rotated sections for consistent scaling
+    valid_rotated_points_for_extent = [pts for pts in all_rotated_points_for_scaling if pts is not None and len(pts) > 0]
+    if not valid_rotated_points_for_extent:
+        print("  No valid rotated points to determine montage scaling.")
+        if 'fig' in locals() and fig: plt.close(fig) # Clean up figure if created
+        return
+        
+    all_points_for_extent_calc = np.vstack(valid_rotated_points_for_extent)
+    max_extent = np.max(np.abs(all_points_for_extent_calc)) * 1.1 if len(all_points_for_extent_calc) > 0 else 1.0
+    
+    # Plotting loop
+    for i, (original_idx, _) in enumerate(valid_section_tuples): # i is index in valid_section_tuples
+        plot_points = all_rotated_points_for_scaling[i] # These are the rotated and centered points
+
+        if i >= len(axes.flatten()): break # Should not happen if rows/cols calculated correctly
+            
+        current_ax = axes[i // cols, i % cols] if rows > 1 and cols > 1 else axes[i]
+        
+        if plot_points is not None and len(plot_points) >= 3:
+            # Order points for a clean polygon (already centered and rotated)
+            ordered_plot_points = order_points(plot_points, method="angular") # from helper_functions
+            
+            current_ax.plot(
+                np.append(ordered_plot_points[:, 0], ordered_plot_points[0, 0]),
+                np.append(ordered_plot_points[:, 1], ordered_plot_points[0, 1]),
                 'b-', linewidth=1.5
             )
-            
-            # Fill the polygon
-            ax.fill(ordered_points[:, 0], ordered_points[:, 1], alpha=0.2, color='blue')
-            
-            # Title with position and aspect ratio
-            ax.set_title(f"Pos: {positions[idx]:.2f}\nAR: {aspect_ratios[idx]:.2f}")
+            current_ax.fill(ordered_plot_points[:, 0], ordered_plot_points[:, 1], alpha=0.2, color='blue')
+            # Use original_idx to access the correct positions and aspect_ratios
+            current_ax.set_title(f"Pos: {positions[original_idx]:.2f}\nAR: {aspect_ratios[original_idx]:.2f}", fontsize=9)
         else:
-            ax.text(0.5, 0.5, "No valid section", ha='center', va='center', transform=ax.transAxes)
+            current_ax.text(0.5, 0.5, "No valid section", ha='center', va='center', transform=current_ax.transAxes, fontsize=9)
             
-        ax.set_aspect('equal')
-        ax.set_xlim(-max_extent, max_extent)
-        ax.set_ylim(-max_extent, max_extent)
-        ax.grid(True, alpha=0.3)
+        current_ax.set_aspect('equal')
+        current_ax.set_xlim(-max_extent, max_extent)
+        current_ax.set_ylim(-max_extent, max_extent)
+        current_ax.grid(True, alpha=0.3)
+        current_ax.tick_params(axis='both', which='major', labelsize=8)
         
     # Hide empty subplots
-    for i in range(len(valid_sections), rows*cols):
-        row = i // cols
-        col = i % cols
-        if rows > 1 and cols > 1:
-            axes[row, col].axis('off')
-        elif i < len(axes):
-            axes[i].axis('off')
+    for i in range(n_valid_sections, rows * cols):
+        ax_to_hide = axes[i // cols, i % cols] if rows > 1 and cols > 1 else axes[i]
+        ax_to_hide.axis('off')
         
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.92)  # Make space for suptitle
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
     plt.savefig(output_path, dpi=150)
     plt.close(fig)
+    print(f"  Created section montage (oriented by highest Z): {output_path}")
 
 # Example usage
 if __name__ == "__main__":
@@ -586,7 +664,7 @@ if __name__ == "__main__":
     ]
 
     ## Test with a single file
-    #files_to_process = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
+    files_to_process = ["results/full_stomata_Ac_DA_1_3_bulge_not_preserved.ply"]
     output_dir = "centerline_results"
     
     # Initialize storage for collected results
