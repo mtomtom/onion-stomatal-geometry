@@ -14,6 +14,7 @@ from helper_functions import (_smooth_centerline_savgol,
                              fit_ellipse_robust, generate_ellipse_points) # ADDED ellipse functions
 import edge_detection as ed
 
+
 def analyze_centerline_sections(mesh_file, 
                                num_sections=20, 
                                visualize=True,
@@ -161,6 +162,9 @@ def analyze_centerline_sections(mesh_file,
     sampled_positions = []
     sampled_tangents = []
     final_normalized_positions = [] # Renamed to avoid conflict with loop var
+    final_transform_matrices_list = []
+    final_section_origins_3d_list = []
+    final_section_normals_3d_list = []
     
     target_norm_positions = np.linspace(0, 1.0, num_sections)
     sampled_indices = [np.argmin(np.abs(normalized_distances - target)) for target in target_norm_positions]
@@ -190,6 +194,9 @@ def analyze_centerline_sections(mesh_file,
             'points_2d': None, 'transform': None, 'position_3d': s_pos, 
             'tangent_3d': s_tan, 'norm_pos': s_norm_pos, 'valid_geometry': False
         }
+
+        current_section_data_item['section_origin_3d'] = s_pos  # Section origin is the point on centerline
+        current_section_data_item['section_normal_3d'] = s_tan  # Section normal is the tangent at centerline
 
         if np.all(s_tan == 0):
             print(f"  Error: Zero tangent at section {idx+1}")
@@ -222,10 +229,16 @@ def analyze_centerline_sections(mesh_file,
             continue
         
         print(f"  Section {idx+1}: Created successfully with {len(section.entities)} entities")
+        final_section_points_3d_list = []  # Add this to store the 3D points
+        final_transform_matrices_list = []
         
         try:
             path_2D, transform_2d_to_3d_geom = section.to_2D()
             points_2D_geom = path_2D.vertices
+            # Add this line to store the 3D points
+            points_3D_geom = np.array(section.vertices) if hasattr(section, 'vertices') else None
+            current_section_data_item['points_3d'] = points_3D_geom
+            current_section_data_item['transform_2d_to_3d'] = transform_2d_to_3d_geom
         except Exception as e_to_2d:
             print(f"  Error converting section {idx+1} to 2D: {e_to_2d}")
             raw_section_data_list.append(current_section_data_item)
@@ -312,6 +325,11 @@ def analyze_centerline_sections(mesh_file,
         relative_orientation_deg_val = None
         
         final_section_points_list.append(current_points_2d) 
+        final_section_points_3d_list.append(data_item.get('points_3d', None))
+        final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))  # Add this line
+        final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))
+        final_section_origins_3d_list.append(data_item.get('section_origin_3d', None))
+        final_section_normals_3d_list.append(data_item.get('section_normal_3d', None))
 
         if data_item['valid_geometry'] and current_points_2d is not None and len(current_points_2d) >= 3:
             # PCA-based metrics ...
@@ -448,11 +466,16 @@ def analyze_centerline_sections(mesh_file,
         
         # Create section montage (will show original and fitted ellipse)
         create_section_montage(
-            final_section_points_list, # Original 2D points
-            final_ellipse_points_for_plot, # Points for drawing ellipses
+            final_section_points_list,
+            final_ellipse_points_for_plot,
             final_normalized_positions, 
-            final_ellipse_aspect_ratios, # AR from ellipse
-            os.path.join(output_dir, f"{base_name_for_outputs}_section_montage_with_ellipse.png") # UPDATED FILENAME
+            final_ellipse_aspect_ratios,
+            os.path.join(output_dir, f"{base_name_for_outputs}_section_montage_with_ellipse.png"),
+            original_points_3d_list=final_section_points_3d_list,
+            pore_center_3d=pore_center,
+            transform_matrices_list=final_transform_matrices_list,
+            section_origins_3d_list=final_section_origins_3d_list,
+            section_normals_3d_list=final_section_normals_3d_list
         )
 
         # NEW: Plot Inlier Ratio (ellipse) vs position
@@ -628,79 +651,242 @@ def analyze_centerline_sections(mesh_file,
     }
 
 def create_section_montage(section_points_list, ellipse_points_for_plot_list, 
-                           positions, aspect_ratios_ellipse, output_path): # MODIFIED SIGNATURE
+                           positions, aspect_ratios_ellipse, output_path,
+                           original_points_3d_list=None,
+                           pore_center_3d=None,
+                           transform_matrices_list=None,
+                           section_origins_3d_list=None,
+                           section_normals_3d_list=None):
+    """
+    Create a montage of cross-sections with their fitted ellipses.
+    Orients sections with their highest Z point at the top and consistent sidedness.
+    All sections are centered at (0,0) with symmetric axis limits.
+    
+    Parameters:
+    -----------
+    section_points_list : list of ndarrays
+        List of 2D points for each cross-section.
+    ellipse_points_for_plot_list : list of ndarrays
+        List of 2D points for the fitted ellipses.
+    positions : list of float
+        Normalized positions along the centerline.
+    aspect_ratios_ellipse : list of float
+        Aspect ratios of the fitted ellipses.
+    output_path : str
+        Path to save the montage.
+    original_points_3d_list : list of ndarrays, optional
+        List of 3D points corresponding to each 2D cross-section. Used for orientation.
+    pore_center_3d : ndarray, optional
+        3D coordinates of the pore center for secondary orientation.
+    """
     valid_sections_info = []
+    
+    # Helper function to rotate 2D points
+    def rotate_points_2d(points_2d, angle):
+        """Rotate 2D points by the given angle in radians."""
+        if points_2d is None or len(points_2d) == 0:
+            return points_2d
+        
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        rotation_matrix = np.array([
+            [cos_angle, -sin_angle],
+            [sin_angle, cos_angle]
+        ])
+        
+        # Calculate centroid for rotation around center
+        centroid = np.mean(points_2d, axis=0)
+        # Center, rotate, then translate back
+        centered = points_2d - centroid
+        rotated = np.dot(centered, rotation_matrix.T)
+        return rotated + centroid
+    
+    # Process each section
     for i, (orig_pts, ellipse_pts) in enumerate(zip(section_points_list, ellipse_points_for_plot_list)):
-        if orig_pts is not None and aspect_ratios_ellipse[i] is not None and \
-           not (hasattr(aspect_ratios_ellipse[i], '__iter__') and len(aspect_ratios_ellipse[i])==0) and \
-           np.isfinite(aspect_ratios_ellipse[i]) and \
-           abs(aspect_ratios_ellipse[i]) <= 30.0: # Filter based on ellipse AR
-            valid_sections_info.append({
-                'original_points': orig_pts,
-                'ellipse_points': ellipse_pts, # Can be None if fitting failed
-                'position': positions[i],
-                'aspect_ratio': aspect_ratios_ellipse[i],
-                'original_index': i
-            })
+        # Skip invalid sections
+        current_ar = aspect_ratios_ellipse[i]
+        if hasattr(current_ar, '__iter__') and len(current_ar) > 0:
+            current_ar = current_ar[0] if len(current_ar) > 0 else None
+        
+        if orig_pts is None or current_ar is None or not np.isfinite(current_ar) or abs(current_ar) > 30.0:
+            continue
+            
+        # Convert to numpy arrays if they aren't already
+        orig_pts = np.array(orig_pts)
+        ellipse_pts = np.array(ellipse_pts) if ellipse_pts is not None else None
+        
+        # Center points at (0,0) and orient if 3D points are available
+        orig_pts_processed = orig_pts.copy()
+        ellipse_pts_processed = ellipse_pts.copy() if ellipse_pts is not None else None
+        
+        # Center original points at (0,0)
+        if len(orig_pts_processed) > 0:
+            centroid_2d = np.mean(orig_pts_processed, axis=0)
+            orig_pts_processed = orig_pts_processed - centroid_2d
+            
+            # Also center ellipse points at the same centroid
+            if ellipse_pts_processed is not None and len(ellipse_pts_processed) > 0:
+                ellipse_pts_processed = ellipse_pts_processed - centroid_2d
+        
+        # Orient the section if 3D points are available
+        if original_points_3d_list is not None and i < len(original_points_3d_list) and original_points_3d_list[i] is not None:
+            orig_3d = original_points_3d_list[i]
+            
+            if len(orig_3d) == len(orig_pts):  # Ensure 1-to-1 correspondence
+                # --- Primary Orientation: Highest Z point up ---
+                # Find highest Z point
+                z_coords_3d = orig_3d[:, 2]
+                highest_z_idx = np.argmax(z_coords_3d)
+                
+                # Get point for rotation (already centered)
+                landmark_for_primary_rotation = orig_pts_processed[highest_z_idx]
+                
+                # Calculate rotation angle
+                current_angle_primary = np.arctan2(landmark_for_primary_rotation[1], landmark_for_primary_rotation[0])
+                target_angle_primary = np.pi/2  # 90 degrees = top (positive Y)
+                rotation_angle_primary = target_angle_primary - current_angle_primary
+                
+                # Create rotation matrix
+                cos_theta_p = np.cos(rotation_angle_primary)
+                sin_theta_p = np.sin(rotation_angle_primary)
+                primary_rotation_matrix = np.array([
+                    [cos_theta_p, -sin_theta_p],
+                    [sin_theta_p, cos_theta_p]
+                ])
+                
+                # Apply primary rotation (points are already centered)
+                orig_pts_processed = np.dot(orig_pts_processed, primary_rotation_matrix.T)
+                
+                # Also rotate ellipse points if present
+                if ellipse_pts_processed is not None:
+                    ellipse_pts_processed = np.dot(ellipse_pts_processed, primary_rotation_matrix.T)
+                
+                # --- Secondary Orientation: Check if we should flip horizontally ---
+                # After the primary rotation, we want to ensure consistent sidedness
+                if pore_center_3d is not None and transform_matrices_list is not None:
+                    transform_2d_to_3d_matrix = transform_matrices_list[i]
+                    if transform_2d_to_3d_matrix is not None:
+                        # Calculate vector from pore center to section centroid in 3D
+                        section_centroid_3d = np.mean(orig_3d, axis=0)
+                        radial_vector_3d = section_centroid_3d - pore_center_3d
+                        
+                        # Calculate the normal vector to the section plane
+                        # Use the last row of the rotation part of the transform (or calculate from points)
+                        normal_from_transform = transform_2d_to_3d_matrix[:3, 2]
+                        normal_magnitude = np.linalg.norm(normal_from_transform)
+                        
+                        if normal_magnitude > 1e-6:
+                            section_normal_3d = normal_from_transform / normal_magnitude
+                            
+                            # Project the radial vector onto the section plane
+                            radial_vector_on_plane_3d = radial_vector_3d - np.dot(radial_vector_3d, section_normal_3d) * section_normal_3d
+                            
+                            # Transform to 2D using the same transformation as the section points
+                            # Extract the rotation component (3x3 upper-left submatrix)
+                            rotation_3d_to_2d = np.linalg.inv(transform_2d_to_3d_matrix[:3, :3])
+                            
+                            # Apply to the radial vector (ignore translation since it's a direction)
+                            radial_vector_2d = np.dot(rotation_3d_to_2d, radial_vector_on_plane_3d)
+                            
+                            # Take just the X and Y components (the Z should be very close to zero)
+                            ref_vec_orig_2d = radial_vector_2d[:2]
+                            
+                            norm_ref_vec = np.linalg.norm(ref_vec_orig_2d)
+                            if norm_ref_vec > 1e-6:
+                                ref_vec_orig_2d /= norm_ref_vec
+                                
+                                # Apply the primary rotation to this 2D reference vector
+                                ref_vec_after_primary_rotation = primary_rotation_matrix @ ref_vec_orig_2d
+                                
+                                # If X component is negative after rotation, flip horizontally
+                                if ref_vec_after_primary_rotation[0] < -1e-5:  # Small tolerance for zero
+                                    orig_pts_processed[:, 0] *= -1  # Flip X-coordinates
+                                    if ellipse_pts_processed is not None:
+                                        ellipse_pts_processed[:, 0] *= -1  # Flip X-coordinates
+        
+        # Store processed points and section information
+        valid_sections_info.append({
+            'original_points_processed': orig_pts_processed,
+            'ellipse_points_processed': ellipse_pts_processed,
+            'position': positions[i],
+            'aspect_ratio': current_ar,
+            'original_index': i
+        })
     
     if not valid_sections_info:
         print("  No valid sections with ellipse data to create montage")
         return
-        
+    
+    # --- Calculate global max extent for consistent axis limits ---
+    all_points_for_extent = []
+    for section_info in valid_sections_info:
+        if section_info['original_points_processed'] is not None:
+            all_points_for_extent.append(section_info['original_points_processed'])
+        if section_info['ellipse_points_processed'] is not None:
+            all_points_for_extent.append(section_info['ellipse_points_processed'])
+    
+    max_extent = 1.0  # Default if no points
+    if all_points_for_extent:
+        stacked_all = np.vstack(all_points_for_extent)
+        max_extent = np.max(np.abs(stacked_all)) * 1.1  # 10% padding
+    
+    # --- Create the plot ---
     n_sections = len(valid_sections_info)
     cols = min(5, n_sections)
     rows = (n_sections + cols - 1) // cols
     
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*3.5, rows*3.5)) # Slightly larger subplots
-    fig.suptitle("Cross-Sections (Original and Fitted Ellipse)", fontsize=16) # UPDATED TITLE
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*3.5, rows*3.5))
+    fig.suptitle("Cross-Sections (Oriented by Highest Z, Centered)", fontsize=16)
     
     if rows == 1 and cols == 1: axes = np.array([axes])
-    elif rows == 1 or cols == 1: axes = axes.flatten()
-    
-    all_orig_points_for_scale = np.vstack([info['original_points'] for info in valid_sections_info if info['original_points'] is not None])
-    max_extent = np.max(np.abs(all_orig_points_for_scale)) * 1.1 if len(all_orig_points_for_scale) > 0 else 1.0
-    
+    axes_flat = axes.flatten()
+
     for i, section_info in enumerate(valid_sections_info):
-        if i >= len(axes.flatten()): break
-            
-        row_idx = i // cols
-        col_idx = i % cols
-        ax = axes[row_idx, col_idx] if rows > 1 and cols > 1 else axes[i]
+        if i >= len(axes_flat): break
+        ax = axes_flat[i]
         
-        orig_pts = section_info['original_points']
-        ellipse_pts = section_info['ellipse_points']
+        orig_pts = section_info['original_points_processed']
+        ellipse_pts = section_info['ellipse_points_processed']
         
         if orig_pts is not None and len(orig_pts) >= 3:
-            ordered_orig_points = order_points(orig_pts, method="angular")
-            ax.plot(np.append(ordered_orig_points[:, 0], ordered_orig_points[0, 0]),
-                    np.append(ordered_orig_points[:, 1], ordered_orig_points[0, 1]),
-                    'b-', linewidth=1.5, label='Original Section')
-            ax.fill(ordered_orig_points[:, 0], ordered_orig_points[:, 1], alpha=0.2, color='blue')
+            # Order points before plotting
+            ordered_orig_pts = order_points(orig_pts, method="angular")
+            
+            # Create closed polygon
+            closed_orig = np.vstack([ordered_orig_pts, ordered_orig_pts[0:1]])
+            ax.plot(closed_orig[:, 0], closed_orig[:, 1], 'b-', linewidth=1.5, label='Original Section')
+            ax.fill(ordered_orig_pts[:, 0], ordered_orig_pts[:, 1], alpha=0.2, color='blue')
 
             if ellipse_pts is not None and len(ellipse_pts) > 0:
-                ax.plot(ellipse_pts[:, 0], ellipse_pts[:, 1], 'r--', linewidth=1.2, label='Fitted Ellipse')
+                # Order ellipse points
+                ordered_ellipse_pts = order_points(ellipse_pts, method="angular")
+                closed_ellipse = np.vstack([ordered_ellipse_pts, ordered_ellipse_pts[0:1]])
+                ax.plot(closed_ellipse[:, 0], closed_ellipse[:, 1], 'r--', linewidth=1.2, label='Fitted Ellipse')
             
-            ax.set_title(f"Pos: {section_info['position']:.2f}\nAR (Ell): {section_info['aspect_ratio']:.2f}")
+            ax.set_title(f"Pos: {section_info['position']:.2f}\nAR (Ell): {section_info['aspect_ratio']:.2f}", fontsize=10)
         else:
             ax.text(0.5, 0.5, "No valid data", ha='center', va='center', transform=ax.transAxes)
-            
+        
+        # Set symmetric axis limits
         ax.set_aspect('equal')
         ax.set_xlim(-max_extent, max_extent)
         ax.set_ylim(-max_extent, max_extent)
         ax.grid(True, alpha=0.3)
-        if i == 0: ax.legend(fontsize='small', loc='upper right') # Add legend to first plot
         
-    for i in range(n_sections, rows*cols):
-        row_idx = i // cols
-        col_idx = i % cols
-        if rows > 1 and cols > 1: axes[row_idx, col_idx].axis('off')
-        elif i < len(axes.flatten()): axes.flatten()[i].axis('off')
+        # Add coordinate axes for reference
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
         
-    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
-    # plt.subplots_adjust(top=0.92) # Already handled by tight_layout rect
+        if i == 0: ax.legend(fontsize='small', loc='upper right')
+    
+    # Turn off unused subplots
+    for i in range(n_sections, len(axes_flat)):
+        axes_flat[i].axis('off')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_path, dpi=150)
     plt.close(fig)
-    print(f"  Created section montage with ellipses: {output_path}")
+    print(f"  Created section montage (oriented by highest Z, centered): {output_path}")
 
 # Example usage
 if __name__ == "__main__":
@@ -710,7 +896,7 @@ if __name__ == "__main__":
         "Meshes/Onion_OBJ/Ac_DA_3_4.obj",  "Meshes/Onion_OBJ/Ac_DA_3_2.obj",
         "Meshes/Onion_OBJ/Ac_DA_3_1.obj", 
         "Meshes/Onion_OBJ/Ac_DA_2_3.obj",
-        "Meshes/Onion_OBJ/Ac_DA_1_8_mesh.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"
+        "Meshes/Onion_OBJ/Ac_DA_1_8.obj", "Meshes/Onion_OBJ/Ac_DA_1_6.obj"
     ]
 
     ## Test with a single file

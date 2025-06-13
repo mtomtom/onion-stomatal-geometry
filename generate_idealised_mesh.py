@@ -1113,8 +1113,8 @@ if __name__ == '__main__':
     
     scaling_factors = [1.27, 1.22, 1.25, 1.24, 1.33, 1.28, 1.49, 1.4, 1.21, 1.44, 1.33, 1.25]
 
-    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_5.obj"]
-    scaling_factors = [1.24]
+    mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
+    scaling_factors = [1.27]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory
