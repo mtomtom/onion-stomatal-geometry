@@ -309,7 +309,8 @@ def run_tiff_cross_section_analysis(
     num_mesh_sections=15,
     output_dir="tiff_cs_results",
     visualize_mesh_analysis_output=False,
-    visualize_tiff_sections=True
+    visualize_tiff_sections=True,
+    tiff_z_resampling_factor=None
 ):
     """
     Orchestrates mesh analysis to get cross-sections, then extracts
@@ -332,6 +333,9 @@ def run_tiff_cross_section_analysis(
     current_output_dir = os.path.join(output_dir, base_name)
     os.makedirs(current_output_dir, exist_ok=True)
 
+    if tiff_z_resampling_factor is not None and tiff_z_resampling_factor != 1.0:
+        print(f"TIFF Z-Resampling Factor: {tiff_z_resampling_factor}")
+
     # --- Load TIFF early for alignment visualization ---
     print("\nLoading TIFF stack for alignment check and analysis...")
     tiff_stack = load_tiff_stack(tiff_file_path)
@@ -339,16 +343,38 @@ def run_tiff_cross_section_analysis(
         print("  Failed to load TIFF stack. Cannot proceed.")
         return None
 
+    effective_tiff_voxel_size_xyz = list(tiff_voxel_size_xyz) # Start with a mutable copy
+
+    if tiff_z_resampling_factor is not None and tiff_z_resampling_factor != 1.0:
+        if tiff_z_resampling_factor <= 0:
+            print("Error: tiff_z_resampling_factor must be positive. Skipping resampling.")
+        else:
+            print(f"Applying Z-resampling to TIFF stack with factor: {tiff_z_resampling_factor}...")
+            # Assuming tiff_stack is ZYX ordered (axis 0 is Z)
+            original_z_shape = tiff_stack.shape[0]
+            
+            # Use scipy.ndimage.zoom for resampling. order=1 is linear interpolation.
+            # Zoom factors are (zoom_z, zoom_y, zoom_x)
+            tiff_stack = scipy.ndimage.zoom(tiff_stack, (tiff_z_resampling_factor, 1, 1), order=1)
+            
+            # Adjust the Z-component of the voxel size.
+            # If you stretch the TIFF (more Z slices, factor > 1), each new Z voxel covers a smaller physical distance.
+            effective_tiff_voxel_size_xyz[2] = effective_tiff_voxel_size_xyz[2] / tiff_z_resampling_factor
+            
+            print(f"  Original TIFF Z-shape: {original_z_shape}, New Z-shape after resampling: {tiff_stack.shape[0]}")
+            print(f"  Original Z voxel size: {tiff_voxel_size_xyz[2]:.4f}")
+            print(f"  Effective Z voxel size after resampling: {effective_tiff_voxel_size_xyz[2]:.4f}")
+
     # --- Generate Full Mesh Alignment Visualization (for Z, Y, and X views) ---
     alignment_view_output_dir = os.path.join(current_output_dir, "alignment_visualization")
     os.makedirs(alignment_view_output_dir, exist_ok=True)
     # ... (calls to visualize_full_mesh_alignment for Z, Y, X views as before) ...
     alignment_image_path_z = os.path.join(alignment_view_output_dir, f"{base_name}_alignment_Z_view.png")
-    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, tiff_voxel_size_xyz, alignment_image_path_z, view_axis='Z')
+    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, effective_tiff_voxel_size_xyz, alignment_image_path_z, view_axis='Z') # USE EFFECTIVE
     alignment_image_path_y = os.path.join(alignment_view_output_dir, f"{base_name}_alignment_Y_view.png")
-    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, tiff_voxel_size_xyz, alignment_image_path_y, view_axis='Y')
+    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, effective_tiff_voxel_size_xyz, alignment_image_path_y, view_axis='Y') # USE EFFECTIVE
     alignment_image_path_x = os.path.join(alignment_view_output_dir, f"{base_name}_alignment_X_view.png")
-    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, tiff_voxel_size_xyz, alignment_image_path_x, view_axis='X')
+    visualize_full_mesh_alignment(mesh_file_path, tiff_stack, mesh_to_tiff_world_transform, tiff_origin_world_xyz, effective_tiff_voxel_size_xyz, alignment_image_path_x, view_axis='X') # USE EFFECTIVE
     
     print(f"  Full mesh alignment views (Z, Y, X) saved in: {alignment_view_output_dir}")
     # Optional: input("  Press Enter to continue after checking alignment views...")
@@ -431,7 +457,7 @@ def run_tiff_cross_section_analysis(
             world_mesh_sections_definitions, # Use the transformed definitions
             tiff_stack,
             tiff_origin_world_xyz, 
-            tiff_voxel_size_xyz,
+            effective_tiff_voxel_size_xyz, # USE EFFECTIVE
             ortho_vis_output_dir,
             base_name
         )
@@ -480,7 +506,7 @@ def run_tiff_cross_section_analysis(
             plane_x_axis_world=plane_x_w,
             plane_y_axis_world=plane_y_w,
             tiff_origin_world_xyz=tiff_origin_world_xyz, 
-            voxel_size_world_xyz=tiff_voxel_size_xyz,    
+            voxel_size_world_xyz=effective_tiff_voxel_size_xyz, # USE EFFECTIVE
             slice_dims_pixels=(128, 128), 
             slice_extent_world=(slice_extent_for_resampling, slice_extent_for_resampling)
         )
@@ -724,7 +750,8 @@ if __name__ == '__main__':
             num_mesh_sections=10, 
             output_dir=example_main_output_dir,
             visualize_mesh_analysis_output=True, 
-            visualize_tiff_sections=True
+            visualize_tiff_sections=True,
+            tiff_z_resampling_factor=1.55  # Set to None or 1.0 to skip resampling
             # Removed threshold_for_com if it was here
         )
         print(f"\nExample run finished. Results are in '{example_main_output_dir}'.")
