@@ -7,6 +7,7 @@ import traceback
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import math
+from sklearn.decomposition import PCA
 import cross_section_functions as csf
 from helper_functions import order_points
 
@@ -28,11 +29,13 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
     - Fit centerline ellipse (csf.fit_centerline_ellipse).
     - Analyze midpoint cross-section (analyze_cross_section).
     - Calculate midpoint cross-section semi-axes and target area.
+    - Calculate confocal pore length and XY projected pore area.
 
     Returns:
         dict: A dictionary containing parameters or None if errors occur.
               Keys: 'mesh', 'center', 'center_xy', 'cl_a', 'cl_b', 'cl_phi',
-                    'cs_a_mid', 'cs_b_mid', 'AR_mid', 'target_area', 'avg_inner_radius'
+                    'cs_a_mid', 'cs_b_mid', 'AR_mid', 'target_area', 'avg_inner_radius',
+                    'confocal_pore_length', 'confocal_pore_area_xy_projection'
     """
     print("STEP 1&2: Extracting geometry and analyzing midpoint...")
     params = {}
@@ -46,29 +49,51 @@ def _get_guard_cell_parameters(input_file_path, visualize_midpoint_analysis=Fals
         params['mesh'] = mesh
         params['center'] = mesh.centroid
 
-        inner_points, outer_points, raw_centerline_points, _ = csf.get_radial_dimensions(
+        # csf.get_radial_dimensions is an alias for get_radial_dimensions from test_functions.py
+        # It returns: inner_points, outer_points, raw_centerline_points, avg_minor_radius_cell_wall
+        inner_points, outer_points, raw_centerline_points, avg_minor_radius_cell_wall = csf.get_radial_dimensions(
             mesh, center=params['center'], ray_count=36
         )
         if raw_centerline_points is None:
              raise ValueError("get_radial_dimensions failed.")
+        # avg_minor_radius_cell_wall is the average (outer-inner)/2, i.e., cell wall thickness
 
         avg_inner_radius = None
-        if inner_points is not None:
+        if inner_points is not None and len(inner_points) > 0: # Check if inner_points is not None and has elements
             inner_radii = np.linalg.norm(inner_points - params['center'], axis=1)
             avg_inner_radius = np.mean(inner_radii) if len(inner_radii) > 0 else None
-            if avg_inner_radius is not None and avg_inner_radius <= 0: print(f"  Warning: Invalid avg inner radius: {avg_inner_radius}")
-            else: print(f"  Avg Inner Radius: {avg_inner_radius:.4f}" if avg_inner_radius is not None else "N/A")
-        params['avg_inner_radius'] = avg_inner_radius
+            if avg_inner_radius is not None and avg_inner_radius <= 1e-6: # Check against small epsilon
+                print(f"  Warning: avg_inner_radius ({avg_inner_radius:.4f}) is very small or non-positive. Pore calculations might be affected.")
+            else: print(f"  Avg Inner Radius (center to inner_points): {avg_inner_radius:.4f}" if avg_inner_radius is not None else "N/A")
+        params['avg_inner_radius'] = avg_inner_radius # This is distance from center to inner points
 
         cl_a, cl_b, cl_phi = csf.fit_centerline_ellipse(raw_centerline_points, params['center'])
         if cl_a is None: raise ValueError("fit_centerline_ellipse failed.")
         params['cl_a'], params['cl_b'], params['cl_phi'] = cl_a, cl_b, cl_phi
         params['center_xy'] = params['center'][:2]
-        print(f"  Centerline: a={cl_a:.3f}, b={cl_b:.3f}, phi={np.degrees(cl_phi):.1f}°")
+        print(f"  Confocal Main Centerline: a={cl_a:.3f}, b={cl_b:.3f}, phi={np.degrees(cl_phi):.1f}°")
         print(f"  Center: {params['center']}")
 
         if avg_inner_radius is not None and cl_b <= avg_inner_radius:
-            print(f"  Warning: Centerline semi-minor axis ({cl_b:.4f}) <= avg inner radius ({avg_inner_radius:.4f}).")
+            print(f"  Warning: Confocal centerline semi-minor axis ({cl_b:.4f}) <= avg_inner_radius ({avg_inner_radius:.4f}). Inner pore ellipse might be invalid.")
+
+        # --- Calculate Confocal Pore Length and XY Projected Pore Area ---
+        confocal_pore_length = None
+        confocal_pore_area_xy_projection = None
+
+        if inner_points is not None and len(inner_points) >= 3:
+            # Project to XY
+            inner_points_xy = inner_points[:, :2]
+            # Order the points (if not already ordered)
+            ordered_inner_points_xy = order_points(inner_points_xy)
+            # Compute area using a polygon
+            pore_polygon = Polygon(ordered_inner_points_xy)
+            confocal_pore_area_xy_projection = pore_polygon.area
+            params['confocal_pore_area_xy_projection'] = confocal_pore_area_xy_projection
+            print(f"  Confocal Pore Area (XY Polygon): {confocal_pore_area_xy_projection:.4f}")
+        else:
+            print("  Warning: Not enough inner points to compute pore area as polygon.")
+            params['confocal_pore_area_xy_projection'] = None
 
         # --- Step 2 Logic ---
         cs_a_mid, cs_b_mid = 0.0, 0.0
@@ -474,7 +499,7 @@ def _generate_swept_mesh_with_caps(half_centerline, cross_section_polygons, num_
         return None
 
 def generate_single_guard_cell(input_file_path, output_path, num_centerline_segments=64,
-                              num_cross_section_points=64, visualize_steps=True, pca_width_scale_factor=1.0):
+                              num_cross_section_points=64, visualize_steps=True, pca_width_scale_factor=1.0, target_pore_length=None, target_pore_area=None):
     """
     Generates a SINGLE guard cell with a CONSTANT cross-section using helper functions.
     """
@@ -511,6 +536,12 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
                 plt.tight_layout(); plt.savefig(viz_path); plt.close(fig)
                 print(f"  Centerline visualization saved to: {viz_path}")
             except Exception as e: print(f"  Error during visualization: {e}")
+
+        if target_pore_length is not None and target_pore_area is not None:
+            print("  Using user-specified target pore length and area (no avg_inner_radius needed).")
+            params['cl_a'] = target_pore_length / 2.0
+            params['cl_b'] = target_pore_area / (np.pi * params['cl_a'])
+            print(f"    Set idealised cl_a={params['cl_a']:.3f}, cl_b={params['cl_b']:.3f} (from user input)")
 
         # --- Step 4: Define HALF centerline and CONSTANT cross-section ---
         print("STEP 4: Defining HALF centerline path and CONSTANT cross-section...")
@@ -609,9 +640,9 @@ def generate_single_guard_cell(input_file_path, output_path, num_centerline_segm
     except Exception as e:
         print(f"  Error generating standard single guard cell: {e}")
         traceback.print_exc()
-        return None, None # Return None, None on error
+        return None, None, None # Return None, None on error
 
-    return single_cell, center
+    return single_cell, center, params
 
 def get_modulated_AR(theta_cl, cl_phi_of_midpoint, AR_mid, AR_tip_target,
                      preserve_area=False, minor_axis_ref=1.0):
@@ -956,9 +987,9 @@ def generate_single_bulging_guard_cell(input_file_path, output_path, num_centerl
     except Exception as e:
         print(f"  Error generating bulging single guard cell: {e}")
         traceback.print_exc()
-        return None, None 
+        return None, None, None
 
-    return single_cell, center
+    return single_cell, center, params
 
 
 def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
@@ -1095,6 +1126,76 @@ def create_full_stomata_from_half(single_cell_mesh, center_point, output_path):
         print(f"  Error during duplication, rotation, combination, or export: {e}")
         traceback.print_exc()
         return None
+    
+def get_inner_points_from_mesh(mesh):
+    inner_points, _, _, _ = csf.get_radial_dimensions(mesh, center=mesh.centroid, ray_count=36)
+    return inner_points
+    
+def scale_mesh_pore_to_match_confocal(mesh, get_inner_points_func, confocal_pore_length, confocal_pore_area, verbose=True):
+    """
+    Scales the mesh in the XY plane so that its pore length and area match the confocal mesh.
+    - mesh: trimesh.Trimesh object (idealised mesh)
+    - get_inner_points_func: function(mesh) -> np.ndarray of inner edge points (N,3)
+    - confocal_pore_length: target pore length (float)
+    - confocal_pore_area: target pore area (float)
+    Returns: scaled mesh (trimesh.Trimesh)
+    """
+    import numpy as np
+    from sklearn.decomposition import PCA
+    from shapely.geometry import Polygon
+    from helper_functions import order_points
+
+    # 1. Extract inner edge points from the mesh
+    inner_points = get_inner_points_func(mesh)
+    if inner_points is None or len(inner_points) < 3:
+        if verbose: print("  [scale_mesh_pore_to_match_confocal] Could not extract inner points from mesh.")
+        return mesh
+
+    # 2. Project to XY
+    inner_xy = inner_points[:, :2]
+    # 3. Order points for area calculation
+    ordered_xy = order_points(inner_xy)
+    # 4. Area
+    idealised_area = Polygon(ordered_xy).area
+    # 5. PCA for length
+    pca = PCA(n_components=1)
+    pca.fit(inner_xy)
+    proj = inner_xy @ pca.components_[0]
+    idealised_length = proj.max() - proj.min()
+
+    if verbose:
+        print(f"  [scale_mesh_pore_to_match_confocal] Idealised pore length: {idealised_length:.4f}, area: {idealised_area:.4f}")
+        print(f"  [scale_mesh_pore_to_match_confocal] Target pore length: {confocal_pore_length:.4f}, area: {confocal_pore_area:.4f}")
+
+    # 6. Compute scaling factors
+    scale_length = confocal_pore_length / idealised_length if idealised_length > 1e-6 else 1.0
+    scale_area = np.sqrt(confocal_pore_area / idealised_area) if idealised_area > 1e-6 else 1.0
+    scale_minor = scale_area / scale_length if scale_length > 1e-6 else 1.0
+
+    # 7. Build scaling matrix in XY (anisotropic scaling)
+    major_axis = pca.components_[0]
+    minor_axis = np.array([-major_axis[1], major_axis[0]])
+    R = np.vstack([major_axis, minor_axis]).T  # 2x2
+    S = np.diag([scale_length, scale_minor])   # 2x2
+    transform_xy = R @ S @ np.linalg.inv(R)    # 2x2
+
+    # 8. Center mesh at pore centroid
+    centroid = inner_xy.mean(axis=0)
+    mesh.vertices[:, :2] -= centroid
+    mesh.vertices[:, :2] = mesh.vertices[:, :2] @ transform_xy.T
+    mesh.vertices[:, :2] += centroid
+
+    if verbose:
+        # Recompute and print new values
+        new_inner_points = get_inner_points_func(mesh)
+        new_inner_xy = new_inner_points[:, :2]
+        new_ordered_xy = order_points(new_inner_xy)
+        new_area = Polygon(new_ordered_xy).area
+        new_proj = new_inner_xy @ major_axis
+        new_length = new_proj.max() - new_proj.min()
+        print(f"  [scale_mesh_pore_to_match_confocal] After scaling: length={new_length:.4f}, area={new_area:.4f}")
+
+    return mesh
 
 # --- Modified Example Usage ---
 if __name__ == '__main__':
@@ -1114,7 +1215,7 @@ if __name__ == '__main__':
     scaling_factors = [1.27, 1.22, 1.25, 1.24, 1.33, 1.28, 1.49, 1.4, 1.21, 1.44, 1.33, 1.25]
 
     mesh_list = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
-    scaling_factors = [1.27]
+    scaling_factors = [1]
     
     # Define output paths for BOTH standard and bulging meshes
     results_dir = "results" # Define results directory
@@ -1143,7 +1244,7 @@ if __name__ == '__main__':
             print("=" * 30)
             print("GENERATING STANDARD MESH")
             print("=" * 30)
-            single_cell_mesh_std, center_point_std = generate_single_guard_cell(
+            single_cell_mesh_std, center_point_std, params_std = generate_single_guard_cell(
                 file_to_process,
                 single_cell_output_std, # Use the correct variable
                 num_centerline_segments=128, # Use higher resolution for smoother curves
@@ -1153,23 +1254,19 @@ if __name__ == '__main__':
             )
             print("-" * 20)
 
-            # --- Create the STANDARD full stomata ---
             if single_cell_mesh_std is not None and center_point_std is not None:
                 create_full_stomata_from_half(
                     single_cell_mesh_std,
                     center_point_std,
-                    full_stomata_output_std # Use the correct variable
+                    full_stomata_output_std
                 )
-            else:
-                print("\nSkipping STANDARD full stomata creation due to errors in single cell generation.")
-
 
             # --- Generate the BULGING single guard cell with preserved cross sectional area---
             preserve_area = True
             print("\n" + "=" * 30)
             print("GENERATING BULGING MESH")
             print("=" * 30)
-            single_cell_mesh_bulge_p, center_point_bulge_p = generate_single_bulging_guard_cell( # Renamed variables
+            single_cell_mesh_bulge_p, center_point_bulge_p, params_bulge_p = generate_single_bulging_guard_cell( # Renamed variables
                 input_file_path=file_to_process,
                 output_path=single_cell_output_bulge_preserved, 
                 num_centerline_segments=128, 
@@ -1184,11 +1281,16 @@ if __name__ == '__main__':
 
             # --- Create the BULGING full stomata ---
             if single_cell_mesh_bulge_p is not None and center_point_bulge_p is not None:
-                create_full_stomata_from_half(
-                    single_cell_mesh_bulge_p,
-                    center_point_bulge_p, 
-                    full_stomata_output_bulge_preserved 
-                )
+                confocal_pore_length = params_bulge_p.get('confocal_pore_length')
+                confocal_pore_area = params_bulge_p.get('confocal_pore_area_xy_projection')
+                if confocal_pore_length and confocal_pore_area:
+                    single_cell_mesh_bulge_p = scale_mesh_pore_to_match_confocal(
+                        single_cell_mesh_bulge_p,
+                        get_inner_points_from_mesh,
+                        confocal_pore_length,
+                        confocal_pore_area,
+                        verbose=True
+                    )
             else:
                 print("\nSkipping BULGING full stomata creation due to errors in single cell generation.")
 
@@ -1197,7 +1299,7 @@ if __name__ == '__main__':
             print("\n" + "=" * 30)
             print("GENERATING BULGING MESH")
             print("=" * 30)
-            single_cell_mesh_bulge_np, center_point_bulge_np = generate_single_bulging_guard_cell( # Renamed variables
+            single_cell_mesh_bulge_np, center_point_bulge_np, params_bulge_np = generate_single_bulging_guard_cell( # Renamed variables
                 input_file_path=file_to_process,
                 output_path=single_cell_output_bulge_not_preserved, 
                 num_centerline_segments=128, 
