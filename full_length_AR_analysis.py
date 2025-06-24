@@ -4,6 +4,7 @@ import matplotlib
 import os
 import trimesh
 from sklearn.decomposition import PCA
+from sklearn.cluster import DBSCAN
 
 # Import necessary functions from existing files
 from test_functions import get_radial_dimensions, filter_section_points
@@ -14,11 +15,241 @@ from helper_functions import (_smooth_centerline_savgol,
                              fit_ellipse_robust, generate_ellipse_points) # ADDED ellipse functions
 import edge_detection as ed
 
+def _find_seam_for_closed_stomata(mesh, output_dir=None, base_name=None):
+    """
+    Finds the internal seam wall by casting rays radially and selecting only the rays
+    that have exactly 3 intersections, as per the geometric definition of the tip seam.
+    """
+    print("  Attempting to find internal seam by selecting rays with exactly 3 intersections...")
+    try:
+        # Step 1: Cast rays radially from the centroid.
+        centroid = mesh.centroid
+        ray_count = 360  # Use a high number of rays for good coverage
+        angles = np.linspace(0, 2 * np.pi, ray_count, endpoint=False)
+        ray_directions = np.zeros((ray_count, 3))
+        ray_directions[:, 0] = np.cos(angles)
+        ray_directions[:, 1] = np.sin(angles)
+        ray_origins = np.tile(centroid, (ray_count, 1))
+        
+        locations, index_ray, _ = mesh.ray.intersects_location(
+            ray_origins=ray_origins, ray_directions=ray_directions
+        )
+
+        if len(locations) == 0:
+            print("  Radial ray-casting found no intersections.")
+            return None
+
+        # Step 2: Collect points ONLY from rays that have exactly 3 hits.
+        seam_points_collected = []
+        for i in range(ray_count):
+            hits_for_this_ray = locations[index_ray == i]
+            
+            # This is the key logic based on your insight:
+            if len(hits_for_this_ray) == 3:
+                # For a 3-hit ray, the middle point is the seam.
+                distances = np.linalg.norm(hits_for_this_ray - centroid, axis=1)
+                sorted_hits = hits_for_this_ray[np.argsort(distances)]
+                seam_points_collected.append(sorted_hits[1]) # Add the middle point
+
+        if not seam_points_collected:
+            print("  Warning: No rays with exactly 3 intersections were found. Cannot identify tip seam.")
+            return None
+        
+        junction_points_3d = np.array(seam_points_collected)
+        print(f"  Found {len(junction_points_3d)} points on the tip seam using 3-intersection logic.")
+
+        # --- Visualization Logic ---
+        if output_dir and base_name:
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.add_collection3d(Poly3DCollection(mesh.vertices[mesh.faces], alpha=0.1, facecolor='cyan', edgecolor='none'))
+            ax.scatter(junction_points_3d[:, 0], junction_points_3d[:, 1], junction_points_3d[:, 2], c='r', s=25, label='Detected Seam Points', depthshade=False)
+            ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+            ax.set_title(f'Internal Seam Detection for {base_name}')
+            ax.legend()
+            
+            bounds = mesh.bounds
+            max_range = (bounds[1] - bounds[0]).max()
+            center = bounds.mean(axis=0)
+            ax.set_xlim(center[0] - max_range / 2, center[0] + max_range / 2)
+            ax.set_ylim(center[1] - max_range / 2, center[1] + max_range / 2)
+            ax.set_zlim(center[2] - max_range / 2, center[2] + max_range / 2)
+
+            plot_path = os.path.join(output_dir, f"{base_name}_seam_detection.png")
+            plt.savefig(plot_path, dpi=150)
+            plt.close(fig)
+            print(f"  Saved internal seam detection visualization to: {plot_path}")
+
+        return junction_points_3d
+
+    except Exception as e:
+        print(f"  Error during internal seam detection: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+def _generate_centerline_for_closed_stomata(mesh, ray_count=90, output_dir=None, base_name=None):
+    """
+    Generates a centerline segment from tip to midpoint for a closed stoma.
+    This version uses the mesh centroid for a stable centerline loop and the seam's
+    principal axis to robustly define the tip and midpoint.
+    """
+    print("  Running closed stoma workflow: finding seam to define centerline segment.")
+
+    # Step 1: Find the seam, which will be used for landmarking ONLY.
+    seam_points = _find_seam_for_closed_stomata(mesh, output_dir=output_dir, base_name=base_name)
+    
+    # Step 2: Generate the centerline loop from the true mesh centroid for stability.
+    # The center of ray-casting is NOT adjusted to the seam, as this distorts the loop.
+    estimated_center = mesh.centroid
+    print(f"  Generating centerline loop via ray-casting from mesh centroid {estimated_center.round(3)}.")
+    
+    raw_centerline_points = []
+    outer_wall_points = []
+    for i in range(ray_count):
+        angle = 2 * np.pi * i / ray_count
+        ray_direction = np.array([np.cos(angle), np.sin(angle), 0])
+        locations, _, _ = mesh.ray.intersects_location(
+            ray_origins=[estimated_center], ray_directions=[ray_direction]
+        )
+        if len(locations) > 0:
+            outer_wall_point = locations[np.argmax(np.linalg.norm(locations - estimated_center, axis=1))]
+            outer_wall_points.append(outer_wall_point)
+            midpoint = estimated_center + (outer_wall_point - estimated_center) / 2.0
+            raw_centerline_points.append(midpoint)
+
+    if len(raw_centerline_points) < 20:
+        print("  Error: Not enough points generated from ray-casting to form a reliable loop.")
+        return None, estimated_center, None, seam_points
+    
+    closed_loop_centerline = np.array(raw_centerline_points)
+
+    # Step 3: Smooth the full loop.
+    pad_len = len(closed_loop_centerline) // 2
+    padded_loop = np.vstack([closed_loop_centerline[-pad_len:], closed_loop_centerline, closed_loop_centerline[:pad_len]])
+    smoothed_padded_loop = _smooth_centerline_savgol(padded_loop)
+    if smoothed_padded_loop is None:
+        print("  Error: Smoothing the padded loop failed.")
+        return None, estimated_center, None, seam_points
+    smoothed_loop = smoothed_padded_loop[pad_len:-pad_len]
+    print(f"  Successfully generated and smoothed a closed centerline loop with {len(smoothed_loop)} points.")
+
+    # Step 4: Identify tip and midpoint using the seam's principal axis.
+    N_cl = len(smoothed_loop)
+    if seam_points is None or len(seam_points) < 3:
+        print("  Warning: Could not find seam or too few seam points. Falling back to geometric tip/midpoint definition.")
+        # Fallback: tip is point on loop furthest from center, midpoint is 90 degrees away.
+        distances_from_center = np.linalg.norm(smoothed_loop - estimated_center, axis=1)
+        tip_idx = np.argmax(distances_from_center)
+        midpoint_idx = (tip_idx + N_cl // 4) % N_cl
+    else:
+        # Use PCA to find the orientation of the seam points.
+        pca = PCA(n_components=2).fit(seam_points)
+        seam_axis = pca.components_[0] # The primary direction of the seam
+        print(f"  Determined seam orientation axis via PCA: {seam_axis.round(3)}")
+
+        # Project the centerline loop points onto the seam axis to find the tip.
+        # The tip is the point on the loop that extends furthest along the seam's direction.
+        projections = (smoothed_loop - pca.mean_) @ seam_axis
+        tip_idx = np.argmax(projections)
+        
+        # The midpoint is 90 degrees (a quarter of the loop) away from the tip.
+        midpoint_idx = (tip_idx + N_cl // 4) % N_cl
+
+    print(f"  Identified Tip (idx {tip_idx}) and Midpoint (idx {midpoint_idx}) on the loop based on seam orientation.")
+
+    # Step 5: Extract the path from the new tip to the new midpoint.
+    path_indices = []
+    curr = tip_idx
+    for _ in range(N_cl): # Safety break
+        path_indices.append(curr)
+        if curr == midpoint_idx: break
+        curr = (curr + 1) % N_cl
+    
+    centerline_segment = smoothed_loop[path_indices]
+    print(f"  Extracted centerline segment from tip to midpoint with {len(centerline_segment)} points.")
+
+    # Step 6: Estimate minor radius for filtering.
+    if len(outer_wall_points) > 0:
+        # Use a more stable radius estimation based on the full loop
+        radii = np.linalg.norm(np.array(outer_wall_points) - closed_loop_centerline, axis=1)
+        estimated_minor_radius = np.mean(radii)
+    else:
+        estimated_minor_radius = np.min(mesh.bounding_box.extents) / 4.0
+    print(f"  Estimated minor radius for filtering: {estimated_minor_radius:.3f}")
+
+    return centerline_segment, estimated_center, estimated_minor_radius, seam_points
+
+def _find_optimal_section(mesh, center_point, initial_normal, pivot_range_deg=20, num_pivots=11):
+    """
+    Pivots the section plane around the center_point to find the orientation 
+    with the minimum cross-sectional area. This performs a 2D search.
+
+    Args:
+        mesh (trimesh.Trimesh): The mesh to section.
+        center_point (ndarray): The point on the centerline to pivot around.
+        initial_normal (ndarray): The initial plane normal (centerline tangent).
+        pivot_range_deg (float): The range of angles (+/-) to search in degrees.
+        num_pivots (int): The number of steps for the angle search.
+
+    Returns:
+        tuple: (best_section, best_normal) where best_section is a trimesh.Path3D object.
+    """
+    if num_pivots < 2:
+        section = mesh.section(plane_origin=center_point, plane_normal=initial_normal)
+        return section, initial_normal
+
+    # Create a basis for pivoting (two orthogonal axes in the plane)
+    u = np.array([1., 0., 0.])
+    if np.abs(np.dot(u, initial_normal)) > 0.99:
+        u = np.array([0., 1., 0.])
+    
+    pivot_axis1 = np.cross(initial_normal, u)
+    pivot_axis1 /= np.linalg.norm(pivot_axis1)
+    pivot_axis2 = np.cross(initial_normal, pivot_axis1)
+    pivot_axis2 /= np.linalg.norm(pivot_axis2)
+
+    best_section = None
+    min_area = float('inf')
+    best_normal = initial_normal
+    angles = np.linspace(-np.deg2rad(pivot_range_deg), np.deg2rad(pivot_range_deg), num_pivots)
+
+    # Perform a 2D search by iterating through combinations of pivots
+    for angle1 in angles:
+        for angle2 in angles:
+            # Rotate around axis 1
+            r1_normal = (initial_normal * np.cos(angle1) + 
+                         np.cross(pivot_axis1, initial_normal) * np.sin(angle1))
+            # Rotate the result around axis 2
+            rotated_normal = (r1_normal * np.cos(angle2) + 
+                              np.cross(pivot_axis2, r1_normal) * np.sin(angle2))
+            
+            rotated_normal /= np.linalg.norm(rotated_normal)
+            
+            try:
+                section = mesh.section(plane_origin=center_point, plane_normal=rotated_normal)
+                if section is not None and section.area > 1e-9:
+                    if section.area < min_area:
+                        min_area = section.area
+                        best_section = section
+                        best_normal = rotated_normal
+            except Exception:
+                continue # Ignore failures for any single pivot
+
+    if best_section is None:
+        print("  Warning: Optimal section search failed. Falling back to initial tangent.")
+        best_section = mesh.section(plane_origin=center_point, plane_normal=initial_normal)
+        best_normal = initial_normal
+
+    return best_section, best_normal
+
 
 def analyze_centerline_sections(mesh_file, 
                                num_sections=20, 
                                visualize=True,
-                               output_dir=None):
+                               output_dir=None,
+                               is_closed=False):
     """
     Analyzes cross-sections along the full centerline of a stomata guard cell
     and measures how aspect ratio changes along its length.
@@ -44,109 +275,131 @@ def analyze_centerline_sections(mesh_file,
     
     base_name_for_outputs = os.path.splitext(os.path.basename(mesh_file))[0]
 
-    # Step 1: Process mesh and extract key features
-    print(f"\nProcessing mesh: {mesh_file}")
-    ed_output = ed.find_seam_by_raycasting(mesh_file, visualize=False)
-    
-    if ed_output is None or 'mesh_object' not in ed_output or ed_output['mesh_object'] is None:
-        print(f"  Error: Edge detection failed for {mesh_file}")
+    try:
+        mesh = trimesh.load(mesh_file, force='mesh')
+    except Exception as e:
+        print(f"  Error loading mesh file {mesh_file}: {e}")
         return None
     
-    mesh = ed_output['mesh_object']
-    shared_wall_points = ed_output.get('shared_wall_points')
-    pore_center = ed_output.get('pore_center_coords') # This is detected_pore_center_3d_ed
-    estimated_centerline_3d_from_ed = ed_output.get('estimated_centerline_points')
+    seam_points_for_plot = None
 
-    # Step 2: Get radial dimensions
-    ray_origin_for_radial_cast = pore_center 
-    print(f"  Performing radial ray casting from origin: {ray_origin_for_radial_cast.round(3) if ray_origin_for_radial_cast is not None else 'mesh centroid (default)'}")
-    ray_count = 45 
-    inner_points, outer_points, raw_centerline_points_from_radial, minor_radius = get_radial_dimensions(
-        mesh, center=ray_origin_for_radial_cast, ray_count=ray_count
-    ) 
-    if raw_centerline_points_from_radial is None or minor_radius is None:
-        print(f"  Error: Radial dimensions could not be determined for {mesh_file}")
-        return None
+    if not is_closed:
 
-    # Step 3: Smooth the raw centerline from radial dimensions
-    smoothed_centerline_initial = _smooth_centerline_savgol(raw_centerline_points_from_radial)
-    if smoothed_centerline_initial is None:
-        smoothed_centerline_initial = raw_centerline_points_from_radial
-    
-    if smoothed_centerline_initial is None or len(smoothed_centerline_initial) < 2:
-        print("  Error: Not enough points in initial smoothed centerline for analysis.")
-        return None
+        # Step 1: Process mesh and extract key features
+        print(f"\nProcessing mesh: {mesh_file}")
+        ed_output = ed.find_seam_by_raycasting(mesh, visualize=False)
+        
+        if ed_output is None or 'mesh_object' not in ed_output or ed_output['mesh_object'] is None:
+            print(f"  Error: Edge detection failed for {mesh_file}")
+            return None
+        
+        mesh = ed_output['mesh_object']
+        shared_wall_points = ed_output.get('shared_wall_points')
+        seam_points_for_plot = shared_wall_points # Add this line to pass the points for plotting
+        pore_center = ed_output.get('pore_center_coords') # This is detected_pore_center_3d_ed
+        estimated_centerline_3d_from_ed = ed_output.get('estimated_centerline_points')
 
-    # Step 4: Determine Tip and Midpoint Plane Origins & Extract Centerline Segment
-    print("  Determining robust tip and midpoint plane origins...")
-    midpoint_plane_origin_3d, _ = _determine_midpoint_plane(
-        smoothed_centerline_initial, 
-        pore_center 
-    )
-    tip_plane_origin_3d, _, _ = _determine_tip_plane_v2(
-        smoothed_centerline_initial, pore_center, shared_wall_points,
-        minor_radius, inner_points, 
-        min_tip_distance=0.05, 
-        estimated_centerline_3d_from_ed=estimated_centerline_3d_from_ed
-    )
-
-    if tip_plane_origin_3d is None or midpoint_plane_origin_3d is None:
-        print("  Error: Could not determine robust tip or midpoint plane origins. Cannot proceed.")
-        return None
-    
-    print(f"  Robust Tip Plane Origin: {tip_plane_origin_3d.round(3)}")
-    print(f"  Robust Midpoint Plane Origin: {midpoint_plane_origin_3d.round(3)}")
-
-    actual_tip_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline_initial - tip_plane_origin_3d, axis=1))
-    actual_mid_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline_initial - midpoint_plane_origin_3d, axis=1))
-
-    if actual_tip_cl_idx == actual_mid_cl_idx:
-        print("  Error: Tip and Midpoint plane origins map to the same point on the centerline. Adjusting for a minimal segment.")
-        if len(smoothed_centerline_initial) > 1:
-            actual_mid_cl_idx = (actual_tip_cl_idx + 1) % len(smoothed_centerline_initial)
-            if actual_tip_cl_idx == actual_mid_cl_idx : # Still same (e.g. 1 point CL)
-                 print("  Cannot form a segment even with adjustment. Centerline too short.")
-                 return None
-        else:
-            print("  Cannot form a segment. Centerline too short.")
+        # Step 2: Get radial dimensions
+        ray_origin_for_radial_cast = pore_center 
+        print(f"  Performing radial ray casting from origin: {ray_origin_for_radial_cast.round(3) if ray_origin_for_radial_cast is not None else 'mesh centroid (default)'}")
+        ray_count = 45 
+        inner_points, outer_points, raw_centerline_points_from_radial, minor_radius = get_radial_dimensions(
+            mesh, center=ray_origin_for_radial_cast, ray_count=ray_count
+        ) 
+        if raw_centerline_points_from_radial is None or minor_radius is None:
+            print(f"  Error: Radial dimensions could not be determined for {mesh_file}")
             return None
 
-    print(f"  Closest CL idx to Tip Origin: {actual_tip_cl_idx} (Point: {smoothed_centerline_initial[actual_tip_cl_idx].round(3)})")
-    print(f"  Closest CL idx to Mid Origin: {actual_mid_cl_idx} (Point: {smoothed_centerline_initial[actual_mid_cl_idx].round(3)})")
-
-    N_cl = len(smoothed_centerline_initial)
-    path1_indices = []
-    curr = actual_tip_cl_idx; count1 = 0
-    while True:
-        path1_indices.append(curr); count1 += 1
-        if curr == actual_mid_cl_idx or count1 > N_cl: break
-        curr = (curr + 1) % N_cl
-    if curr != actual_mid_cl_idx and count1 > N_cl: path1_indices = list(range(N_cl)) # Safety
-
-    path2_indices = []
-    curr = actual_tip_cl_idx; count2 = 0
-    while True:
-        path2_indices.append(curr); count2 += 1
-        if curr == actual_mid_cl_idx or count2 > N_cl: break
-        curr = (curr - 1 + N_cl) % N_cl
-    if curr != actual_mid_cl_idx and count2 > N_cl: path2_indices = list(range(N_cl)) # Safety
+        # Step 3: Smooth the raw centerline from radial dimensions
+        smoothed_centerline_initial = _smooth_centerline_savgol(raw_centerline_points_from_radial)
+        if smoothed_centerline_initial is None:
+            smoothed_centerline_initial = raw_centerline_points_from_radial
         
-    final_path_indices = path1_indices if len(path1_indices) <= len(path2_indices) else path2_indices
-    print(f"  Selected Path (length {len(final_path_indices)}) for centerline segment.")
+        if smoothed_centerline_initial is None or len(smoothed_centerline_initial) < 2:
+            print("  Error: Not enough points in initial smoothed centerline for analysis.")
+            return None
 
-    if not final_path_indices:
-        print("  Error: Could not determine a valid path between tip and midpoint.")
-        return None
+        print("  Determining robust tip and midpoint plane origins...")
+        midpoint_plane_origin_3d, _ = _determine_midpoint_plane(
+            smoothed_centerline_initial, 
+            pore_center 
+        )
+        tip_plane_origin_3d, _, _ = _determine_tip_plane_v2(
+            smoothed_centerline_initial, pore_center, shared_wall_points,
+            minor_radius, inner_points, 
+            min_tip_distance=0.05, 
+            estimated_centerline_3d_from_ed=estimated_centerline_3d_from_ed
+        )
 
-    centerline_segment_for_analysis = smoothed_centerline_initial[final_path_indices]
-    if len(centerline_segment_for_analysis) < 2:
-        print(f"  Error: Extracted centerline segment has too few points ({len(centerline_segment_for_analysis)}).")
-        return None
-    print(f"  Extracted new centerline segment for analysis with {len(centerline_segment_for_analysis)} points.")
-    
-    smoothed_centerline = centerline_segment_for_analysis # This is the final CL segment to use
+        if tip_plane_origin_3d is None or midpoint_plane_origin_3d is None:
+            print("  Error: Could not determine robust tip or midpoint plane origins. Cannot proceed.")
+            return None
+        
+        print(f"  Robust Tip Plane Origin: {tip_plane_origin_3d.round(3)}")
+        print(f"  Robust Midpoint Plane Origin: {midpoint_plane_origin_3d.round(3)}")
 
-    # Step 4b: Normalize distances along the new segment
+        actual_tip_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline_initial - tip_plane_origin_3d, axis=1))
+        actual_mid_cl_idx = np.argmin(np.linalg.norm(smoothed_centerline_initial - midpoint_plane_origin_3d, axis=1))
+
+        if actual_tip_cl_idx == actual_mid_cl_idx:
+            print("  Error: Tip and Midpoint plane origins map to the same point on the centerline. Adjusting for a minimal segment.")
+            if len(smoothed_centerline_initial) > 1:
+                actual_mid_cl_idx = (actual_tip_cl_idx + 1) % len(smoothed_centerline_initial)
+                if actual_tip_cl_idx == actual_mid_cl_idx : # Still same (e.g. 1 point CL)
+                    print("  Cannot form a segment even with adjustment. Centerline too short.")
+                    return None
+            else:
+                print("  Cannot form a segment. Centerline too short.")
+                return None
+
+        print(f"  Closest CL idx to Tip Origin: {actual_tip_cl_idx} (Point: {smoothed_centerline_initial[actual_tip_cl_idx].round(3)})")
+        print(f"  Closest CL idx to Mid Origin: {actual_mid_cl_idx} (Point: {smoothed_centerline_initial[actual_mid_cl_idx].round(3)})")
+
+        N_cl = len(smoothed_centerline_initial)
+        path1_indices = []
+        curr = actual_tip_cl_idx; count1 = 0
+        while True:
+            path1_indices.append(curr); count1 += 1
+            if curr == actual_mid_cl_idx or count1 > N_cl: break
+            curr = (curr + 1) % N_cl
+        if curr != actual_mid_cl_idx and count1 > N_cl: path1_indices = list(range(N_cl)) # Safety
+
+        path2_indices = []
+        curr = actual_tip_cl_idx; count2 = 0
+        while True:
+            path2_indices.append(curr); count2 += 1
+            if curr == actual_mid_cl_idx or count2 > N_cl: break
+            curr = (curr - 1 + N_cl) % N_cl
+        if curr != actual_mid_cl_idx and count2 > N_cl: path2_indices = list(range(N_cl)) # Safety
+            
+        final_path_indices = path1_indices if len(path1_indices) <= len(path2_indices) else path2_indices
+        print(f"  Selected Path (length {len(final_path_indices)}) for centerline segment.")
+
+        if not final_path_indices:
+            print("  Error: Could not determine a valid path between tip and midpoint.")
+            return None
+
+        centerline_segment_for_analysis = smoothed_centerline_initial[final_path_indices]
+        if len(centerline_segment_for_analysis) < 2:
+            print(f"  Error: Extracted centerline segment has too few points ({len(centerline_segment_for_analysis)}).")
+            return None
+        print(f"  Extracted new centerline segment for analysis with {len(centerline_segment_for_analysis)} points.")
+        
+        smoothed_centerline = centerline_segment_for_analysis # This is the final CL segment to use
+
+    else:
+        # --- CLOSED STOMATA WORKFLOW ---
+        centerline_segment_for_analysis, pore_center, minor_radius, seam_points_for_plot = _generate_centerline_for_closed_stomata(
+            mesh, output_dir=output_dir, base_name=base_name_for_outputs
+        )
+        if centerline_segment_for_analysis is None or len(centerline_segment_for_analysis) < 2:
+            print("  Error: Centerline segment generation for closed stoma failed.")
+            return None
+        smoothed_centerline = _smooth_centerline_savgol(centerline_segment_for_analysis)
+        if smoothed_centerline is None:
+            smoothed_centerline = centerline_segment_for_analysis
+
+    # ... (Centerline normalization and sampling setup is unchanged) ...
     centerline_segments_diff = np.diff(smoothed_centerline, axis=0)
     segment_lengths = np.linalg.norm(centerline_segments_diff, axis=1)
     if len(segment_lengths) == 0:
@@ -155,108 +408,90 @@ def analyze_centerline_sections(mesh_file,
         cumulative_distances = np.zeros(len(smoothed_centerline))
         cumulative_distances[1:] = np.cumsum(segment_lengths)
         normalized_distances = cumulative_distances / cumulative_distances[-1] if cumulative_distances[-1] > 0 else np.zeros(len(smoothed_centerline))
-    
     total_points_segment = len(smoothed_centerline)
-
-    # Step 5: Sample positions along the centerline segment
-    sampled_positions = []
-    sampled_tangents = []
-    final_normalized_positions = [] # Renamed to avoid conflict with loop var
-    final_transform_matrices_list = []
-    final_section_origins_3d_list = []
-    final_section_normals_3d_list = []
-    
+    sampled_positions, sampled_tangents, final_normalized_positions = [], [], []
     target_norm_positions = np.linspace(0, 1.0, num_sections)
     sampled_indices = [np.argmin(np.abs(normalized_distances - target)) for target in target_norm_positions]
-
     for i in sampled_indices:
         position = smoothed_centerline[i]
         sampled_positions.append(position)
-        
-        if total_points_segment < 2: tangent_vec = np.array([0.0,1.0,0.0]) # Should not happen due to earlier check
+        if total_points_segment < 2: tangent_vec = np.array([0.0,1.0,0.0])
         elif i == 0: tangent_vec = smoothed_centerline[1] - smoothed_centerline[0]
         elif i == total_points_segment - 1: tangent_vec = smoothed_centerline[-1] - smoothed_centerline[-2]
         else: tangent_vec = smoothed_centerline[i + 1] - smoothed_centerline[i - 1]
-        
         tangent_norm_val = np.linalg.norm(tangent_vec)
         tangent = tangent_vec / tangent_norm_val if tangent_norm_val > 1e-6 else np.array([0.0, 1.0, 0.0])
-        
         sampled_tangents.append(tangent)
-        final_normalized_positions.append(normalized_distances[i]) # Use the actual normalized distance of the sampled point
+        final_normalized_positions.append(normalized_distances[i])
 
     # --- Stage 1: Initial Section Processing & Geometry Extraction ---
     raw_section_data_list = []
-    print("DEBUG: >>> Entering INITIAL SECTIONING LOOP (Geometry Extraction) <<<")
+    print("DEBUG: >>> Entering INITIAL SECTIONING LOOP (Optimizing and Splitting) <<<")
     for idx, (s_pos, s_tan, s_norm_pos) in enumerate(zip(sampled_positions, sampled_tangents, final_normalized_positions)):
         print(f"  Processing geometry for section {idx+1}/{len(sampled_positions)} at norm_pos {s_norm_pos:.2f}")
         
-        current_section_data_item = {
-            'points_2d': None, 'transform': None, 'position_3d': s_pos, 
-            'tangent_3d': s_tan, 'norm_pos': s_norm_pos, 'valid_geometry': False
-        }
+        current_section_data_item = {'valid_geometry': False}
 
-        current_section_data_item['section_origin_3d'] = s_pos  # Section origin is the point on centerline
-        current_section_data_item['section_normal_3d'] = s_tan  # Section normal is the tangent at centerline
+        # --- NEW: Find optimal section by pivoting to find minimum area ---
+        section, optimal_normal = _find_optimal_section(
+            mesh, center_point=s_pos, initial_normal=s_tan, pivot_range_deg=20, num_pivots=11
+        )
+        s_tan = optimal_normal # Update tangent to the new optimal one
+        
+        current_section_data_item.update({
+            'position_3d': s_pos, 'tangent_3d': s_tan, 'norm_pos': s_norm_pos
+        })
 
-        if np.all(s_tan == 0):
-            print(f"  Error: Zero tangent at section {idx+1}")
-            raw_section_data_list.append(current_section_data_item)
-            continue
-            
-        section = None
-        try:
-            section = mesh.section(plane_origin=s_pos, plane_normal=s_tan)
-            if section is None or not hasattr(section, 'entities') or len(section.entities) == 0:
-                print(f"  Section {idx+1} failed or empty. Attempting perturbation...")
-                for attempt in range(3):
-                    perp1 = np.array([1,0,0]) - np.dot(np.array([1,0,0]), s_tan) * s_tan
-                    if np.linalg.norm(perp1) < 1e-6: perp1 = np.array([0,1,0]) - np.dot(np.array([0,1,0]), s_tan) * s_tan
-                    perp1 /= np.linalg.norm(perp1)
-                    perp2 = np.cross(s_tan, perp1); perp2 /= np.linalg.norm(perp2)
-                    offset = 0.01 * (attempt + 1); new_position = s_pos + offset * (perp1 + perp2)
-                    section = mesh.section(plane_origin=new_position, plane_normal=s_tan)
-                    if section is not None and hasattr(section, 'entities') and len(section.entities) > 0:
-                        print(f"  Successfully created section {idx+1} with offset {offset}")
-                        current_section_data_item['position_3d'] = new_position # Update position if perturbed
-                        break
-                if section is None or not hasattr(section, 'entities') or len(section.entities) == 0:
-                     print(f"  [FAIL] Section {idx+1} could not be created even with perturbation.")
-                     raw_section_data_list.append(current_section_data_item)
-                     continue
-        except Exception as e_sec:
-            print(f"  Error creating section {idx+1}: {e_sec}")
+        if section is None or not hasattr(section, 'entities') or len(section.entities) == 0:
+            print(f"  [FAIL] Section {idx+1} could not be created.")
             raw_section_data_list.append(current_section_data_item)
             continue
         
-        print(f"  Section {idx+1}: Created successfully with {len(section.entities)} entities")
-        final_section_points_3d_list = []  # Add this to store the 3D points
-        final_transform_matrices_list = []
+        # Store the full 3D section points for later use in montage orientation
+        current_section_data_item['full_section_points_3d'] = section.vertices
         
         try:
             path_2D, transform_2d_to_3d_geom = section.to_2D()
             points_2D_geom = path_2D.vertices
-            # Add this line to store the 3D points
-            points_3D_geom = np.array(section.vertices) if hasattr(section, 'vertices') else None
-            current_section_data_item['points_3d'] = points_3D_geom
             current_section_data_item['transform_2d_to_3d'] = transform_2d_to_3d_geom
         except Exception as e_to_2d:
             print(f"  Error converting section {idx+1} to 2D: {e_to_2d}")
             raw_section_data_list.append(current_section_data_item)
             continue
-        print(f"  Section {idx+1}: 2D projection has {len(points_2D_geom)} points")
 
-        plane_origin_2d_geom, _ = _project_plane_origin_to_2d(current_section_data_item['position_3d'], transform_2d_to_3d_geom, points_2D_geom)
+        plane_origin_2d_geom, _ = _project_plane_origin_to_2d(s_pos, transform_2d_to_3d_geom, points_2D_geom)
         
-        if minor_radius is None: # Global minor_radius
-            print(f"  [CRITICAL FAIL] Global minor_radius is None. Cannot filter section {idx+1}.")
-            raw_section_data_list.append(current_section_data_item)
-            continue
-        
-        print(f"    Using global minor_radius for filtering section {idx+1}: {minor_radius:.3f}")
         filtered_points_2D_geom, _ = filter_section_points(
-            points_2D_geom, minor_radius, plane_origin_2d_geom,
-            eps_factor=0.15, min_samples=3
+            points_2D_geom, minor_radius, plane_origin_2d_geom, eps_factor=0.15, min_samples=3
         )
+
+        # --- NEW: Split section to get single guard cell ---
+        if len(filtered_points_2D_geom) >= 3:
+            up_vec = np.array([0., 0., 1.])
+            side_vec_3d = np.cross(s_tan, up_vec)
+            if np.linalg.norm(side_vec_3d) < 1e-6: side_vec_3d = np.cross(s_tan, np.array([0., 1., 0.]))
+            side_vec_3d /= np.linalg.norm(side_vec_3d)
+
+            rotation_3d_to_2d = np.linalg.inv(transform_2d_to_3d_geom[:3, :3])
+            side_vec_2d = (rotation_3d_to_2d @ side_vec_3d)[:2]
+
+            vectors_from_origin = filtered_points_2D_geom - plane_origin_2d_geom
+            projections = vectors_from_origin @ side_vec_2d
+            
+            # Keep the points on the "left" side (projections > 0 is a consistent side)
+            single_guard_cell_points_2d = filtered_points_2D_geom[projections > 0]
+            print(f"    Original section had {len(filtered_points_2D_geom)} pts. Isolated half has {len(single_guard_cell_points_2d)} pts.")
+            
+            if len(single_guard_cell_points_2d) >= 3:
+                current_section_data_item['points_2d'] = single_guard_cell_points_2d
+                current_section_data_item['transform'] = transform_2d_to_3d_geom
+                current_section_data_item['valid_geometry'] = True
+            else:
+                print(f"  [FAIL] Isolated guard cell for section {idx+1} has too few points.")
+        else:
+            print(f"  [FAIL] Section {idx+1} has too few points ({len(filtered_points_2D_geom)}) after initial filtering.")
+        
+        raw_section_data_list.append(current_section_data_item)
         print(f"  Section {idx+1}: After filtering: {len(filtered_points_2D_geom)} points from {len(points_2D_geom)}")
 
         if len(filtered_points_2D_geom) >= 3:
@@ -314,22 +549,19 @@ def analyze_centerline_sections(mesh_file,
 
     final_section_points_list = [] 
     section_data_3d = [] 
+    final_section_points_3d_list = []
+    final_transform_matrices_list = []
 
     print("DEBUG: >>> Entering FINAL ASPECT RATIO AND ELLIPSE FITTING LOOP <<<")
     for idx, data_item in enumerate(raw_section_data_list):
         pca_ar, pca_w = None, None
-        ellipse_ar, ellipse_w = None, None
-        ellipse_plot_pts = None
         inlier_ratio_val = 0.0 # NEW: Initialize inlier ratio for the section
         current_points_2d = data_item['points_2d']
         relative_orientation_deg_val = None
         
         final_section_points_list.append(current_points_2d) 
-        final_section_points_3d_list.append(data_item.get('points_3d', None))
-        final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))  # Add this line
+        final_section_points_3d_list.append(data_item.get('full_section_points_3d', None))
         final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))
-        final_section_origins_3d_list.append(data_item.get('section_origin_3d', None))
-        final_section_normals_3d_list.append(data_item.get('section_normal_3d', None))
 
         if data_item['valid_geometry'] and current_points_2d is not None and len(current_points_2d) >= 3:
             # PCA-based metrics ...
@@ -585,6 +817,15 @@ def analyze_centerline_sections(mesh_file,
                     mode='lines+markers', line=dict(color='black', width=6), marker=dict(size=3.5, color='black'),
                     name='Centerline Segment'
                 ))
+
+                # Add seam points to the plot
+                if seam_points_for_plot is not None and len(seam_points_for_plot) > 0:
+                    plotly_traces.append(go.Scatter3d(
+                        x=seam_points_for_plot[:, 0], y=seam_points_for_plot[:, 1], z=seam_points_for_plot[:, 2],
+                        mode='markers',
+                        marker=dict(size=2, color='red', symbol='x'),
+                        name='Detected Seam'
+                    ))
 
                 cmap_plotly = matplotlib.colormaps['plasma']
                 section_annotations_plotly = []
@@ -900,7 +1141,7 @@ if __name__ == "__main__":
     ]
 
     ## Test with a single file
-    #files_to_process = ["Meshes/Onion_OBJ/Ac_DA_1_2.obj"]
+    files_to_process = ["arabidopsis/myrYFP_38.6_ABA+dark_t120_EDITED_GCS_ONLY_MESH.obj"]
     main_output_directory = "centerline_results" # Renamed for clarity
     
     # Initialize storage for collected results
@@ -918,7 +1159,8 @@ if __name__ == "__main__":
             mesh_file_path,
             num_sections=15,
             visualize=True,
-            output_dir=mesh_specific_output_dir # Pass the specific dir for this mesh
+            output_dir=mesh_specific_output_dir,
+            is_closed=True
         )
         
         if results:
