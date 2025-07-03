@@ -14,6 +14,15 @@ from helper_functions import (_smooth_centerline_savgol,
                              order_points, _determine_midpoint_plane, _determine_tip_plane_v2,
                              fit_ellipse_robust, generate_ellipse_points) # ADDED ellipse functions
 import edge_detection as ed
+from plotting_helpers import (
+    plot_aspect_ratio_curve,
+    plot_width_curve,
+    plot_inlier_ratio_curve,
+    plot_orientation_curve,
+    create_section_montage,
+    plot_sections_3d_matplotlib,
+    plot_sections_3d_plotly
+)
 
 def _find_seam_for_closed_stomata(mesh, output_dir=None, base_name=None):
     """
@@ -58,28 +67,7 @@ def _find_seam_for_closed_stomata(mesh, output_dir=None, base_name=None):
         junction_points_3d = np.array(seam_points_collected)
         print(f"  Found {len(junction_points_3d)} points on the tip seam using 3-intersection logic.")
 
-        # --- Visualization Logic ---
-        if output_dir and base_name:
-            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection='3d')
-            ax.add_collection3d(Poly3DCollection(mesh.vertices[mesh.faces], alpha=0.1, facecolor='cyan', edgecolor='none'))
-            ax.scatter(junction_points_3d[:, 0], junction_points_3d[:, 1], junction_points_3d[:, 2], c='r', s=25, label='Detected Seam Points', depthshade=False)
-            ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-            ax.set_title(f'Internal Seam Detection for {base_name}')
-            ax.legend()
-            
-            bounds = mesh.bounds
-            max_range = (bounds[1] - bounds[0]).max()
-            center = bounds.mean(axis=0)
-            ax.set_xlim(center[0] - max_range / 2, center[0] + max_range / 2)
-            ax.set_ylim(center[1] - max_range / 2, center[1] + max_range / 2)
-            ax.set_zlim(center[2] - max_range / 2, center[2] + max_range / 2)
-
-            plot_path = os.path.join(output_dir, f"{base_name}_seam_detection.png")
-            plt.savefig(plot_path, dpi=150)
-            plt.close(fig)
-            print(f"  Saved internal seam detection visualization to: {plot_path}")
+        
 
         return junction_points_3d
 
@@ -399,34 +387,41 @@ def analyze_centerline_sections(mesh_file,
         if smoothed_centerline is None:
             smoothed_centerline = centerline_segment_for_analysis
 
-    # ... (Centerline normalization and sampling setup is unchanged) ...
-    centerline_segments_diff = np.diff(smoothed_centerline, axis=0)
-    segment_lengths = np.linalg.norm(centerline_segments_diff, axis=1)
-    if len(segment_lengths) == 0:
-        normalized_distances = np.array([0.0]) if len(smoothed_centerline) == 1 else np.array([])
-    else:
-        cumulative_distances = np.zeros(len(smoothed_centerline))
-        cumulative_distances[1:] = np.cumsum(segment_lengths)
-        normalized_distances = cumulative_distances / cumulative_distances[-1] if cumulative_distances[-1] > 0 else np.zeros(len(smoothed_centerline))
-    total_points_segment = len(smoothed_centerline)
-    sampled_positions, sampled_tangents, final_normalized_positions = [], [], []
-    target_norm_positions = np.linspace(0, 1.0, num_sections)
-    sampled_indices = [np.argmin(np.abs(normalized_distances - target)) for target in target_norm_positions]
-    for i in sampled_indices:
-        position = smoothed_centerline[i]
-        sampled_positions.append(position)
-        if total_points_segment < 2: tangent_vec = np.array([0.0,1.0,0.0])
-        elif i == 0: tangent_vec = smoothed_centerline[1] - smoothed_centerline[0]
-        elif i == total_points_segment - 1: tangent_vec = smoothed_centerline[-1] - smoothed_centerline[-2]
-        else: tangent_vec = smoothed_centerline[i + 1] - smoothed_centerline[i - 1]
-        tangent_norm_val = np.linalg.norm(tangent_vec)
-        tangent = tangent_vec / tangent_norm_val if tangent_norm_val > 1e-6 else np.array([0.0, 1.0, 0.0])
-        sampled_tangents.append(tangent)
-        final_normalized_positions.append(normalized_distances[i])
+        # ... (Centerline normalization and sampling setup is unchanged) ...
+        centerline_segments_diff = np.diff(smoothed_centerline, axis=0)
+        segment_lengths = np.linalg.norm(centerline_segments_diff, axis=1)
+        if len(segment_lengths) == 0:
+            normalized_distances = np.array([0.0]) if len(smoothed_centerline) == 1 else np.array([])
+        else:
+            cumulative_distances = np.zeros(len(smoothed_centerline))
+            cumulative_distances[1:] = np.cumsum(segment_lengths)
+            normalized_distances = cumulative_distances / cumulative_distances[-1] if cumulative_distances[-1] > 0 else np.zeros(len(smoothed_centerline))
+        total_points_segment = len(smoothed_centerline)
+        sampled_positions, sampled_tangents, final_normalized_positions = [], [], []
+        target_norm_positions = np.linspace(0, 1.0, num_sections)
+        sampled_indices = [np.argmin(np.abs(normalized_distances - target)) for target in target_norm_positions]
+        for i in sampled_indices:
+            position = smoothed_centerline[i]
+            sampled_positions.append(position)
+            if total_points_segment < 2: tangent_vec = np.array([0.0,1.0,0.0])
+            elif i == 0: tangent_vec = smoothed_centerline[1] - smoothed_centerline[0]
+            elif i == total_points_segment - 1: tangent_vec = smoothed_centerline[-1] - smoothed_centerline[-2]
+            else: tangent_vec = smoothed_centerline[i + 1] - smoothed_centerline[i - 1]
+            tangent_norm_val = np.linalg.norm(tangent_vec)
+            tangent = tangent_vec / tangent_norm_val if tangent_norm_val > 1e-6 else np.array([0.0, 1.0, 0.0])
+            sampled_tangents.append(tangent)
+            final_normalized_positions.append(normalized_distances[i])
 
+    
+    print(f"seam_points_for_plot is None? {seam_points_for_plot is None}")
+    if seam_points_for_plot is not None:
+        print(f"len(seam_points_for_plot): {len(seam_points_for_plot)}")
     # --- Stage 1: Initial Section Processing & Geometry Extraction ---
     raw_section_data_list = []
     print("DEBUG: >>> Entering INITIAL SECTIONING LOOP (Optimizing and Splitting) <<<")
+
+    section_data_3d = []
+
     for idx, (s_pos, s_tan, s_norm_pos) in enumerate(zip(sampled_positions, sampled_tangents, final_normalized_positions)):
         print(f"  Processing geometry for section {idx+1}/{len(sampled_positions)} at norm_pos {s_norm_pos:.2f}")
         
@@ -444,6 +439,7 @@ def analyze_centerline_sections(mesh_file,
 
         if section is None or not hasattr(section, 'entities') or len(section.entities) == 0:
             print(f"  [FAIL] Section {idx+1} could not be created.")
+            current_section_data_item['points_2d'] = None  # <-- Add this line
             raw_section_data_list.append(current_section_data_item)
             continue
         
@@ -456,6 +452,7 @@ def analyze_centerline_sections(mesh_file,
             current_section_data_item['transform_2d_to_3d'] = transform_2d_to_3d_geom
         except Exception as e_to_2d:
             print(f"  Error converting section {idx+1} to 2D: {e_to_2d}")
+            current_section_data_item['points_2d'] = None
             raw_section_data_list.append(current_section_data_item)
             continue
 
@@ -465,42 +462,92 @@ def analyze_centerline_sections(mesh_file,
             points_2D_geom, minor_radius, plane_origin_2d_geom, eps_factor=0.15, min_samples=3
         )
 
-        # --- NEW: Split section to get single guard cell ---
-        if len(filtered_points_2D_geom) >= 3:
-            up_vec = np.array([0., 0., 1.])
-            side_vec_3d = np.cross(s_tan, up_vec)
-            if np.linalg.norm(side_vec_3d) < 1e-6: side_vec_3d = np.cross(s_tan, np.array([0., 1., 0.]))
-            side_vec_3d /= np.linalg.norm(side_vec_3d)
+        if seam_points_for_plot is not None and len(seam_points_for_plot) >= 2:
+            global_seam_pca = PCA(n_components=2)
+            global_seam_pca.fit(seam_points_for_plot)
+            global_seam_center = global_seam_pca.mean_
+            global_seam_dir = global_seam_pca.components_[0]
+        else:
+            global_seam_center = None
+            global_seam_dir = None
 
-            rotation_3d_to_2d = np.linalg.inv(transform_2d_to_3d_geom[:3, :3])
-            side_vec_2d = (rotation_3d_to_2d @ side_vec_3d)[:2]
+        if len(filtered_points_2D_geom) >= 3 and global_seam_center is not None and global_seam_dir is not None:
+            # Project global seam line into section's 2D coordinates
+            origin_3d = transform_2d_to_3d_geom[:3, 3]
+            u_vec_3d = transform_2d_to_3d_geom[:3, 0]
+            v_vec_3d = transform_2d_to_3d_geom[:3, 1]
 
-            vectors_from_origin = filtered_points_2D_geom - plane_origin_2d_geom
-            projections = vectors_from_origin @ side_vec_2d
-            
-            # Keep the points on the "left" side (projections > 0 is a consistent side)
-            single_guard_cell_points_2d = filtered_points_2D_geom[projections > 0]
-            print(f"    Original section had {len(filtered_points_2D_geom)} pts. Isolated half has {len(single_guard_cell_points_2d)} pts.")
-            
+            def project_3d_to_section2d(P):
+                v = P - origin_3d
+                return np.array([np.dot(v, u_vec_3d), np.dot(v, v_vec_3d)])
+
+            seam_origin_2d = project_3d_to_section2d(global_seam_center)
+            seam_dir_point_3d = global_seam_center + global_seam_dir
+            seam_dir_point_2d = project_3d_to_section2d(seam_dir_point_3d)
+            seam_vec_2d = seam_dir_point_2d - seam_origin_2d
+            seam_vec_2d /= np.linalg.norm(seam_vec_2d)
+
+            # Rotate so seam divider is vertical (y-axis)
+            theta = np.arctan2(seam_vec_2d[1], seam_vec_2d[0])
+            rotation_to_vertical = np.array([
+                [ np.cos(-theta), -np.sin(-theta)],
+                [ np.sin(-theta),  np.cos(-theta)]
+            ])
+
+            rotated_section_points_2d = (filtered_points_2D_geom - seam_origin_2d) @ rotation_to_vertical.T
+
+            # Take both half-planes
+            mask_left = rotated_section_points_2d[:, 0] < 0
+            mask_right = ~mask_left
+
+            # Project the 3D centerline point (section origin) into section 2D coordinates
+            section_origin_2d = project_3d_to_section2d(s_pos)
+
+            # Compute centroids of both halves
+            centroid_left = np.mean(filtered_points_2D_geom[mask_left], axis=0)
+            centroid_right = np.mean(filtered_points_2D_geom[mask_right], axis=0)
+
+            # Choose the half whose centroid is closest to the projected centerline point
+            dist_left = np.linalg.norm(centroid_left - section_origin_2d)
+            dist_right = np.linalg.norm(centroid_right - section_origin_2d)
+            if dist_left < dist_right:
+                selected_mask = mask_left
+            else:
+                selected_mask = mask_right
+
+            single_guard_cell_points_2d = filtered_points_2D_geom[selected_mask]
+
+            # Map to 3D for this section (if needed for visualization or analysis)
+            R_2d_to_3d = transform_2d_to_3d_geom[:3, :2]
+            t_3d = transform_2d_to_3d_geom[:3, 3]
+            single_guard_cell_points_3d = np.array([R_2d_to_3d.dot(pt_2d) + t_3d for pt_2d in single_guard_cell_points_2d])
+
+            # Store for later
             if len(single_guard_cell_points_2d) >= 3:
                 current_section_data_item['points_2d'] = single_guard_cell_points_2d
+                current_section_data_item['points_3d'] = single_guard_cell_points_3d
                 current_section_data_item['transform'] = transform_2d_to_3d_geom
                 current_section_data_item['valid_geometry'] = True
             else:
-                print(f"  [FAIL] Isolated guard cell for section {idx+1} has too few points.")
-        else:
-            print(f"  [FAIL] Section {idx+1} has too few points ({len(filtered_points_2D_geom)}) after initial filtering.")
-        
-        raw_section_data_list.append(current_section_data_item)
-        print(f"  Section {idx+1}: After filtering: {len(filtered_points_2D_geom)} points from {len(points_2D_geom)}")
+                # Fallback to using all filtered points if split is too small
+                current_section_data_item['points_2d'] = filtered_points_2D_geom
+                R_2d_to_3d = transform_2d_to_3d_geom[:3, :2]
+                t_3d = transform_2d_to_3d_geom[:3, 3]
+                current_section_data_item['points_3d'] = np.array([R_2d_to_3d.dot(pt_2d) + t_3d for pt_2d in filtered_points_2D_geom])
+                current_section_data_item['transform'] = transform_2d_to_3d_geom
+                current_section_data_item['valid_geometry'] = True
 
-        if len(filtered_points_2D_geom) >= 3:
+        elif len(filtered_points_2D_geom) >= 3:
+            # No seam line available, just use all filtered points
             current_section_data_item['points_2d'] = filtered_points_2D_geom
+            current_section_data_item['points_3d'] = None
             current_section_data_item['transform'] = transform_2d_to_3d_geom
             current_section_data_item['valid_geometry'] = True
         else:
-            print(f"  [FAIL] Section {idx+1} has too few points ({len(filtered_points_2D_geom)}) after filtering geometry.")
-        
+            print(f"  [FAIL] Section {idx+1} has too few points ({len(filtered_points_2D_geom)}) after initial filtering.")
+            current_section_data_item['points_2d'] = None
+            current_section_data_item['valid_geometry'] = False
+
         raw_section_data_list.append(current_section_data_item)
 
     # --- Stage 2: Determine Midpoint Reference Orientation ---
@@ -554,14 +601,14 @@ def analyze_centerline_sections(mesh_file,
 
     print("DEBUG: >>> Entering FINAL ASPECT RATIO AND ELLIPSE FITTING LOOP <<<")
     for idx, data_item in enumerate(raw_section_data_list):
+        print(f"Section {idx+1}: valid_geometry={data_item['valid_geometry']}, points_2d={None if data_item['points_2d'] is None else len(data_item['points_2d'])}")
         pca_ar, pca_w = None, None
+        ellipse_ar = None         # <-- Add this
+        ellipse_w = None          # <-- Add this
+        ellipse_plot_pts = None
         inlier_ratio_val = 0.0 # NEW: Initialize inlier ratio for the section
         current_points_2d = data_item['points_2d']
         relative_orientation_deg_val = None
-        
-        final_section_points_list.append(current_points_2d) 
-        final_section_points_3d_list.append(data_item.get('full_section_points_3d', None))
-        final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))
 
         if data_item['valid_geometry'] and current_points_2d is not None and len(current_points_2d) >= 3:
             # PCA-based metrics ...
@@ -634,6 +681,7 @@ def analyze_centerline_sections(mesh_file,
             if temp_ar_for_3d_filter is not None and pca_w is not None and np.isfinite(temp_ar_for_3d_filter) and np.isfinite(pca_w) and abs(temp_ar_for_3d_filter) <= 30.0 : 
                 section_data_3d.append({
                     'points_2d': current_points_2d, # Original points for 3D plot
+                    'points_3d': data_item['points_3d'],
                     'position': data_item['position_3d'],
                     'tangent': data_item['tangent_3d'],
                     'norm_pos': data_item['norm_pos'],
@@ -642,6 +690,9 @@ def analyze_centerline_sections(mesh_file,
                     'transform': data_item['transform'] 
                 })
         
+        final_section_points_list.append(current_points_2d) 
+        final_section_points_3d_list.append(data_item.get('full_section_points_3d', None))
+        final_transform_matrices_list.append(data_item.get('transform_2d_to_3d', None))
         final_pca_aspect_ratios.append(pca_ar)
         final_pca_widths.append(pca_w)
         final_ellipse_aspect_ratios.append(ellipse_ar)
@@ -649,235 +700,66 @@ def analyze_centerline_sections(mesh_file,
         final_ellipse_points_for_plot.append(ellipse_plot_pts)
         final_ellipse_inlier_ratios.append(inlier_ratio_val)
         final_ellipse_relative_orientations_deg.append(relative_orientation_deg_val) # NEW: Append relative orientation
-    
-    # Use ellipse data for the main 'aspect_ratios' and 'widths' going forward for plots
-    # Keep PCA versions if needed for other comparisons later, but plots will use ellipse.
-    aspect_ratios_for_plots = final_ellipse_aspect_ratios
-    widths_for_plots = final_ellipse_widths
-    #section_points_list = final_section_points_list 
 
     # Step 7: Create visualizations
     if visualize and output_dir:
         # Plot aspect ratio (ellipse) vs position
-        fig_ar, ax_ar = plt.subplots(figsize=(10, 6))
-        valid_ar_indices = [i for i, ar_val in enumerate(aspect_ratios_for_plots) if ar_val is not None]
-        valid_ar_positions = [final_normalized_positions[i] for i in valid_ar_indices]
-        valid_ar_ratios = [aspect_ratios_for_plots[i] for i in valid_ar_indices]
-        
-        if valid_ar_positions and valid_ar_ratios:
-            sorted_plot_indices = np.argsort(valid_ar_positions)
-            plot_positions_ar = np.array(valid_ar_positions)[sorted_plot_indices]
-            plot_ratios_ar = np.array(valid_ar_ratios)[sorted_plot_indices]
-            ax_ar.plot(plot_positions_ar, plot_ratios_ar, 'o-', linewidth=2)
-        
-        ax_ar.set_xlabel('Normalized Position Along Centerline')
-        ax_ar.set_ylabel('Aspect Ratio (Ellipse)') # UPDATED LABEL
-        ax_ar.set_title(f'Aspect Ratio (Ellipse) Along Centerline\n{base_name_for_outputs}') # UPDATED TITLE
-        ax_ar.grid(True)
-        aspect_plot_path = os.path.join(output_dir, f"{base_name_for_outputs}_aspect_ratio_ellipse_curve.png") # UPDATED FILENAME
-        plt.savefig(aspect_plot_path, dpi=150); plt.close(fig_ar)
-        
-        # Plot width (ellipse semi-minor) vs position
-        fig_w, ax_w = plt.subplots(figsize=(10, 6))
-        valid_w_indices = [i for i, w_val in enumerate(widths_for_plots) if w_val is not None]
-        valid_w_positions = [final_normalized_positions[i] for i in valid_w_indices]
-        valid_w_values = [widths_for_plots[i] for i in valid_w_indices]
-
-        if valid_w_positions and valid_w_values:
-            sorted_plot_indices_w = np.argsort(valid_w_positions)
-            plot_positions_w = np.array(valid_w_positions)[sorted_plot_indices_w]
-            plot_values_w = np.array(valid_w_values)[sorted_plot_indices_w]
-            ax_w.plot(plot_positions_w, plot_values_w, 'o-', color='green', linewidth=2)
-
-        ax_w.set_xlabel('Normalized Position Along Centerline')
-        ax_w.set_ylabel('Width (Ellipse Semi-Minor Axis)') # UPDATED LABEL
-        ax_w.set_title(f'Width (Ellipse) Along Centerline\n{base_name_for_outputs}') # UPDATED TITLE
-        ax_w.grid(True)
-        width_plot_path = os.path.join(output_dir, f"{base_name_for_outputs}_width_ellipse_curve.png") # UPDATED FILENAME
-        plt.savefig(width_plot_path, dpi=150); plt.close(fig_w)
-        
-        # Create section montage (will show original and fitted ellipse)
-        create_section_montage(
-            final_section_points_list,
-            final_ellipse_points_for_plot,
-            final_normalized_positions, 
-            final_ellipse_aspect_ratios,
-            os.path.join(output_dir, f"{base_name_for_outputs}_section_montage_with_ellipse.png"),
-            original_points_3d_list=final_section_points_3d_list,
-            pore_center_3d=pore_center,
-            transform_matrices_list=final_transform_matrices_list,
-            section_origins_3d_list=final_section_origins_3d_list,
-            section_normals_3d_list=final_section_normals_3d_list
+        plot_aspect_ratio_curve(
+            positions=final_normalized_positions,
+            aspect_ratios=final_ellipse_aspect_ratios,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir
         )
 
-        # NEW: Plot Inlier Ratio (ellipse) vs position
-        fig_ir, ax_ir = plt.subplots(figsize=(10, 6))
-        valid_ir_indices = [i for i, ir_val in enumerate(final_ellipse_inlier_ratios) if ir_val is not None] # Should always be a float
-        valid_ir_positions = [final_normalized_positions[i] for i in valid_ir_indices]
-        valid_ir_ratios = [final_ellipse_inlier_ratios[i] for i in valid_ir_indices]
-        
-        if valid_ir_positions and valid_ir_ratios:
-            sorted_plot_indices_ir = np.argsort(valid_ir_positions)
-            plot_positions_ir = np.array(valid_ir_positions)[sorted_plot_indices_ir]
-            plot_ratios_ir = np.array(valid_ir_ratios)[sorted_plot_indices_ir]
-            ax_ir.plot(plot_positions_ir, plot_ratios_ir, 'o-', color='purple', linewidth=2)
-        
-        ax_ir.set_xlabel('Normalized Position Along Centerline')
-        ax_ir.set_ylabel('Ellipse Inlier Ratio (RANSAC)')
-        ax_ir.set_title(f'Ellipse Fit Regularity (Inlier Ratio) Along Centerline\n{base_name_for_outputs}')
-        ax_ir.grid(True)
-        ax_ir.set_ylim(0, 1.05) # Inlier ratio is between 0 and 1
-        inlier_ratio_plot_path = os.path.join(output_dir, f"{base_name_for_outputs}_ellipse_inlier_ratio_curve.png")
-        plt.savefig(inlier_ratio_plot_path, dpi=150); plt.close(fig_ir)
-        print(f"  Created ellipse inlier ratio plot: {inlier_ratio_plot_path}")
+        plot_width_curve(
+            positions=final_normalized_positions,
+            widths=final_ellipse_widths,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir
+        )
 
-        # NEW: Plot Relative Orientation (ellipse major axis) vs position
-        fig_orient, ax_orient = plt.subplots(figsize=(10, 6))
-        valid_orient_indices = [i for i, orient_val in enumerate(final_ellipse_relative_orientations_deg) if orient_val is not None and np.isfinite(orient_val)]
-        valid_orient_positions = [final_normalized_positions[i] for i in valid_orient_indices]
-        valid_orient_values_deg = [final_ellipse_relative_orientations_deg[i] for i in valid_orient_indices]
-        
-        if valid_orient_positions and valid_orient_values_deg:
-            sorted_plot_indices_orient = np.argsort(valid_orient_positions)
-            plot_positions_orient = np.array(valid_orient_positions)[sorted_plot_indices_orient]
-            plot_values_orient_deg = np.array(valid_orient_values_deg)[sorted_plot_indices_orient]
-            ax_orient.plot(plot_positions_orient, plot_values_orient_deg, 'o-', color='cyan', linewidth=2)
-        
-        ax_orient.set_xlabel('Normalized Position Along Centerline')
-        ax_orient.set_ylabel('Relative Orientation of Major Axis (degrees)')
-        ax_orient.set_title(f'Ellipse Major Axis Orientation (Relative to Midpoint)\n{base_name_for_outputs}')
-        ax_orient.grid(True)
-        ax_orient.set_ylim(-95, 95) # Degrees, -90 to +90
-        orientation_plot_path = os.path.join(output_dir, f"{base_name_for_outputs}_ellipse_relative_orientation_curve.png")
-        plt.savefig(orientation_plot_path, dpi=150); plt.close(fig_orient)
-        print(f"  Created ellipse relative orientation plot: {orientation_plot_path}")
-        
-        # Matplotlib 3D plot (uses section_data_3d populated in Stage 3)
-        if section_data_3d: # Check if there's data to plot
-            fig_3d_mpl = plt.figure(figsize=(12, 10))
-            ax_3d_mpl = fig_3d_mpl.add_subplot(111, projection='3d')
-            
-            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-            mesh_triangles = mesh.vertices[mesh.faces]
-            mesh_collection = Poly3DCollection(mesh_triangles, alpha=0.3, edgecolor='gray', linewidth=0.05, facecolor='lightgray')
-            ax_3d_mpl.add_collection3d(mesh_collection)
-            ax_3d_mpl.plot(smoothed_centerline[:, 0], smoothed_centerline[:, 1], smoothed_centerline[:, 2], 'k-', linewidth=2, label='Centerline')
-            
-            cmap_mpl = matplotlib.colormaps['plasma']
-            for sd_item in section_data_3d:
-                points_2d_vis = sd_item['points_2d']
-                transform_vis = sd_item['transform']
-                norm_pos_vis = sd_item['norm_pos']
-                color_vis = cmap_mpl(norm_pos_vis)
-                
-                ordered_points_2d_vis = order_points(points_2d_vis, method="angular")
-                points_3d_vis_list = []
-                for pt_2d_vis in ordered_points_2d_vis:
-                    pt_2d_h_vis = np.array([pt_2d_vis[0], pt_2d_vis[1], 0.0, 1.0])
-                    pt_3d_h_vis = transform_vis.dot(pt_2d_h_vis)
-                    points_3d_vis_list.append(pt_3d_h_vis[:3])
-                
-                if not points_3d_vis_list: continue
-                points_3d_array_vis = np.array(points_3d_vis_list)
-                pts_closed_vis = np.vstack([points_3d_array_vis, points_3d_array_vis[0]])
-                ax_3d_mpl.plot(pts_closed_vis[:, 0], pts_closed_vis[:, 1], pts_closed_vis[:, 2], color=color_vis, linewidth=2, alpha=0.9)
-                
-                verts_vis = [list(zip(pts_closed_vis[:, 0], pts_closed_vis[:, 1], pts_closed_vis[:, 2]))]
-                poly_vis = Poly3DCollection(verts_vis, alpha=0.6, facecolor=color_vis)
-                ax_3d_mpl.add_collection3d(poly_vis)
-            
-            sampled_positions_plot = np.array([s['position'] for s in section_data_3d])
-            if len(sampled_positions_plot) > 0:
-                 ax_3d_mpl.scatter(sampled_positions_plot[:, 0], sampled_positions_plot[:, 1], sampled_positions_plot[:, 2], c='blue', marker='o', s=30, alpha=0.7, depthshade=False)
+        plot_inlier_ratio_curve(
+            positions=final_normalized_positions,
+            inlier_ratios=final_ellipse_inlier_ratios,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir
+        )
 
-            ax_3d_mpl.set_xlabel('X'); ax_3d_mpl.set_ylabel('Y'); ax_3d_mpl.set_zlabel('Z')
-            ax_3d_mpl.set_title(f'3D Cross-Sections - {base_name_for_outputs}')
-            ax_3d_mpl.view_init(elev=30, azim=45) # Adjust view for better visibility
-            # Auto-scale axes
-            max_val = np.max(mesh.bounds)
-            min_val = np.min(mesh.bounds)
-            ax_3d_mpl.auto_scale_xyz([min_val, max_val], [min_val, max_val], [min_val, max_val])
+        plot_orientation_curve(
+            positions=final_normalized_positions,
+            orientations_deg=final_ellipse_relative_orientations_deg,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir
+        )
 
+        create_section_montage(
+            section_points_list=final_section_points_list,
+            ellipse_points_for_plot_list=final_ellipse_points_for_plot,
+            positions=final_normalized_positions,
+            aspect_ratios_ellipse=final_ellipse_aspect_ratios,
+            output_path=os.path.join(output_dir, f"{base_name_for_outputs}_section_montage.png"),
+            original_points_3d_list=final_section_points_3d_list,
+            transform_matrices_list=final_transform_matrices_list,
+            pore_center_3d= pore_center
+        )
 
-            in_situ_path = os.path.join(output_dir, f"{base_name_for_outputs}_3d_sections.png")
-            plt.savefig(in_situ_path, dpi=200); plt.close(fig_3d_mpl)
-            print(f"  Created 3D cross-section visualization (Matplotlib): {in_situ_path}")
+        plot_sections_3d_matplotlib(
+            mesh=mesh,
+            smoothed_centerline=smoothed_centerline,
+            section_data_3d=section_data_3d,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir
+        )
 
-        # Plotly 3D HTML Plot (uses section_data_3d populated in Stage 3)
-            try:
-                import plotly.graph_objects as go
-                plotly_traces = []
-                plotly_traces.append(go.Mesh3d(
-                    x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
-                    i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
-                    opacity=0.3, color='lightgrey', name='Mesh' 
-                ))
-                plotly_traces.append(go.Scatter3d(
-                    x=smoothed_centerline[:, 0], y=smoothed_centerline[:, 1], z=smoothed_centerline[:, 2],
-                    mode='lines+markers', line=dict(color='black', width=6), marker=dict(size=3.5, color='black'),
-                    name='Centerline Segment'
-                ))
-
-                # Add seam points to the plot
-                if seam_points_for_plot is not None and len(seam_points_for_plot) > 0:
-                    plotly_traces.append(go.Scatter3d(
-                        x=seam_points_for_plot[:, 0], y=seam_points_for_plot[:, 1], z=seam_points_for_plot[:, 2],
-                        mode='markers',
-                        marker=dict(size=2, color='red', symbol='x'),
-                        name='Detected Seam'
-                    ))
-
-                cmap_plotly = matplotlib.colormaps['plasma']
-                section_annotations_plotly = []
-                for idx_plotly, sd_item_plotly in enumerate(section_data_3d):
-                    points_2d_plotly = sd_item_plotly['points_2d']
-                    transform_plotly = sd_item_plotly['transform']
-                    norm_pos_plotly = sd_item_plotly['norm_pos']
-                    section_pos_3d_plotly = sd_item_plotly['position']
-                    rgba_color_plotly = cmap_plotly(norm_pos_plotly) 
-                    plotly_color_str = f'rgba({int(rgba_color_plotly[0]*255)}, {int(rgba_color_plotly[1]*255)}, {int(rgba_color_plotly[2]*255)}, {rgba_color_plotly[3]})'
-
-                    ordered_points_2d_plotly = order_points(points_2d_plotly, method="angular")
-                    points_3d_list_plotly = []
-                    for pt_2d_pl in ordered_points_2d_plotly:
-                        pt_2d_h_pl = np.array([pt_2d_pl[0], pt_2d_pl[1], 0.0, 1.0])
-                        pt_3d_h_pl = transform_plotly.dot(pt_2d_h_pl)
-                        points_3d_list_plotly.append(pt_3d_h_pl[:3])
-                    
-                    if not points_3d_list_plotly: continue
-                    points_3d_array_plotly = np.array(points_3d_list_plotly)
-                    outline_3d_closed_plotly = np.vstack([points_3d_array_plotly, points_3d_array_plotly[0]])
-                    
-                    plotly_traces.append(go.Scatter3d(
-                        x=outline_3d_closed_plotly[:, 0], y=outline_3d_closed_plotly[:, 1], z=outline_3d_closed_plotly[:, 2],
-                        mode='lines', line=dict(color=plotly_color_str, width=4),
-                        name=f'Section {idx_plotly} (Pos: {norm_pos_plotly:.2f}, AR: {sd_item_plotly["aspect_ratio"]:.2f})'
-                    ))
-                    section_annotations_plotly.append(dict(
-                        showarrow=False, x=section_pos_3d_plotly[0], y=section_pos_3d_plotly[1], z=section_pos_3d_plotly[2],
-                        text=f"{norm_pos_plotly:.2f}", font=dict(color="white", size=10), bgcolor="rgba(0,0,0,0.5)"
-                    ))
-
-                sampled_positions_plotly_plot = np.array([s['position'] for s in section_data_3d])
-                if len(sampled_positions_plotly_plot) > 0:
-                    plotly_traces.append(go.Scatter3d(
-                        x=sampled_positions_plotly_plot[:, 0], y=sampled_positions_plotly_plot[:, 1], z=sampled_positions_plotly_plot[:, 2],
-                        mode='markers', marker=dict(size=5, color='blue', symbol='circle'), name='Sampled Positions'
-                    ))
-
-                fig_plotly = go.Figure(data=plotly_traces)
-                fig_plotly.update_layout(
-                    title=f'Interactive 3D Cross-Sections - {base_name_for_outputs}',
-                    scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data', 
-                               camera=dict(eye=dict(x=1.2, y=1.2, z=1.2)), annotations=section_annotations_plotly),
-                    margin=dict(l=0, r=0, b=0, t=40)
-                )
-                plotly_html_path = os.path.join(output_dir, f"{base_name_for_outputs}_3d_sections_interactive.html")
-                fig_plotly.write_html(plotly_html_path)
-                print(f"  Created interactive 3D cross-section visualization (HTML): {plotly_html_path}")
-            except ImportError: print("  Plotly is not installed. Skipping interactive 3D HTML plot.")
-            except Exception as e_plotly: print(f"  Error creating Plotly 3D HTML plot: {e_plotly}")
-    
+        plot_sections_3d_plotly(
+            mesh=mesh,
+            smoothed_centerline=smoothed_centerline,
+            section_data_3d=section_data_3d,
+            base_name=base_name_for_outputs,
+            output_dir=output_dir,
+            seam_points_for_plot=seam_points_for_plot
+        )
+ 
     return {
         'positions': final_normalized_positions,
         'pca_aspect_ratios': final_pca_aspect_ratios,    
@@ -891,243 +773,7 @@ def analyze_centerline_sections(mesh_file,
         'centerline': smoothed_centerline
     }
 
-def create_section_montage(section_points_list, ellipse_points_for_plot_list, 
-                           positions, aspect_ratios_ellipse, output_path,
-                           original_points_3d_list=None,
-                           pore_center_3d=None,
-                           transform_matrices_list=None,
-                           section_origins_3d_list=None,
-                           section_normals_3d_list=None):
-    """
-    Create a montage of cross-sections with their fitted ellipses.
-    Orients sections with their highest Z point at the top and consistent sidedness.
-    All sections are centered at (0,0) with symmetric axis limits.
-    
-    Parameters:
-    -----------
-    section_points_list : list of ndarrays
-        List of 2D points for each cross-section.
-    ellipse_points_for_plot_list : list of ndarrays
-        List of 2D points for the fitted ellipses.
-    positions : list of float
-        Normalized positions along the centerline.
-    aspect_ratios_ellipse : list of float
-        Aspect ratios of the fitted ellipses.
-    output_path : str
-        Path to save the montage.
-    original_points_3d_list : list of ndarrays, optional
-        List of 3D points corresponding to each 2D cross-section. Used for orientation.
-    pore_center_3d : ndarray, optional
-        3D coordinates of the pore center for secondary orientation.
-    """
-    valid_sections_info = []
-    
-    # Helper function to rotate 2D points
-    def rotate_points_2d(points_2d, angle):
-        """Rotate 2D points by the given angle in radians."""
-        if points_2d is None or len(points_2d) == 0:
-            return points_2d
-        
-        cos_angle = np.cos(angle)
-        sin_angle = np.sin(angle)
-        rotation_matrix = np.array([
-            [cos_angle, -sin_angle],
-            [sin_angle, cos_angle]
-        ])
-        
-        # Calculate centroid for rotation around center
-        centroid = np.mean(points_2d, axis=0)
-        # Center, rotate, then translate back
-        centered = points_2d - centroid
-        rotated = np.dot(centered, rotation_matrix.T)
-        return rotated + centroid
-    
-    # Process each section
-    for i, (orig_pts, ellipse_pts) in enumerate(zip(section_points_list, ellipse_points_for_plot_list)):
-        # Skip invalid sections
-        current_ar = aspect_ratios_ellipse[i]
-        if hasattr(current_ar, '__iter__') and len(current_ar) > 0:
-            current_ar = current_ar[0] if len(current_ar) > 0 else None
-        
-        if orig_pts is None or current_ar is None or not np.isfinite(current_ar) or abs(current_ar) > 30.0:
-            continue
-            
-        # Convert to numpy arrays if they aren't already
-        orig_pts = np.array(orig_pts)
-        ellipse_pts = np.array(ellipse_pts) if ellipse_pts is not None else None
-        
-        # Center points at (0,0) and orient if 3D points are available
-        orig_pts_processed = orig_pts.copy()
-        ellipse_pts_processed = ellipse_pts.copy() if ellipse_pts is not None else None
-        
-        # Center original points at (0,0)
-        if len(orig_pts_processed) > 0:
-            centroid_2d = np.mean(orig_pts_processed, axis=0)
-            orig_pts_processed = orig_pts_processed - centroid_2d
-            
-            # Also center ellipse points at the same centroid
-            if ellipse_pts_processed is not None and len(ellipse_pts_processed) > 0:
-                ellipse_pts_processed = ellipse_pts_processed - centroid_2d
-        
-        # Orient the section if 3D points are available
-        if original_points_3d_list is not None and i < len(original_points_3d_list) and original_points_3d_list[i] is not None:
-            orig_3d = original_points_3d_list[i]
-            
-            if len(orig_3d) == len(orig_pts):  # Ensure 1-to-1 correspondence
-                # --- Primary Orientation: Highest Z point up ---
-                # Find highest Z point
-                z_coords_3d = orig_3d[:, 2]
-                highest_z_idx = np.argmax(z_coords_3d)
-                
-                # Get point for rotation (already centered)
-                landmark_for_primary_rotation = orig_pts_processed[highest_z_idx]
-                
-                # Calculate rotation angle
-                current_angle_primary = np.arctan2(landmark_for_primary_rotation[1], landmark_for_primary_rotation[0])
-                target_angle_primary = np.pi/2  # 90 degrees = top (positive Y)
-                rotation_angle_primary = target_angle_primary - current_angle_primary
-                
-                # Create rotation matrix
-                cos_theta_p = np.cos(rotation_angle_primary)
-                sin_theta_p = np.sin(rotation_angle_primary)
-                primary_rotation_matrix = np.array([
-                    [cos_theta_p, -sin_theta_p],
-                    [sin_theta_p, cos_theta_p]
-                ])
-                
-                # Apply primary rotation (points are already centered)
-                orig_pts_processed = np.dot(orig_pts_processed, primary_rotation_matrix.T)
-                
-                # Also rotate ellipse points if present
-                if ellipse_pts_processed is not None:
-                    ellipse_pts_processed = np.dot(ellipse_pts_processed, primary_rotation_matrix.T)
-                
-                # --- Secondary Orientation: Check if we should flip horizontally ---
-                # After the primary rotation, we want to ensure consistent sidedness
-                if pore_center_3d is not None and transform_matrices_list is not None:
-                    transform_2d_to_3d_matrix = transform_matrices_list[i]
-                    if transform_2d_to_3d_matrix is not None:
-                        # Calculate vector from pore center to section centroid in 3D
-                        section_centroid_3d = np.mean(orig_3d, axis=0)
-                        radial_vector_3d = section_centroid_3d - pore_center_3d
-                        
-                        # Calculate the normal vector to the section plane
-                        # Use the last row of the rotation part of the transform (or calculate from points)
-                        normal_from_transform = transform_2d_to_3d_matrix[:3, 2]
-                        normal_magnitude = np.linalg.norm(normal_from_transform)
-                        
-                        if normal_magnitude > 1e-6:
-                            section_normal_3d = normal_from_transform / normal_magnitude
-                            
-                            # Project the radial vector onto the section plane
-                            radial_vector_on_plane_3d = radial_vector_3d - np.dot(radial_vector_3d, section_normal_3d) * section_normal_3d
-                            
-                            # Transform to 2D using the same transformation as the section points
-                            # Extract the rotation component (3x3 upper-left submatrix)
-                            rotation_3d_to_2d = np.linalg.inv(transform_2d_to_3d_matrix[:3, :3])
-                            
-                            # Apply to the radial vector (ignore translation since it's a direction)
-                            radial_vector_2d = np.dot(rotation_3d_to_2d, radial_vector_on_plane_3d)
-                            
-                            # Take just the X and Y components (the Z should be very close to zero)
-                            ref_vec_orig_2d = radial_vector_2d[:2]
-                            
-                            norm_ref_vec = np.linalg.norm(ref_vec_orig_2d)
-                            if norm_ref_vec > 1e-6:
-                                ref_vec_orig_2d /= norm_ref_vec
-                                
-                                # Apply the primary rotation to this 2D reference vector
-                                ref_vec_after_primary_rotation = primary_rotation_matrix @ ref_vec_orig_2d
-                                
-                                # If X component is negative after rotation, flip horizontally
-                                if ref_vec_after_primary_rotation[0] < -1e-5:  # Small tolerance for zero
-                                    orig_pts_processed[:, 0] *= -1  # Flip X-coordinates
-                                    if ellipse_pts_processed is not None:
-                                        ellipse_pts_processed[:, 0] *= -1  # Flip X-coordinates
-        
-        # Store processed points and section information
-        valid_sections_info.append({
-            'original_points_processed': orig_pts_processed,
-            'ellipse_points_processed': ellipse_pts_processed,
-            'position': positions[i],
-            'aspect_ratio': current_ar,
-            'original_index': i
-        })
-    
-    if not valid_sections_info:
-        print("  No valid sections with ellipse data to create montage")
-        return
-    
-    # --- Calculate global max extent for consistent axis limits ---
-    all_points_for_extent = []
-    for section_info in valid_sections_info:
-        if section_info['original_points_processed'] is not None:
-            all_points_for_extent.append(section_info['original_points_processed'])
-        if section_info['ellipse_points_processed'] is not None:
-            all_points_for_extent.append(section_info['ellipse_points_processed'])
-    
-    max_extent = 1.0  # Default if no points
-    if all_points_for_extent:
-        stacked_all = np.vstack(all_points_for_extent)
-        max_extent = np.max(np.abs(stacked_all)) * 1.1  # 10% padding
-    
-    # --- Create the plot ---
-    n_sections = len(valid_sections_info)
-    cols = min(5, n_sections)
-    rows = (n_sections + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*3.5, rows*3.5))
-    fig.suptitle("Cross-Sections (Oriented by Highest Z, Centered)", fontsize=16)
-    
-    if rows == 1 and cols == 1: axes = np.array([axes])
-    axes_flat = axes.flatten()
 
-    for i, section_info in enumerate(valid_sections_info):
-        if i >= len(axes_flat): break
-        ax = axes_flat[i]
-        
-        orig_pts = section_info['original_points_processed']
-        ellipse_pts = section_info['ellipse_points_processed']
-        
-        if orig_pts is not None and len(orig_pts) >= 3:
-            # Order points before plotting
-            ordered_orig_pts = order_points(orig_pts, method="angular")
-            
-            # Create closed polygon
-            closed_orig = np.vstack([ordered_orig_pts, ordered_orig_pts[0:1]])
-            ax.plot(closed_orig[:, 0], closed_orig[:, 1], 'b-', linewidth=1.5, label='Original Section')
-            ax.fill(ordered_orig_pts[:, 0], ordered_orig_pts[:, 1], alpha=0.2, color='blue')
-
-            if ellipse_pts is not None and len(ellipse_pts) > 0:
-                # Order ellipse points
-                ordered_ellipse_pts = order_points(ellipse_pts, method="angular")
-                closed_ellipse = np.vstack([ordered_ellipse_pts, ordered_ellipse_pts[0:1]])
-                ax.plot(closed_ellipse[:, 0], closed_ellipse[:, 1], 'r--', linewidth=1.2, label='Fitted Ellipse')
-            
-            ax.set_title(f"Pos: {section_info['position']:.2f}\nAR (Ell): {section_info['aspect_ratio']:.2f}", fontsize=10)
-        else:
-            ax.text(0.5, 0.5, "No valid data", ha='center', va='center', transform=ax.transAxes)
-        
-        # Set symmetric axis limits
-        ax.set_aspect('equal')
-        ax.set_xlim(-max_extent, max_extent)
-        ax.set_ylim(-max_extent, max_extent)
-        ax.grid(True, alpha=0.3)
-        
-        # Add coordinate axes for reference
-        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
-        ax.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
-        
-        if i == 0: ax.legend(fontsize='small', loc='upper right')
-    
-    # Turn off unused subplots
-    for i in range(n_sections, len(axes_flat)):
-        axes_flat[i].axis('off')
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(output_path, dpi=150)
-    plt.close(fig)
-    print(f"  Created section montage (oriented by highest Z, centered): {output_path}")
 
 # Example usage
 if __name__ == "__main__":
