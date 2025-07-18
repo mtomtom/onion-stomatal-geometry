@@ -1,104 +1,117 @@
-import numpy as np
-import pyvista as pv
-import trimesh
-from shapely.geometry import Polygon
-import argparse
-from trimesh.creation import sweep_polygon
+## To define an ellipse, we need its semi-majpr axis, a, and semi-minor axis, b. The standard parametric equation for an ellipse centred at (0,0) is:
 
-def create_stomatal_complex(
-    pore_area: float,
-    pore_length: float,
-    stomatal_height: float,
-    cross_aspect_ratio: float,
-    wall_thickness: float,
-    output_path: str = "stomatal_complex.ply",
+# x(t) = a * cos(t)
+# y(t) = b * sin(t)
+
+# Where t is the parameter that ranges from 0 to 2π.
+
+import numpy as np
+import matplotlib.pyplot as plt
+import trimesh
+import tidy3d
+
+def create_elliptical_torus(
+    major_radius_a, major_radius_b, 
+    minor_radius_a, minor_radius_b, 
+    major_segments, minor_segments
 ):
     """
-    Generates a single, fully‐watertight stomatal ring by sweeping
-    a hollow 2D cross-section around a closed elliptical path.
-    This method is robust as it avoids joining or boolean operations.
+    Creates a mesh where an elliptical cross-section travels along an elliptical path.
+
+    Args:
+        major_radius_a: Semi-axis of the major (path) ellipse along the x-axis.
+        major_radius_b: Semi-axis of the major (path) ellipse along the y-axis.
+        minor_radius_a: Semi-axis of the minor (cross-section) ellipse (width).
+        minor_radius_b: Semi-axis of the minor (cross-section) ellipse (height).
+        major_segments: Number of segments for the major elliptical path.
+        minor_segments: Number of segments for the minor elliptical cross-section.
     """
-    # --- 1. Define Cross-Section Geometry ---
-    # The cross-section is an ellipse defining the shape of the guard cell wall.
-    cs_semi_height = wall_thickness / cross_aspect_ratio  # Semi-major axis (a)
-    cs_semi_width = wall_thickness # Semi-minor axis (b)
+    vertices = []
+    faces = []
 
-    # --- 2. Define Pore and Centerline Geometry ---
-    # The centerline is the path the cross-section will be swept along.
-    pore_semi_length = pore_length / 2.0
-    pore_semi_width = pore_area / (np.pi * pore_semi_length) if pore_semi_length > 1e-9 else 0.0
-    
-    # The centerline is offset from the pore by the width of the cross-section itself.
-    centerline_semi_length = pore_semi_length + cs_semi_width
-    centerline_semi_width = pore_semi_width + cs_semi_width
+    # Create vertices
+    for i in range(major_segments):
+        theta = i * 2 * np.pi / major_segments
 
-    # --- 3. Build the Closed Elliptical Path ---
-    n_path_points = 128
-    theta = np.linspace(0, 2 * np.pi, n_path_points, endpoint=False) # Full 360 degrees
-    path = np.column_stack((
-        centerline_semi_length * np.cos(theta),
-        centerline_semi_width * np.sin(theta),
-        np.zeros_like(theta)
-    ))
-    # Close the loop for trimesh
-    path = np.vstack([path, path[0]])
+        # Position on the major (path) ellipse
+        path_x = major_radius_a * np.cos(theta)
+        path_y = major_radius_b * np.sin(theta)
+        
+        # Tangent vector to the major ellipse at this point (for orientation)
+        # The derivative of the path gives the tangent direction
+        tx = -major_radius_a * np.sin(theta)
+        ty =  major_radius_b * np.cos(theta)
+        tangent = np.array([tx, ty, 0])
+        tangent /= np.linalg.norm(tangent)
 
-    # --- 4. Define the Hollow Cross-Section Polygon ---
-    n_cs_points = 64
-    angles = np.linspace(0, 2 * np.pi, n_cs_points, endpoint=False)
-    
-    # Outer boundary of the cross-section
-    outer_verts = np.column_stack([cs_semi_width * np.cos(angles), cs_semi_height * np.sin(angles)])
-    
-    # Inner boundary is inset by the wall_thickness
-    # We must ensure the thickness doesn't exceed the cell's dimensions
-    inner_semi_width = max(0, cs_semi_width - wall_thickness)
-    inner_semi_height = max(0, cs_semi_height - wall_thickness)
-    inner_verts = np.column_stack([inner_semi_width * np.cos(angles), inner_semi_height * np.sin(angles)])
-    
-    # Create the shapely polygon with a hole (inner vertices must be reversed)
-    cross_section_poly = Polygon(outer_verts, holes=[inner_verts[::-1]])
+        # Normal and binormal vectors to define the plane of the cross-section
+        normal = np.array([-ty, tx, 0]) # Perpendicular to tangent in XY plane
+        normal /= np.linalg.norm(normal)
+        binormal = np.array([0, 0, 1]) # Perpendicular to the XY plane
 
-    # --- 5. Sweep the Polygon Around the Path ---
-    mesh = sweep_polygon(polygon=cross_section_poly, path=path)
-    mesh.fix_normals()
-    
-    if not mesh.is_watertight:
-        print("Warning: Generated mesh is not watertight.")
+        for j in range(minor_segments):
+            phi = j * 2 * np.pi / minor_segments
 
-    # --- 6. Export via PyVista ---
-    faces = np.hstack((np.full((len(mesh.faces), 1), 3), mesh.faces))
-    pv_mesh = pv.PolyData(mesh.vertices, faces)
-    pv_mesh.save(output_path)
-    print(f"Saved stomatal complex ring to {output_path}")
+            # Position on the minor (cross-section) ellipse
+            # These are local coordinates on the plane of the cross-section
+            local_x = minor_radius_a * np.cos(phi)
+            local_z = minor_radius_b * np.sin(phi)
 
-    return pv_mesh
+            # Combine the local coordinates with the orientation vectors
+            # to position the vertex in 3D space
+            vertex = np.array([path_x, path_y, 0]) + local_x * normal + local_z * binormal
+            vertices.append(vertex)
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(
-        description="Generate an idealized stomatal guard cell ring.")
-    p.add_argument("--pore-area", type=float, default=100.0, help="Target area of the stomatal pore.")
-    p.add_argument("--pore-length", type=float, default=20.0, help="Target length of the stomatal pore (major axis).")
-    p.add_argument("--stomatal-height", type=float, default=5.0, help="The total height of the stomata in the Z-axis.")
-    p.add_argument("--cross-ar", type=float, default=2.0, help="Aspect ratio of the guard cell cross-section (height/width).")
-    p.add_argument("--wall-thickness", type=float, default=2.5, help="Thickness of the guard cell wall.")
-    p.add_argument("--output", default="stomatal_complex.ply", help="Path to save the output .ply file.")
-    args = p.parse_args()
+    # Create faces (this logic remains the same)
+    for i in range(major_segments):
+        for j in range(minor_segments):
+            next_i = (i + 1) % major_segments
+            next_j = (j + 1) % minor_segments
 
-    # Use the hardcoded values from the file for demonstration
+            v1 = i * minor_segments + j
+            v2 = next_i * minor_segments + j
+            v3 = next_i * minor_segments + next_j
+            v4 = i * minor_segments + next_j
+
+            faces.append([v1, v2, v4])
+            faces.append([v2, v3, v4])
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
+
+# --- Example Usage ---
+if __name__ == '__main__':
+    # Create a torus with an elliptical path and a circular cross-section
+    # major_radius_a: radius of path ellipse along x-axis
+    # major_radius_b: radius of path ellipse along y-axis
+    # minor_radius_a: radius of cross-section ellipse along x-axis 
+    # minor_radius_b: radius of cross-section ellipse along y-axis 
+    # if minor_radius_a == minor_radius_b, it becomes a circular cross-section
+
+    ## Get the parameters for the elliptical torus from the confocal mesh
     pore_area = 40.4
     pore_length = 13.1
-    stomatal_height = 42.0 # Renamed from stomatal_length for clarity
-    wall_thickness = 17.2 # Renamed from cell_width for clarity
-    cross_aspect_ratio = 1.6
+    pore_width = 4.9
+    stomata_length = 42
+    stomata_width = 38
 
-    create_stomatal_complex(
-        pore_area=pore_area,
-        pore_length=pore_length,
-        stomatal_height=stomatal_height,
-        cross_aspect_ratio=cross_aspect_ratio,
-        wall_thickness=wall_thickness,
-        output_path=args.output
+    minor_radius_a = 8
+    minor_radius_b = 5
+    major_radius_a = (stomata_length - minor_radius_a) / 2
+    major_radius_b = (stomata_width - minor_radius_a) / 2
+
+    elliptical_torus_mesh = create_elliptical_torus(
+        major_radius_a=major_radius_a,  # Wider path
+        major_radius_b=major_radius_b,  # Narrower path
+        minor_radius_a=minor_radius_a, 
+        minor_radius_b=minor_radius_b, 
+        major_segments=100,
+        minor_segments=50
     )
+    ## Save the mesh to a PLY file
+    elliptical_torus_mesh.export('elliptical_torus.ply')
+
+
+
+
 
 
