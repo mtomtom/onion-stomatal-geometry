@@ -297,6 +297,26 @@ if __name__ == '__main__':
     ## Save the mesh to a PLY file
         elliptical_torus_mesh.export('Meshes/Idealised/idealised_' + this_mesh + '.ply')
 
+
+    ## Create our donut meshes
+    for i in range(len(mesh_name)):
+        this_mesh = mesh_name[i]
+        major_radius_a = (stomata_width[i] - 2 * minor_radius_a[i]) / 2
+        major_radius_b = (stomata_length[i] - 2 * minor_radius_a[i]) / 2
+
+        elliptical_torus_mesh = create_elliptical_torus(
+            major_radius_a=major_radius_a,  # Wider path
+            major_radius_b=major_radius_b,  # Narrower path
+            minor_radius_a=minor_radius_a[i], 
+            minor_radius_b=minor_radius_a[i], 
+            major_segments=100,
+            minor_segments=50
+        )
+    ## Save the mesh to a PLY file
+        elliptical_torus_mesh.export('Meshes/Idealised/idealised_' + this_mesh + '_equal.ply')
+
+
+
     # stomata_length = 39.4 # vertical dimension (y-axis)
     # stomata_width = 38.4 # horizontal dimension (x-axis)
     # major_radius_a = (stomata_width - 2 * minor_radius_a) / 2
