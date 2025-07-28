@@ -120,11 +120,20 @@ def create_elliptical_torus_bulged(
             interp_factor = norm_pos_from_tip / transition_point  # Changed from (1.0 - norm_pos...)
         else:
             interp_factor = 1.0  # Changed from 0.0
-            
+
+        interp_factor = 1.0
         # Corrected interpolation formula - applies mid_radius at midpoints and tip_radius at tips
         current_minor_radius_a = mid_radius_a * (1 - interp_factor) + tip_radius_a * interp_factor
         current_minor_radius_b = mid_radius_b * (1 - interp_factor) + tip_radius_b * interp_factor
 
+        shrink_start = 0.9  # Start shrinking at 95% of the way to the tip
+        # if norm_pos_from_tip >= shrink_start:
+        #     # Quadratic shrink: increases faster near the tip
+        #     t = (norm_pos_from_tip - shrink_start) / (1.0 - shrink_start)
+        #     shrink_factor = 1.0 - 0.2 * (t ** 5)
+        #     current_minor_radius_a *= shrink_factor
+        #     current_minor_radius_b *= shrink_factor
+            
         # Tangent vector to the major ellipse at this point (for orientation)
         tx = -major_radius_a * np.sin(theta)
         ty =  major_radius_b * np.cos(theta)
@@ -139,11 +148,23 @@ def create_elliptical_torus_bulged(
         for j in range(minor_segments):
             phi = j * 2 * np.pi / minor_segments
 
-            # Cross-section ellipse local coordinates
             local_x = current_minor_radius_a * np.cos(phi)
             local_z = current_minor_radius_b * np.sin(phi)
 
-            # Combine local coordinates with orientation vectors to get vertex position
+            # Only apply shrink near the tip
+            if norm_pos_from_tip >= shrink_start:
+                t = (norm_pos_from_tip - shrink_start) / (1.0 - shrink_start)
+                full_shrink = 1.0 - 0.2 * (t ** 5)
+
+                # Normalize local_x: -max_a (outside) to +max_a (inside)
+                # So: 0 (outside) ... 1 (inside)
+                x_norm = (local_x + current_minor_radius_a) / (2 * current_minor_radius_a)
+                # Blend shrink: full_shrink at outside, 1 at inside
+                blend_shrink = full_shrink * (1 - x_norm) + 1.0 * x_norm
+
+                local_x *= blend_shrink
+                local_z *= blend_shrink  # If you want to keep aspect ratio
+
             vertex = np.array([path_x, path_y, 0]) + local_x * normal + local_z * binormal
             vertices.append(vertex)
 
@@ -258,6 +279,22 @@ def plot_radius_distribution(side_radius_a, tip_radius_a, side_radius_b=None, ti
     plt.legend()
     plt.savefig('radius_distribution.png')
     plt.show()
+
+    # After plotting radius_a_values
+    shrink_start = 0.95
+    theta_values = np.linspace(0, 2*np.pi, 100)
+    norm_pos_from_tip = np.abs(np.sin(theta_values))  # For a circle; for ellipse use path_y/major_radius_b
+
+    plt.plot(np.degrees(theta_values), norm_pos_from_tip, 'k--', alpha=0.3, label='norm_pos_from_tip')
+
+    # Mark where shrink starts
+    shrink_angles = np.degrees(theta_values[norm_pos_from_tip >= shrink_start])
+    if len(shrink_angles) > 0:
+        plt.axvline(x=shrink_angles[0], color='purple', linestyle='-.', label='Shrink start')
+        plt.axvline(x=shrink_angles[-1], color='purple', linestyle='-.')
+
+    plt.legend()
+    plt.show()
     
     return radius_a_values
 
@@ -315,29 +352,33 @@ if __name__ == '__main__':
     ## Save the mesh to a PLY file
         elliptical_torus_mesh.export('Meshes/Idealised/idealised_' + this_mesh + '_equal.ply')
 
+    ## Let's create some bulged versions of the meshes
 
+    mesh_name =["1_2","1_3","1_4","1_5","1_6","1_8","2_1", "2_3", "2_6a", "2_6b", "2_7","3_1","3_2", "3_3", "3_4","3_6", "3_7"]
+    tip_radius_a = [8, 8, 7.5, 9, 7.9, 7.4, 6.7, 7.2, 8, 7.8, 7, 7.5, 8.4, 8.5, 8.1, 8.5, 7.9]
+    tip_radius_b = [8, 5, 5.5, 6, 5.5, 5.8, 5.0, 4, 5, 6, 5.3, 5.5, 6, 6, 7, 6.5, 5.9]
+    stomata_length = [43, 40,40.5, 48.2, 45.2, 40.3, 37, 39.6, 37.5, 36, 40, 42.1, 41.6, 40.6, 40.5, 45.5, 41] # vertical dimension (y-axis)
+    stomata_width = [37, 39, 35.4, 41.5, 37, 37.6, 36.0, 37.6, 37.0, 35, 33.5, 32.9, 37.2, 35.8, 36.3, 38.5, 35] # horizontal dimension (x-axis)
+    confocal_pore_area = [40.9,44.7,43.0, 49.6, 53.9, 65.7, 73.8, 74.2, 21.7, 14.2, 49.2, 22, 20.9, 7.3, 23.5, 37.3, 22.3]
 
-    # stomata_length = 39.4 # vertical dimension (y-axis)
-    # stomata_width = 38.4 # horizontal dimension (x-axis)
-    # major_radius_a = (stomata_width - 2 * minor_radius_a) / 2
-    # major_radius_b = (stomata_length - 2 * minor_radius_a) / 2
+    mesh_num = 1
+    for i in range(0, mesh_num):
+        this_mesh = mesh_name[i]
+        major_radius_a = (stomata_width[i] - 2 * minor_radius_a[i]) / 2
+        major_radius_b = (stomata_length[i] - 2 * minor_radius_a[i]) / 2
 
-    # mid_radius_a = minor_radius_a
-    # mid_radius_b = minor_radius_b
-    # tip_radius_a = 7.5
-    # tip_radius_b = 7.5
-
-    # elliptical_torus_mesh = create_elliptical_torus_bulged(
-    # major_radius_a, major_radius_b, 
-    # mid_radius_a, mid_radius_b,
-    # tip_radius_a, tip_radius_b, 
-    # major_segments=100,
-    # minor_segments=50
-# )
-    
-#      ## Save the mesh to a PLY file
-#     elliptical_torus_mesh.export('elliptical_torus_bulged.ply')
-
+        elliptical_torus_mesh = create_elliptical_torus_bulged(
+            major_radius_a=major_radius_a,  # Wider path
+            major_radius_b=major_radius_b,  # Narrower path
+            mid_radius_a=minor_radius_a[i], 
+            mid_radius_b=minor_radius_b[i], 
+            tip_radius_a=tip_radius_a[i],
+            tip_radius_b=tip_radius_b[i],
+            major_segments=100,
+            minor_segments=50
+        )
+    ## Save the mesh to a PLY file
+        elliptical_torus_mesh.export('Meshes/Idealised/idealised_bulged' + this_mesh + '.ply')
 
 
 
