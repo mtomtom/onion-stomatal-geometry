@@ -501,7 +501,7 @@ def extract_cross_section_data(file, path, side="single_a", n_sections=20):
         'file_info': {
             'file_name': file,
             'side': side,
-            'mesh_path': f"{path}{file}/{file}_{side}.obj"
+            'mesh_path': f"{path}/{file}_{side}.obj"
         },
         'mesh_data': {},
         'cross_sections': {
@@ -696,3 +696,157 @@ def get_cross_section_points(mesh, centreline, indices):
                 sections_points_list.append(section.vertices)
                 
     return sections_points_list
+
+def visualize_mesh_with_cross_sections(file, path, side="single_a", n_sections=20, colormap='viridis'):
+    """
+    Create a 3D visualization of a single mesh with all cross-sections.
+    
+    Parameters:
+    -----------
+    file_index : int
+        Index of the file to visualize from the files list
+    side : str
+        Side to analyze ("single_a" or "single_b")
+    n_sections : int
+        Number of cross-sections to generate along the centreline
+    colormap : str
+        Matplotlib colormap name for coloring the cross-sections
+    
+    Returns:
+    --------
+    fig : plotly.graph_objects.Figure
+        The 3D figure object that can be further customized if needed
+    """
+    import plotly.graph_objects as go
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    
+    # Load and process mesh
+    mesh_path = f"{path}/{file}_{side}.obj"
+    mesh = trimesh.load(mesh_path, process=True)
+    
+    # Align the mesh to the Y-axis and center it
+    mesh = align_mesh_to_y_axis(mesh)
+    
+    # Ensure consistent orientation
+    outer_points_check = find_outer_edge(mesh, smoothing=50)
+    if np.mean(outer_points_check[:, 0]) < 0:
+        mesh.vertices[:, 0] *= -1
+    
+    # Process mesh to find centreline
+    outer_points = find_outer_edge(mesh, smoothing=50)
+    outer_curve_projected = create_projected_curve(
+        mesh, outer_points, smooth=50, n_points=120, end_segment_size=10
+    )
+
+    # Get midpoint cross-section
+    midpoint_trace, section_trace, section_points = get_midpoint_trace(outer_points, mesh)
+
+    # Get the circle centers
+    _, _, _, _, _, center_start, center_end = define_end_point_circles(outer_curve_projected, section_points)
+
+    # Create the centreline using the actual circle centers
+    section_midpoint = np.mean(section_points, axis=0)
+    centreline, centreline_trace = create_bezier_centreline(
+        center_start, section_midpoint, center_end, curve_points=50
+    )
+
+    # Define cross-section indices
+    end_margin_points = 3  # Avoid unstable sections at the very ends
+    start_index = end_margin_points
+    end_index = len(centreline) - 1 - end_margin_points
+    indices = np.linspace(start_index, end_index, n_sections, dtype=int)
+    
+    # Get all cross-sections
+    all_section_points = get_cross_section_points(mesh, centreline, indices)
+    
+    # Calculate tangents along the centreline
+    tangents = np.gradient(centreline, axis=0)
+    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
+    
+    # Create a colormap for cross-sections based on position
+    color_scale = plt.cm.get_cmap(colormap)(np.linspace(0, 1, len(all_section_points)))
+    
+    # Create visualization traces
+    traces = []
+    
+    # Add the mesh with transparency
+    traces.append(go.Mesh3d(
+        x=mesh.vertices[:, 0], y=mesh.vertices[:, 1], z=mesh.vertices[:, 2],
+        i=mesh.faces[:, 0], j=mesh.faces[:, 1], k=mesh.faces[:, 2],
+        color='lightgray', opacity=0.5, name='Mesh'
+    ))
+    
+    # Add the centreline
+    traces.append(go.Scatter3d(
+        x=centreline[:, 0], y=centreline[:, 1], z=centreline[:, 2],
+        mode='lines', line=dict(color='black', width=3), name='Centreline'
+    ))
+    
+    # Process each cross-section
+    for i, section_points in enumerate(all_section_points):
+        if section_points is None or len(section_points) < 3:
+            continue
+            
+        idx = indices[i]
+        section_centroid = np.mean(section_points, axis=0)
+        
+        # Get RGB color for this cross-section
+        color_rgb = color_scale[i][:3]  # Extract RGB (ignore alpha)
+        color = f'rgb({int(color_rgb[0]*255)},{int(color_rgb[1]*255)},{int(color_rgb[2]*255)})'
+        
+        # Sort points for a clean polygon (circular order around centroid)
+        tangent = tangents[idx]
+        points_2d = section_points - section_centroid
+        
+        # Project onto plane perpendicular to tangent
+        ref = np.array([0, 0, 1]) if not np.allclose(tangent, [0, 0, 1]) else np.array([1, 0, 0])
+        v1 = np.cross(tangent, ref)
+        v1 = v1 / np.linalg.norm(v1)
+        v2 = np.cross(tangent, v1)
+        v2 = v2 / np.linalg.norm(v2)
+        
+        x_2d = points_2d @ v1
+        y_2d = points_2d @ v2
+        
+        # Sort by polar angle
+        angles = np.arctan2(y_2d, x_2d)
+        sorted_indices = np.argsort(angles)
+        
+        # Get sorted 3D points
+        sorted_points = section_points[sorted_indices]
+        
+        # Close the loop by adding the first point at the end
+        closed_points = np.vstack([sorted_points, sorted_points[0]])
+        
+        # Add the cross-section as a line trace
+        traces.append(go.Scatter3d(
+            x=closed_points[:, 0], y=closed_points[:, 1], z=closed_points[:, 2],
+            mode='lines', line=dict(color=color, width=5),
+            name=f'Section {i+1}'
+        ))
+    
+    # Create the figure
+    fig = go.Figure(data=traces)
+    
+    # Update layout
+    fig.update_layout(
+        title=f"Cross-Sections for {file}_{side}",
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z',
+            aspectmode='data',
+            camera=dict(
+                eye=dict(x=1.5, y=0, z=0.5)  # Adjust for better viewing angle
+            )
+        )
+    )
+    
+    # Save the visualization as an HTML file for interactive viewing
+    output_filename = f"{file}_{side}_cross_sections_3d.html"
+    fig.write_html(output_filename, include_plotlyjs='cdn')
+    print(f"Saved 3D visualization to {output_filename}")
+    
+    return fig
