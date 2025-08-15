@@ -7,6 +7,78 @@ from scipy.spatial import ConvexHull
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
+def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list2, n_cols=5, figsize=(15, 10), filename=None, colors=('k-', 'r-')):
+    """
+    Plot each pair of cross sections (Nx3 arrays) in a grid of 2D subplots, overlaid.
+    Projects both sections to the best-fit 2D plane of the first section using PCA.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+
+    n_sections = min(len(sections_points_list1), len(sections_points_list2))
+    n_rows = int(np.ceil(n_sections / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten()
+
+    for i in range(n_sections):
+        section1 = sections_points_list1[i]
+        section2 = sections_points_list2[i]
+        ax = axes[i]
+
+        if (section1 is None or len(section1) < 3) and (section2 is None or len(section2) < 3):
+            ax.set_axis_off()
+            continue
+
+        # Project both sections using PCA from section1 (if available), else section2
+        if section1 is not None and len(section1) >= 3:
+            section1 = np.asarray(section1)
+            pca = PCA(n_components=2)
+            section1_2d = pca.fit_transform(section1)
+            # Sort section1 points by angle around centroid
+            centroid1 = section1_2d.mean(axis=0)
+            rel1 = section1_2d - centroid1
+            angles1 = np.arctan2(rel1[:, 1], rel1[:, 0])
+            sort_idx1 = np.argsort(angles1)
+            section1_2d_sorted = section1_2d[sort_idx1]
+            section1_2d_sorted = np.vstack([section1_2d_sorted, section1_2d_sorted[0]])
+            ax.plot(section1_2d_sorted[:, 0], section1_2d_sorted[:, 1], colors[0], label='Mesh 1')
+            if section2 is not None and len(section2) >= 3:
+                section2 = np.asarray(section2)
+                section2_2d = pca.transform(section2)
+                centroid2 = section2_2d.mean(axis=0)
+                rel2 = section2_2d - centroid2
+                angles2 = np.arctan2(rel2[:, 1], rel2[:, 0])
+                sort_idx2 = np.argsort(angles2)
+                section2_2d_sorted = section2_2d[sort_idx2]
+                section2_2d_sorted = np.vstack([section2_2d_sorted, section2_2d_sorted[0]])
+                ax.plot(section2_2d_sorted[:, 0], section2_2d_sorted[:, 1], colors[1], label='Mesh 2')
+        elif section2 is not None and len(section2) >= 3:
+            section2 = np.asarray(section2)
+            pca = PCA(n_components=2)
+            section2_2d = pca.fit_transform(section2)
+            centroid2 = section2_2d.mean(axis=0)
+            rel2 = section2_2d - centroid2
+            angles2 = np.arctan2(rel2[:, 1], rel2[:, 0])
+            sort_idx2 = np.argsort(angles2)
+            section2_2d_sorted = section2_2d[sort_idx2]
+            section2_2d_sorted = np.vstack([section2_2d_sorted, section2_2d_sorted[0]])
+            ax.plot(section2_2d_sorted[:, 0], section2_2d_sorted[:, 1], colors[1], label='Mesh 2')
+
+        ax.set_title(f'Section {i+1}')
+        ax.axis('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # Hide any unused subplots
+    for j in range(n_sections, len(axes)):
+        axes[j].set_axis_off()
+
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename)
+    plt.show()
+
 def plot_cross_sections_grid(sections_points_list, n_cols=5, figsize=(15, 10), filename=None):
     """
     Plot each cross section (Nx3 array) in a grid of 2D subplots.
@@ -25,7 +97,15 @@ def plot_cross_sections_grid(sections_points_list, n_cols=5, figsize=(15, 10), f
         # Project to 2D using PCA
         pca = PCA(n_components=2)
         section_2d = pca.fit_transform(section)
-        axes[i].plot(section_2d[:, 0], section_2d[:, 1], 'k-')
+        # Sort points by angle around centroid for consistent ordering
+        centroid = section_2d.mean(axis=0)
+        rel = section_2d - centroid
+        angles = np.arctan2(rel[:, 1], rel[:, 0])
+        sort_idx = np.argsort(angles)
+        section_2d_sorted = section_2d[sort_idx]
+        # Close the loop for plotting
+        section_2d_sorted = np.vstack([section_2d_sorted, section_2d_sorted[0]])
+        axes[i].plot(section_2d_sorted[:, 0], section_2d_sorted[:, 1], 'k-')
         axes[i].set_title(f'Section {i+1}')
         axes[i].axis('equal')
         axes[i].set_xticks([])
@@ -63,6 +143,22 @@ def create_outer_curve_trace(outer_curve):
         name='Projected Outer Curve'
     )
     return outer_curve_trace
+
+## Create mesh trace
+def create_mesh_trace(mesh):
+
+    mesh_trace = go.Mesh3d(
+        x=mesh.vertices[:, 0],
+        y=mesh.vertices[:, 1],
+        z=mesh.vertices[:, 2],
+        i=mesh.faces[:, 0],
+        j=mesh.faces[:, 1],
+        k=mesh.faces[:, 2],
+        color='lightgray',
+        opacity=0.75,
+        name='Mesh'
+    )
+    return mesh_trace
 
 ## Define function to visualize the mesh
 
@@ -664,16 +760,23 @@ def align_mesh_to_y_axis(mesh):
     y_axis = np.array([0, 1, 0])
 
     # 2. Find the 4x4 transformation matrix that aligns the longest axis with the Y-axis
-    transform_matrix = trimesh.geometry.align_vectors(longest_axis, y_axis)
+    rotation_matrix = trimesh.geometry.align_vectors(longest_axis, y_axis)
 
     # 3. Apply the transformation to a copy of the mesh to avoid modifying the original
     aligned_mesh = mesh.copy()
-    aligned_mesh.apply_transform(transform_matrix)
-    
-    # 4. Center the aligned mesh at the origin for consistency
-    aligned_mesh.vertices -= aligned_mesh.centroid
+    aligned_mesh.apply_transform(rotation_matrix)
 
-    return aligned_mesh, transform_matrix
+    # 4. Compute translation to center at origin
+    centroid = aligned_mesh.centroid
+    translation_matrix = np.eye(4)
+    translation_matrix[:3, 3] = -centroid
+
+    # 5. Apply translation
+    aligned_mesh.apply_transform(translation_matrix)
+    # 6. Combine rotation and translation into one matrix
+    full_transform = translation_matrix @ rotation_matrix
+
+    return aligned_mesh, full_transform
 
 ## Also obsolete - uses the wrong cross section code. However, we may need to use the code here to fit the ellipses, and extract the aspect ratios.
 # def extract_cross_section_data(file, path, side="single_a", n_sections=20):
@@ -898,7 +1001,7 @@ def get_cross_section_points(mesh, centreline, indices):
 
     return sections_points_list
 
-def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, section_points=None, centreline = None, n_sections=20, colormap='viridis'):
+def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centreline = None, n_sections=20, colormap='viridis'):
     """
     Create a 3D visualization of a single mesh with all cross-sections.
     
