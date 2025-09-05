@@ -1,3 +1,106 @@
+def calculate_cross_section_aspect_ratios(sections_points_list):
+    """Compute aspect ratio (major/minor) for each cross section.
+
+    Parameters
+    ----------
+    sections_points_list : list[array_like] or ndarray
+        Either a list where each element is an (N_i, 3) array of points for a
+        cross section, OR a single (N, 3) array (treated as one section).
+
+    Returns
+    -------
+    list[float]
+        Aspect ratio per cross section. 0.0 for invalid/degenerate sections.
+
+    Notes
+    -----
+    1. A PCA is fit per section to obtain a local 2D plane.
+    2. The *major* axis for each section is chosen as the PCA axis most
+       aligned (by absolute dot) to the midpoint section's first PCA axis.
+    3. The *minor* axis is enforced as the perpendicular in the 2D plane.
+    4. Width/height are taken as peak-to-peak extents along major/minor.
+    """
+    from sklearn.decomposition import PCA
+    import numpy as np
+
+    # Normalize input: allow a single (N,3) array
+    if isinstance(sections_points_list, np.ndarray):
+        if sections_points_list.ndim == 2 and sections_points_list.shape[1] == 3:
+            sections_points_list = [sections_points_list]
+        else:
+            raise ValueError("If passing a numpy array it must be shape (N,3).")
+
+    if not sections_points_list:
+        return []
+
+    # Ensure all valid sections have >=3 pts; collect indices of valid sections
+    valid_indices = [i for i, s in enumerate(sections_points_list) if s is not None and len(s) >= 3]
+    if not valid_indices:
+        return [0.0] * len(sections_points_list)
+
+    # Midpoint index chosen among the *list* (not only valid subset) for stability
+    mid_idx = len(sections_points_list) // 2
+    if sections_points_list[mid_idx] is None or len(sections_points_list[mid_idx]) < 3:
+        # Fallback: pick the central valid index
+        mid_idx = valid_indices[len(valid_indices)//2]
+
+    mid_points = np.asarray(sections_points_list[mid_idx])
+    pca_mid = PCA(n_components=2)
+    pca_mid.fit(mid_points)
+    major_axis_ref = pca_mid.components_[0]
+
+    aspect_ratios = []
+    for section in sections_points_list:
+        if section is None or len(section) < 3:
+            aspect_ratios.append(0.0)
+            continue
+        pts = np.asarray(section)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            aspect_ratios.append(0.0)
+            continue
+        # Fit PCA (2D) on the 3D points
+        pca = PCA(n_components=2)
+        section_2d = pca.fit_transform(pts)  # shape (N,2) in PCA basis
+        comps = pca.components_              # shape (2,3) in 3D
+        # Decide which PCA component is the major axis (aligned with reference)
+        dot0 = abs(np.dot(comps[0], major_axis_ref))
+        dot1 = abs(np.dot(comps[1], major_axis_ref))
+        if dot0 >= dot1:
+            width_vals = section_2d[:, 0]
+            height_vals = section_2d[:, 1]
+        else:
+            # swap if second component is closer to reference
+            width_vals = section_2d[:, 1]
+            height_vals = section_2d[:, 0]
+        width = width_vals.max() - width_vals.min()
+        height = height_vals.max() - height_vals.min()
+        if width <= 1e-12 or height <= 1e-12:
+            aspect_ratios.append(0.0)
+        else:
+            aspect_ratios.append(width / height)
+    return aspect_ratios
+def calculate_cross_section_areas(sections_points_list):
+    """
+    Calculate the area of each cross section in a list.
+    Each cross section should be an (N, 3) array-like of points.
+    Returns a list of areas (float), one per cross section. If a section has <3 points, area is 0.
+    """
+    from sklearn.decomposition import PCA
+    from scipy.spatial import ConvexHull
+    areas = []
+    for points in sections_points_list:
+        if points is None or len(points) < 3:
+            areas.append(0.0)
+            continue
+        pca = PCA(n_components=2)
+        pts2 = pca.fit_transform(np.asarray(points))
+        try:
+            hull = ConvexHull(pts2)
+            area = hull.volume  # 2D 'volume' is area
+        except Exception:
+            area = 0.0
+        areas.append(area)
+    return areas
 ## Helper functions for the cross section analysis
 
 import trimesh
@@ -68,85 +171,6 @@ def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list
         ax.set_title(f'Section {i+1}')
         ax.axis('equal')
         ax.set_xticks([])
-        ax.set_yticks([])
-
-    # Hide any unused subplots
-    for j in range(n_sections, len(axes)):
-        axes[j].set_axis_off()
-
-    plt.tight_layout()
-    if filename:
-        plt.savefig(filename)
-    plt.show()
-
-def plot_cross_sections_grid(sections_points_list, n_cols=5, figsize=(15, 10), filename=None):
-    """
-    Plot each cross section (Nx3 array) in a grid of 2D subplots.
-    Projects each section to its best-fit 2D plane using PCA.
-    """
-    n_sections = len(sections_points_list)
-    n_rows = int(np.ceil(n_sections / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-    axes = axes.flatten()
-
-    for i, section in enumerate(sections_points_list):
-        if section is None or len(section) < 3:
-            axes[i].set_axis_off()
-            continue
-        section = np.asarray(section)
-        # Project to 2D using PCA
-        pca = PCA(n_components=2)
-        section_2d = pca.fit_transform(section)
-        # Sort points by angle around centroid for consistent ordering
-        centroid = section_2d.mean(axis=0)
-        rel = section_2d - centroid
-        angles = np.arctan2(rel[:, 1], rel[:, 0])
-        sort_idx = np.argsort(angles)
-        section_2d_sorted = section_2d[sort_idx]
-        # Close the loop for plotting
-        section_2d_sorted = np.vstack([section_2d_sorted, section_2d_sorted[0]])
-        axes[i].plot(section_2d_sorted[:, 0], section_2d_sorted[:, 1], 'k-')
-        axes[i].set_title(f'Section {i+1}')
-        axes[i].axis('equal')
-        axes[i].set_xticks([])
-        axes[i].set_yticks([])
-
-    # Hide any unused subplots
-    for j in range(i+1, len(axes)):
-        axes[j].set_axis_off()
-
-    plt.tight_layout()
-    plt.savefig(filename) if filename else plt.show()
-    plt.show()
-
-def create_centreline_trace(centreline):
-
-    centreline_trace = go.Scatter3d(
-        x=centreline[:, 0],
-        y=centreline[:, 1],
-        z=centreline[:, 2],
-        mode='lines+markers',
-        marker=dict(size=4),
-        line=dict(width=3),
-        name='Bezier Centreline'
-    )
-    return centreline_trace
-
-def create_outer_curve_trace(outer_curve):
-
-    outer_curve_trace = go.Scatter3d(
-        x=outer_curve[:, 0],
-        y=outer_curve[:, 1],
-        z=outer_curve[:, 2],
-        mode='lines',
-        line=dict(width=2, color='blue'),
-        name='Projected Outer Curve'
-    )
-    return outer_curve_trace
-
-## Create mesh trace
-def create_mesh_trace(mesh):
-
     mesh_trace = go.Mesh3d(
         x=mesh.vertices[:, 0],
         y=mesh.vertices[:, 1],
@@ -1001,7 +1025,7 @@ def get_cross_section_points(mesh, centreline, indices):
 
     return sections_points_list
 
-def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centreline = None, n_sections=20, colormap='viridis'):
+def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centreline = None, end_margin_points = 3, n_sections=20, colormap='viridis'):
     """
     Create a 3D visualization of a single mesh with all cross-sections.
     
@@ -1057,7 +1081,7 @@ def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centrelin
     #)
 
     # Define cross-section indices
-    end_margin_points = 3  # Avoid unstable sections at the very ends
+    end_margin_points = end_margin_points  # Avoid unstable sections at the very ends
     start_index = end_margin_points
     end_index = len(centreline) - 1 - end_margin_points
     indices = np.linspace(start_index, end_index, n_sections, dtype=int)
