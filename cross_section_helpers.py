@@ -1,3 +1,136 @@
+from sklearn.cluster import KMeans
+from scipy.spatial import ConvexHull
+from sklearn.decomposition import PCA
+from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
+
+def analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=False):
+    ## Load in the mesh
+    mesh = trimesh.load(mesh_path)
+
+    ## Get the wall vertices
+    wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=0.2)
+
+    centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace = get_top_bottom_wall_centres(mesh, wall_vertices)
+
+    midpoint, traces, section_points, local_axes = get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom)
+
+    ## Label the left and right cross sections
+    left_section, right_section, left_section_centre, right_section_centre, left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace = get_left_right_midsections(section_points, midpoint, local_axes)
+
+    ## The radius of the circles to place at the top and bottom walls is taken from the radius of the midsections
+    area1 = cross_section_area_2d(left_section)
+    area2 = cross_section_area_2d(right_section)
+
+    avg_area = 0.5 * (area1 + area2)
+
+    ## Calculate the area of the circles at either end, based on the midsection areas
+    radius = np.sqrt(max(avg_area, 0.0) / np.pi)
+
+    ## Create the circles
+    circle_top = make_circle(top_wall_coords, radius=radius)
+    circle_bottom = make_circle(bottom_wall_coords, radius=radius)
+
+    circle_top_trace = get_circle_trace(circle_top, colour = 'red', name = 'Top Circle')
+    circle_bottom_trace = get_circle_trace(circle_bottom, colour = 'blue', name = 'Bottom Circle')
+
+    spline_trace, spline_x, spline_y, spline_z = get_centreline_estimate(centre_top, centre_bottom, left_section_centre, right_section_centre)
+
+    ## Visualise the first step
+    if visualize:
+        output = visualize_mesh(mesh,[top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace, *traces, left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace, circle_top_trace, circle_bottom_trace, spline_trace])
+
+    ## To simplify analysis, we will split the mesh into left and right guard cells
+    left, right = split_mesh_at_wall_vertices(mesh, wall_vertices, left_section_centre, right_section_centre)
+    full_trace, left_trace, right_trace, left_half, right_half = get_centreline_estimate_and_split(centre_top, centre_bottom, left_section_centre, right_section_centre, n_points=40)
+    section_points_left, section_traces_left, section_bary_data_left = get_regularly_spaced_cross_sections(left, left_half, centre_top, centre_bottom, num_sections=20)
+
+    section_points_right, section_traces_right, section_bary_data_right = get_regularly_spaced_cross_sections(right, right_half, centre_top, centre_bottom, num_sections=20)
+
+    section_points_left, section_traces_left, section_bary_data_left = get_regularly_spaced_cross_sections(left, left_half, centre_top, centre_bottom, num_sections=20)
+
+    return section_points_right, section_points_left, section_traces_left, section_traces_right
+
+def load_and_analyze(args):
+    pressure, obj_path, mesh_id = args
+    filename = f"{obj_path}{mesh_id}_{pressure:.1f}.obj"
+    mesh = trimesh.load_mesh(filename)
+    section_points_left, section_points_right = analyze_stomata_mesh(
+        filename, num_sections=20, n_points=40, visualize=False
+    )
+    return mesh, section_points_left, section_points_right
+
+def calculate_cross_section_aspect_ratios_and_lengths(sections_points_list):
+    """
+    Compute aspect ratio (major/minor), major axis length, and minor axis length for each cross section.
+    Returns three lists: aspect_ratios, major_lengths, minor_lengths.
+    """
+    from sklearn.decomposition import PCA
+    import numpy as np
+
+    # Normalize input: allow a single (N,3) array
+    if isinstance(sections_points_list, np.ndarray):
+        if sections_points_list.ndim == 2 and sections_points_list.shape[1] == 3:
+            sections_points_list = [sections_points_list]
+        else:
+            raise ValueError("If passing a numpy array it must be shape (N,3).")
+
+    if not sections_points_list:
+        return [], [], []
+
+    valid_indices = [i for i, s in enumerate(sections_points_list) if s is not None and len(s) >= 3]
+    if not valid_indices:
+        n = len(sections_points_list)
+        return [0.0]*n, [0.0]*n, [0.0]*n
+
+    mid_idx = len(sections_points_list) // 2
+    if sections_points_list[mid_idx] is None or len(sections_points_list[mid_idx]) < 3:
+        mid_idx = valid_indices[len(valid_indices)//2]
+
+    mid_points = np.asarray(sections_points_list[mid_idx])
+    pca_mid = PCA(n_components=2)
+    pca_mid.fit(mid_points)
+    major_axis_ref = pca_mid.components_[0]
+
+    aspect_ratios = []
+    major_lengths = []
+    minor_lengths = []
+
+    for section in sections_points_list:
+        if section is None or len(section) < 3:
+            aspect_ratios.append(0.0)
+            major_lengths.append(0.0)
+            minor_lengths.append(0.0)
+            continue
+        pts = np.asarray(section)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            aspect_ratios.append(0.0)
+            major_lengths.append(0.0)
+            minor_lengths.append(0.0)
+            continue
+        pca = PCA(n_components=2)
+        section_2d = pca.fit_transform(pts)
+        comps = pca.components_
+        dot0 = abs(np.dot(comps[0], major_axis_ref))
+        dot1 = abs(np.dot(comps[1], major_axis_ref))
+        if dot0 >= dot1:
+            major_vals = section_2d[:, 0]
+            minor_vals = section_2d[:, 1]
+        else:
+            major_vals = section_2d[:, 1]
+            minor_vals = section_2d[:, 0]
+        major_length = major_vals.max() - major_vals.min()
+        minor_length = minor_vals.max() - minor_vals.min()
+        if major_length <= 1e-12 or minor_length <= 1e-12:
+            aspect_ratios.append(0.0)
+            major_lengths.append(0.0)
+            minor_lengths.append(0.0)
+        else:
+            aspect_ratios.append(major_length / minor_length)
+            major_lengths.append(major_length)
+            minor_lengths.append(minor_length)
+    return aspect_ratios, major_lengths, minor_lengths
+
 def calculate_cross_section_aspect_ratios(sections_points_list):
     """Compute aspect ratio (major/minor) for each cross section.
 
@@ -349,187 +482,17 @@ def get_midpoint_trace(outer_points, mesh):
     else:
         print("No cross section found at midpoint.")
 
-
-# def create_projected_curve(mesh, outer_points, smooth=50, n_points=120, end_segment_size=10):
-#     """
-#     Create a curve that extends to the min/max x boundaries of the cell with
-#     parallel end segments perpendicular to circle axes.
-
-#     Fixes:
-#       - uses both near_min_x and near_max_x when choosing boundary candidates
-#       - chooses the candidate closest to each endpoint
-#       - computes end directions from transition->endpoint so signs are correct
-#     """
-#     from scipy.interpolate import splprep, splev, CubicSpline
-#     import numpy as np
-#     import trimesh
-
-#     # 1. Fit spline to original curve
-#     tck, u = splprep(outer_points.T, s=smooth)
-
-#     # 2. Make a copy of the input points for the central part
-#     central_curve = outer_points.copy()
-
-#     # 3. Find the min/max x value in the mesh (with a small buffer)
-#     min_x = mesh.vertices[:, 0].min() + 0.5  # buffer
-#     max_x = mesh.vertices[:, 0].max() - 0.5  # buffer
-
-#     # 4. Find mesh vertices near minimum and maximum x
-#     x_tol = 2.0  # tolerance for being "near" a boundary
-#     near_min_x = mesh.vertices[np.abs(mesh.vertices[:, 0] - min_x) < x_tol]
-#     near_max_x = mesh.vertices[np.abs(mesh.vertices[:, 0] - max_x) < x_tol]
-
-#     # Helper to pick best boundary point (closest in full 3D distance) from a candidate set
-#     def pick_best_candidate(candidates, ref_point):
-#         if len(candidates) == 0:
-#             return None
-#         dists = np.linalg.norm(candidates - ref_point.reshape(1, 3), axis=1)
-#         return candidates[np.argmin(dists)]
-
-#     if len(near_min_x) > 0 or len(near_max_x) > 0:
-#         # starting and ending endpoints from original outer_points
-#         start_pt = outer_points[0]
-#         end_pt = outer_points[-1]
-
-#         # pick best candidates near min and max
-#         start_candidate_min = pick_best_candidate(near_min_x, start_pt) if len(near_min_x) > 0 else None
-#         start_candidate_max = pick_best_candidate(near_max_x, start_pt) if len(near_max_x) > 0 else None
-
-#         # choose the closer of available candidates for the start
-#         candidates_for_start = []
-#         if start_candidate_min is not None:
-#             candidates_for_start.append(start_candidate_min)
-#         if start_candidate_max is not None:
-#             candidates_for_start.append(start_candidate_max)
-#         if len(candidates_for_start) > 0:
-#             start_boundary = pick_best_candidate(np.vstack(candidates_for_start), start_pt)
-#         else:
-#             start_boundary = start_pt.copy()
-
-#         # pick best candidates for end
-#         end_candidate_min = pick_best_candidate(near_min_x, end_pt) if len(near_min_x) > 0 else None
-#         end_candidate_max = pick_best_candidate(near_max_x, end_pt) if len(near_max_x) > 0 else None
-
-#         candidates_for_end = []
-#         if end_candidate_min is not None:
-#             candidates_for_end.append(end_candidate_min)
-#         if end_candidate_max is not None:
-#             candidates_for_end.append(end_candidate_max)
-#         if len(candidates_for_end) > 0:
-#             end_boundary = pick_best_candidate(np.vstack(candidates_for_end), end_pt)
-#         else:
-#             end_boundary = end_pt.copy()
-
-#         # If the two boundaries ended up identical (rare), fall back to mirrored behavior:
-#         if np.allclose(start_boundary, end_boundary):
-#             # try to force one to the opposite side by using the farthest candidate for end if available
-#             if len(near_max_x) > 0 and len(near_min_x) > 0:
-#                 # pick the farthest candidate from start for end (ensures opposite side)
-#                 all_candidates = np.vstack([near_min_x, near_max_x])
-#                 dists = np.linalg.norm(all_candidates - start_boundary.reshape(1,3), axis=1)
-#                 end_boundary = all_candidates[np.argmax(dists)]
-
-#         # 7. Create new curve with these endpoints
-#         extended_curve = np.vstack([start_boundary, central_curve, end_boundary])
-#     else:
-#         # Fallback to original curve if no min/max x points found
-#         extended_curve = central_curve
-
-#     # 8. Project onto mesh surface to ensure all points are on the mesh
-#     extended_curve = trimesh.proximity.closest_point(mesh, extended_curve)[0]
-
-#     # 9. Resample for smoothness with higher density at ends
-#     if len(extended_curve) >= 3:
-#         t = np.linspace(0, 1, len(extended_curve))
-#         t_new = np.linspace(0, 1, n_points)
-
-#         # Use cubic interpolation to maintain shape
-#         cs_x = CubicSpline(t, extended_curve[:, 0])
-#         cs_y = CubicSpline(t, extended_curve[:, 1])
-#         cs_z = CubicSpline(t, extended_curve[:, 2])
-
-#         final_curve = np.column_stack([
-#             cs_x(t_new), cs_y(t_new), cs_z(t_new)
-#         ])
-
-#         # Ensure endpoints are exactly preserved
-#         final_curve[0] = extended_curve[0]
-#         final_curve[-1] = extended_curve[-1]
-#     else:
-#         # Fall back to original method if insufficient points
-#         tck2, u2 = splprep(extended_curve.T, s=smooth)
-#         final_curve = np.array(splev(np.linspace(0, 1, n_points), tck2)).T
-
-#     # 10. Apply additional smoothing
-#     tck3, u3 = splprep(final_curve.T, s=smooth * 0.5)
-#     final_curve_smooth = np.array(splev(np.linspace(0, 1, n_points), tck3)).T
-
-#     # 11. Make end segments parallel and perpendicular to circle axes
-#     if end_segment_size > n_points // 4:
-#         end_segment_size = n_points // 4
-
-#     # Transition indices
-#     start_transition_idx = end_segment_size
-#     end_transition_idx = n_points - end_segment_size - 1
-
-#     # Robust approach: compute direction from transition point toward the true endpoint,
-#     # then project that into the X-Z plane (i.e. remove Y component) to get the direction to use.
-#     def safe_unit(v):
-#         norm = np.linalg.norm(v)
-#         return v / norm if norm > 1e-12 else v
-
-#     y_axis = np.array([0.0, 1.0, 0.0])
-
-#     # For start: desired direction = from transition to actual start endpoint (final index 0 of final_curve_smooth)
-#     desired_start_dir = final_curve_smooth[0] - final_curve_smooth[start_transition_idx]
-#     start_dir = desired_start_dir - np.dot(desired_start_dir, y_axis) * y_axis
-#     start_dir = safe_unit(start_dir)
-#     if np.linalg.norm(start_dir) < 1e-8:
-#         # fallback to tangent-based projection (older behavior) if degenerate
-#         start_tangent = final_curve_smooth[start_transition_idx + 1] - final_curve_smooth[start_transition_idx - 1]
-#         start_dir = start_tangent - np.dot(start_tangent, y_axis) * y_axis
-#         start_dir = safe_unit(start_dir)
-
-#     # For end: direction from transition to final endpoint
-#     desired_end_dir = final_curve_smooth[-1] - final_curve_smooth[end_transition_idx]
-#     end_dir = desired_end_dir - np.dot(desired_end_dir, y_axis) * y_axis
-#     end_dir = safe_unit(end_dir)
-#     if np.linalg.norm(end_dir) < 1e-8:
-#         end_tangent = final_curve_smooth[end_transition_idx + 1] - final_curve_smooth[end_transition_idx - 1]
-#         end_dir = end_tangent - np.dot(end_tangent, y_axis) * y_axis
-#         end_dir = safe_unit(end_dir)
-
-#     # Adjust the start segment points (interpolate outward from transition point)
-#     for i in range(end_segment_size):
-#         # index i runs from 0..end_segment_size-1
-#         factor = (end_segment_size - i) / float(end_segment_size)  # 1 at transition -> 0 at endpoint? we want 0 at transition -> 1 at endpoint
-#         # we want factor = (i+1)/end_segment_size so 0 at transition_idx and 1 at endpoint
-#         factor = (i + 1) / float(end_segment_size)
-#         orig_dir = final_curve_smooth[i] - final_curve_smooth[start_transition_idx]
-#         dist = np.linalg.norm(orig_dir)
-#         final_curve_smooth[i] = final_curve_smooth[start_transition_idx] + dist * start_dir * factor
-
-#     # Adjust the end segment points
-#     for i in range(end_segment_size):
-#         idx = n_points - end_segment_size + i  # start at end_transition_idx+1 up to last
-#         factor = (i + 1) / float(end_segment_size)
-#         orig_dir = final_curve_smooth[idx] - final_curve_smooth[end_transition_idx]
-#         dist = np.linalg.norm(orig_dir)
-#         final_curve_smooth[idx] = final_curve_smooth[end_transition_idx] + dist * end_dir * factor
-
-#     # 12. Project back onto mesh surface
-#     final_curve_smooth = trimesh.proximity.closest_point(mesh, final_curve_smooth)[0]
-
-#     # 13. Apply one final light smoothing to blend the adjusted ends
-#     tck4, u4 = splprep(final_curve_smooth.T, s=smooth * 0.3)
-#     final_curve_smooth = np.array(splev(np.linspace(0, 1, n_points), tck4)).T
-
-#     # Ensure endpoints remain fixed
-#     final_curve_smooth[0] = final_curve[0]
-#     final_curve_smooth[-1] = final_curve[-1]
-
-#     return final_curve_smooth
-
+def get_circle_trace(circle, name="Circle", colour="red"):
+    ## Create the circle traces
+    circle_trace = go.Scatter3d(
+        x=circle[:, 0],
+        y=circle[:, 1],
+        z=circle[:, 2],
+        mode='lines',
+        line=dict(color=colour, width=2),
+        name=name
+    )
+    return circle_trace
 
 def define_end_point_circles(outer_curve_projected, section_points, n_points=64, eps=1e-9, y_rotation_deg=0.0, mesh=None, flip_circle_directions=False):
     """
@@ -802,198 +765,17 @@ def align_mesh_to_y_axis(mesh):
 
     return aligned_mesh, full_transform
 
-## Also obsolete - uses the wrong cross section code. However, we may need to use the code here to fit the ellipses, and extract the aspect ratios.
-# def extract_cross_section_data(file, path, side="single_a", n_sections=20):
-#     """
-#     Extract cross-section data from a mesh without creating visualizations.
-    
-#     Parameters:
-#     -----------
-#     file_index : int
-#         Index of the file to analyze from the files list
-#     side : str
-#         Side to analyze ("single_a" or "single_b")
-#     n_sections : int
-#         Number of cross-sections to generate along the centreline
-        
-#     Returns:
-#     --------
-#     data : dict
-#         Dictionary containing all computed data
-#     """
-#     from sklearn.decomposition import PCA
-#     from skimage.measure import EllipseModel
-    
-#     # Initialize results dictionary
-#     results = {
-#         'file_info': {
-#             'file_name': file,
-#             'side': side,
-#             'mesh_path': f"{path}/{file}_{side}.obj"
-#         },
-#         'mesh_data': {},
-#         'cross_sections': {
-#             'indices': [],
-#             '3d_points': [],
-#             '2d_points': [],
-#             'pca_components': [],
-#             'std_devs': [],
-#             'aspect_ratios': [],
-#             'ellipse_fits': []
-#         }
-#     }
-    
-#     # Load and process mesh
-#     mesh_path = results['file_info']['mesh_path']
-#     mesh = trimesh.load(mesh_path, process=True)
-    
-#     # Align the mesh to the Y-axis and center it
-#     mesh = align_mesh_to_y_axis(mesh)
-    
-#     # Ensure consistent orientation
-#     outer_points_check = find_outer_edge(mesh, smoothing=50)
-#     if np.mean(outer_points_check[:, 0]) < 0:
-#         mesh.vertices[:, 0] *= -1
-    
-#     # Process mesh to find centreline
-#     outer_points = find_outer_edge(mesh, smoothing=50)
-#     outer_curve_projected = create_projected_curve(
-#         mesh, outer_points, smooth=50, n_points=120, end_segment_size=10
-#     )
+def order_points_consistently(points, normal, midpoint):
+    # build a stable 2D basis in the slicing plane
+    ref = np.array([0,0,1]) if abs(np.dot(normal,[0,0,1])) < 0.9 else np.array([1,0,0])
+    v1 = np.cross(normal, ref); v1 /= np.linalg.norm(v1)
+    v2 = np.cross(normal, v1)
 
-#     # Get midpoint cross-section
-#     _, _, section_points = get_midpoint_trace(outer_points, mesh)
-
-#     # Get the circle centers
-#     _, _, _, _, _, center_start, center_end, circle_start, circle_end = define_end_point_circles(outer_curve_projected, section_points, mesh=mesh)
-
-#     # Create the centreline using the actual circle centers
-#     section_midpoint = np.mean(section_points, axis=0)
-#     centreline, _ = create_bezier_centreline(
-#         center_start, section_midpoint, center_end, curve_points=50
-#     )
-
-#     # Store centreline in results
-#     results['mesh_data']['centreline'] = centreline
-#     results['mesh_data']['outer_points'] = outer_points
-#     results['mesh_data']['outer_curve_projected'] = outer_curve_projected
-    
-#     # Define cross-section indices
-#     end_margin_points = 3  # Avoid unstable sections at the very ends
-#     start_index = end_margin_points
-#     end_index = len(centreline) - 1 - end_margin_points
-#     indices = np.linspace(start_index, end_index, n_sections, dtype=int)
-#     results['cross_sections']['indices'] = indices.tolist()
-    
-#     # Get all cross-sections
-#     all_section_points = get_cross_section_points(mesh, centreline, indices)
-    
-#     # Calculate tangents along the centreline
-#     tangents = np.gradient(centreline, axis=0)
-#     tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
-#     results['mesh_data']['tangents'] = tangents
-    
-#     # Define a consistent reference for orientation
-#     pattern_reference = np.array([1.0, 0.0, 1.0])  # Diagonal pattern in X-Z plane
-#     pattern_reference = pattern_reference / np.linalg.norm(pattern_reference)  # Normalize
-#     x_axis = np.array([1, 0, 0])
-    
-#     # Process each cross-section
-#     for i, section_points in enumerate(all_section_points):
-#         if section_points is None or len(section_points) < 3:
-#             # Store empty data for missing sections
-#             results['cross_sections']['3d_points'].append(None)
-#             results['cross_sections']['2d_points'].append(None)
-#             results['cross_sections']['pca_components'].append(None)
-#             results['cross_sections']['std_devs'].append(None)
-#             results['cross_sections']['aspect_ratios'].append(np.nan)
-#             results['cross_sections']['ellipse_fits'].append(None)
-#             continue
-            
-#         idx = indices[i]
-#         tangent = tangents[idx]
-        
-#         # Store 3D points
-#         results['cross_sections']['3d_points'].append(section_points.tolist())
-        
-#         # Perform PCA
-#         pca = PCA(n_components=2)
-#         pca.fit(section_points)
-#         std_devs = np.sqrt(pca.explained_variance_)
-        
-#         # Store PCA components and std_devs
-#         results['cross_sections']['pca_components'].append(pca.components_.tolist())
-#         results['cross_sections']['std_devs'].append(std_devs.tolist())
-
-#         # Get PCA components
-#         component_0 = pca.components_[0]
-#         component_1 = pca.components_[1]
-
-#         # CONSISTENT HORIZONTAL ALIGNMENT:
-#         # Check which component is more aligned with X-axis
-#         dot_0_x = np.abs(np.dot(component_0, x_axis))
-#         dot_1_x = np.abs(np.dot(component_1, x_axis))
-
-#         # The component more aligned with X is the major axis
-#         if dot_0_x >= dot_1_x:
-#             main_axis_vec = component_0 if np.dot(component_0, x_axis) >= 0 else -component_0
-#             minor_axis_vec = component_1 if np.cross(main_axis_vec, component_1)[1] >= 0 else -component_1
-#             main_axis_std, minor_axis_std = std_devs[0], std_devs[1]
-#         else:
-#             main_axis_vec = component_1 if np.dot(component_1, x_axis) >= 0 else -component_1
-#             minor_axis_vec = component_0 if np.cross(main_axis_vec, component_0)[1] >= 0 else -component_0
-#             main_axis_std, minor_axis_std = std_devs[1], std_devs[0]
-        
-#         # Calculate aspect ratio
-#         if minor_axis_std > 1e-9:
-#             aspect_ratio = main_axis_std / minor_axis_std
-#         else:
-#             aspect_ratio = np.nan
-            
-#         # Store aspect ratio
-#         results['cross_sections']['aspect_ratios'].append(float(aspect_ratio))
-        
-#         # Project points to 2D using the principal axes
-#         centroid = np.mean(section_points, axis=0)
-#         centered = section_points - centroid
-#         x_coords = centered @ main_axis_vec
-#         y_coords = centered @ minor_axis_vec
-#         points_2d = np.column_stack([x_coords, y_coords])
-        
-#         # Store 2D points
-#         results['cross_sections']['2d_points'].append(points_2d.tolist())
-        
-#         # Fit an ellipse to the 2D points
-#         ellipse_data = None
-#         try:
-#             ellipse_model = EllipseModel()
-#             if len(points_2d) >= 5 and ellipse_model.estimate(points_2d):
-#                 xc, yc, a, b, theta = ellipse_model.params
-                
-#                 # Generate points along the ellipse
-#                 t = np.linspace(0, 2*np.pi, 100)
-#                 ellipse_x = xc + a * np.cos(t) * np.cos(theta) - b * np.sin(t) * np.sin(theta)
-#                 ellipse_y = yc + a * np.cos(t) * np.sin(theta) + b * np.sin(t) * np.cos(theta)
-#                 ellipse_points = np.column_stack([ellipse_x, ellipse_y])
-                
-#                 # Calculate ellipse aspect ratio
-#                 ellipse_ar = max(a, b) / min(a, b)
-                
-#                 # Store ellipse data
-#                 ellipse_data = {
-#                     'center': [float(xc), float(yc)],
-#                     'axes_lengths': [float(a), float(b)],
-#                     'angle': float(theta),
-#                     'aspect_ratio': float(ellipse_ar),
-#                     'points': ellipse_points.tolist()
-#                 }
-#         except Exception as e:
-#             pass
-            
-#         # Store ellipse data
-#         results['cross_sections']['ellipse_fits'].append(ellipse_data)
-    
-#     return results
+    R = points - midpoint
+    coords2d = np.column_stack([R @ v1, R @ v2])
+    angles = np.arctan2(coords2d[:,1], coords2d[:,0])
+    order = np.argsort(angles)
+    return points[order]
 
 ## Function to iterate over a number of meshes, and create plots showing the aspect ratio of the cross sections along the guard cells: OBSOLETE
 def get_cross_section_points(mesh, centreline, indices):
@@ -1021,9 +803,147 @@ def get_cross_section_points(mesh, centreline, indices):
             sections_points_list.append(nearest_seg)
         else:
             if section.vertices.shape[0] > 0:
-                sections_points_list.append(section.vertices)
+                ordered_vertices = order_points_consistently(section.vertices, tangent, midpoint)
+                sections_points_list.append(ordered_vertices)
 
     return sections_points_list
+
+import numpy as np
+
+def get_cross_section_points_with_normals(
+    mesh,
+    centreline,
+    indices,
+    normal_source='centreline',   # 'centreline' or 'svd'
+    enforce_consistent_normal=True
+):
+    """
+    Compute cross-section point clouds and return slice normals.
+
+    Returns (sections_list, normals_list, midpoints_list) where each list has the
+    same length as `indices`. Failed slices produce None entries.
+
+    normal_source:
+      - 'centreline' : return the tangent at the centreline index (fast)
+      - 'svd'        : compute normal from the section points via SVD (robust)
+
+    enforce_consistent_normal: if True, flip a computed normal so it faces the
+    same hemisphere as the previous non-None normal (reduces sign flip issues).
+    """
+    centreline = np.asarray(centreline, dtype=float)
+    # compute stable centreline tangents (same approach as before)
+    tangents = np.gradient(centreline, axis=0)
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    tangents = tangents / norms
+    for i in range(1, len(tangents)):
+        if np.dot(tangents[i], tangents[i-1]) < 0:
+            tangents[i] *= -1.0
+
+    # containers aligned to indices
+    n_idx = len(indices)
+    sections = [None] * n_idx
+    normals = [None] * n_idx
+    midpoints = [None] * n_idx
+
+    prev_normal = None
+
+    # fallback ordering if user has no order_points_consistently function
+    def _order_points_consistently_fallback(pts3, tangent, midpoint):
+        # order by angle in-plane using SVD to get a stable plane basis
+        X = pts3 - pts3.mean(axis=0)
+        try:
+            _, _, vh = np.linalg.svd(X, full_matrices=False)
+            normal_est = vh[-1]
+        except Exception:
+            normal_est = tangent
+        # build in-plane basis
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(ref, normal_est)) > 0.95:
+            ref = np.array([1.0, 0.0, 0.0])
+        v1 = np.cross(normal_est, ref)
+        nv1 = np.linalg.norm(v1)
+        if nv1 < 1e-12:
+            return pts3  # give up
+        v1 /= nv1
+        v2 = np.cross(normal_est, v1)
+        v2 /= max(np.linalg.norm(v2), 1e-12)
+        # project to 2D and sort by angle around centroid
+        pts2 = np.column_stack([ (pts3 - midpoint) @ v1, (pts3 - midpoint) @ v2 ])
+        centroid2 = pts2.mean(axis=0)
+        angles = np.arctan2(pts2[:,1] - centroid2[1], pts2[:,0] - centroid2[0])
+        order = np.argsort(angles)
+        return pts3[order]
+
+    for out_i, idx in enumerate(indices):
+        # bounds guard
+        if idx < 0 or idx >= len(centreline):
+            continue
+        midpoint = centreline[idx]
+        tangent = tangents[idx]
+
+        section = mesh.section(plane_origin=midpoint, plane_normal=tangent)
+        if section is None:
+            # leave None entries
+            continue
+
+        # obtain an ordered polyline for the segment nearest midpoint
+        chosen_seg = None
+        if hasattr(section, 'discrete') and section.discrete:
+            # pick the segment whose centroid is nearest to the midpoint
+            segments = [seg for seg in section.discrete if seg.shape[0] >= 3]
+            if len(segments) == 0:
+                # nothing useful
+                continue
+            centroids = [seg.mean(axis=0) for seg in segments]
+            dists = [np.linalg.norm(c - midpoint) for c in centroids]
+            chosen_seg = segments[int(np.argmin(dists))]
+        else:
+            # fallback to merged vertices - try to order them
+            if not (hasattr(section, 'vertices') and section.vertices is not None and section.vertices.shape[0] >= 3):
+                continue
+            verts = section.vertices
+            # try to use user's ordering function if present
+            try:
+                ordered = order_points_consistently(verts, tangent, midpoint)
+            except NameError:
+                ordered = _order_points_consistently_fallback(verts, tangent, midpoint)
+            chosen_seg = ordered
+
+        # store chosen segment and midpoint
+        sections[out_i] = chosen_seg
+        midpoints[out_i] = midpoint
+
+        # compute the returned normal according to requested source
+        if normal_source == 'centreline':
+            n = tangent.copy()
+        elif normal_source == 'svd':
+            # compute from chosen segment points
+            pts = chosen_seg - chosen_seg.mean(axis=0)
+            try:
+                _, _, vh = np.linalg.svd(pts, full_matrices=False)
+                n = vh[-1].copy()
+            except Exception:
+                n = tangent.copy()
+        else:
+            raise ValueError("normal_source must be 'centreline' or 'svd'")
+
+        # ensure unit and non-zero
+        nnorm = np.linalg.norm(n)
+        if nnorm < 1e-12:
+            n = tangent.copy()
+            nnorm = np.linalg.norm(n)
+        n /= nnorm
+
+        # enforce hemisphere consistency to reduce basis flipping
+        if enforce_consistent_normal and prev_normal is not None and np.dot(n, prev_normal) < 0:
+            n = -n
+
+        normals[out_i] = n
+        prev_normal = n
+
+    return sections, normals, midpoints
+
 
 def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centreline = None, end_margin_points = 3, n_sections=20, colormap='viridis'):
     """
@@ -1178,3 +1098,816 @@ def visualize_mesh_with_cross_sections(mesh=None, outer_points = None, centrelin
     print(f"Saved 3D visualization to {output_filename}")
     
     return fig, all_section_points
+
+def find_wall_vertices(mesh: trimesh.Trimesh, dihedral_deg=175.0):
+    """
+    Return indices of vertices that lie on 'wall' seams where adjacent faces
+    have almost opposite normals (dihedral angle near 180°).
+    """
+    if mesh.face_adjacency.shape[0] == 0:
+        return np.array([], dtype=int)
+
+    angles = mesh.face_adjacency_angles  # angle between face normals (0 ~ same dir, pi ~ opposite)
+    wall_mask = angles > np.deg2rad(dihedral_deg)
+    if not np.any(wall_mask):
+        return np.array([], dtype=int)
+
+    wall_face_pairs = mesh.face_adjacency[wall_mask]              # (k,2)
+    wall_faces = np.unique(wall_face_pairs.ravel())               # face indices involved
+    wall_vertices = np.unique(mesh.faces[wall_faces].ravel())     # vertex indices
+    return wall_vertices
+
+def find_wall_vertices_vertex_normals(mesh: trimesh.Trimesh, dot_thresh=0.2):
+    """
+    Fallback: mark a vertex as wall if its incident face normals contain
+    at least one pair with dot < - (1 - dot_thresh) (i.e., strong opposition).
+    """
+    face_normals = mesh.face_normals
+    # Build incident face list per vertex
+    incident = [[] for _ in range(len(mesh.vertices))]
+    for f_idx, face in enumerate(mesh.faces):
+        for v in face:
+            incident[v].append(f_idx)
+
+    wall_vertices = []
+    opposite_limit = -(1.0 - dot_thresh)
+    for vidx, f_list in enumerate(incident):
+        if len(f_list) < 2:
+            continue
+        fn = face_normals[f_list]
+        # Fast prune: compare against first normal
+        dots = fn @ fn[0]
+        if np.min(dots) > opposite_limit:  # no strong opposite to first
+            # full pairwise if ambiguous
+            opp = False
+            for i in range(len(fn)):
+                if opp: break
+                d = fn[i+1:] @ fn[i]
+                if d.size and np.min(d) < opposite_limit:
+                    opp = True
+            if not opp:
+                continue
+        wall_vertices.append(vidx)
+    return np.array(wall_vertices, dtype=int)
+
+def get_top_bottom_wall_centres(mesh, wall_vertices):
+    ## Separate these into top and bottom walls
+    verts = mesh.vertices
+    wall_coords = verts[wall_vertices]
+    # Use KMeans clustering to separate into two groups (top and bottom walls)
+    if len(wall_coords) >= 2:
+        kmeans = KMeans(n_clusters=2, random_state=0).fit(wall_coords)
+        labels = kmeans.labels_
+        group1 = wall_coords[labels == 0]
+        group2 = wall_coords[labels == 1]
+        # Assign top/bottom by comparing mean y values
+        if group1[:, 1].mean() > group2[:, 1].mean():
+            top_wall_coords = group1
+            bottom_wall_coords = group2
+        else:
+            top_wall_coords = group2
+            bottom_wall_coords = group1
+    else:
+        # Fallback: use all as top, none as bottom
+        top_wall_coords = wall_coords
+        bottom_wall_coords = np.empty((0, 3))
+
+    # Create the wall traces
+    top_wall_trace = go.Scatter3d(
+        x=top_wall_coords[:, 0],
+        y=top_wall_coords[:, 1],
+        z=top_wall_coords[:, 2],
+        mode='markers',
+        marker=dict(size=5, color='red'),
+        name='Top Wall Vertices'
+    )
+    bottom_wall_trace = go.Scatter3d(
+        x=bottom_wall_coords[:, 0],
+        y=bottom_wall_coords[:, 1],
+        z=bottom_wall_coords[:, 2],
+        mode='markers',
+        marker=dict(size=5, color='blue'),
+        name='Bottom Wall Vertices'
+    )
+
+    centre_top = top_wall_coords.mean(axis=0)
+    centre_bottom = bottom_wall_coords.mean(axis=0)
+
+    centre_top_trace = go.Scatter3d(
+        x=[centre_top[0]],
+        y=[centre_top[1]],
+        z=[centre_top[2]],
+        mode='markers',
+        marker=dict(size=5, color='red'),
+        name='Top Wall Centre'
+    )
+    centre_bottom_trace = go.Scatter3d(
+        x=[centre_bottom[0]],
+        y=[centre_bottom[1]],
+        z=[centre_bottom[2]],
+        mode='markers',
+        marker=dict(size=5, color='blue'),
+        name='Bottom Wall Centre'
+    )
+
+    return centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace
+
+def get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom):
+    """
+    Take a cross section at the midpoint between two precomputed wall centres.
+    The cross section plane is perpendicular to the line joining the centres.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        The mesh to section.
+    centre_top : np.ndarray
+        3D coordinates of the top wall centre.
+    centre_bottom : np.ndarray
+        3D coordinates of the bottom wall centre.
+
+    Returns
+    -------
+    midpoint : np.ndarray
+        The midpoint between wall centres.
+    traces : list
+        Plotly traces for visualization.
+    section_points : np.ndarray
+        Points of the cross section at the midpoint.
+    local_axes : np.ndarray
+        3x3 array: [wall_vec, left_right_vec, normal_vec]
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+    from sklearn.decomposition import PCA
+
+    # Define wall axis (from bottom to top)
+    wall_vec = centre_top - centre_bottom
+    wall_vec /= np.linalg.norm(wall_vec)
+
+    # Midpoint
+    midpoint = (centre_top + centre_bottom) / 2
+
+    # Find all mesh vertices near the midpoint plane (for local PCA)
+    verts = mesh.vertices
+    dists = np.dot(verts - midpoint, wall_vec)
+    close_mask = np.abs(dists) < np.percentile(np.abs(dists), 10)  # 10% closest to plane
+    midplane_points = verts[close_mask]
+
+    # Use PCA to find the two main axes in the midplane
+    pca = PCA(n_components=2)
+    pca.fit(midplane_points)
+    left_right_vec = pca.components_[0]
+    normal_vec = np.cross(wall_vec, left_right_vec)
+    normal_vec /= np.linalg.norm(normal_vec)
+
+    # Take cross section at midpoint, normal to wall_vec
+    section = mesh.section(plane_origin=midpoint, plane_normal=wall_vec)
+    if section is not None:
+        if hasattr(section, 'discrete'):
+            section_points = np.vstack([seg for seg in section.discrete])
+        else:
+            section_points = section.vertices
+    else:
+        section_points = None
+
+    # Visualization traces
+    midpoint_trace = go.Scatter3d(
+        x=[midpoint[0]], y=[midpoint[1]], z=[midpoint[2]],
+        mode='markers', marker=dict(size=8, color='black'), name='Midpoint (centres)'
+    )
+    traces = [midpoint_trace]
+    if section_points is not None:
+        traces.append(go.Scatter3d(
+            x=section_points[:, 0], y=section_points[:, 1], z=section_points[:, 2],
+            mode='markers', marker=dict(size=5, color='orange'), name='Midpoint Cross Section (centres)'
+        ))
+
+    local_axes = np.stack([wall_vec, left_right_vec, normal_vec], axis=0)
+
+    return midpoint, traces, section_points, local_axes
+
+## Get the areas of the midsections
+def cross_section_area_2d(points):
+        pca = PCA(n_components=2)
+        pts2 = pca.fit_transform(points)
+        hull = ConvexHull(pts2)
+        return hull.volume
+
+def get_left_right_midsections(section_points, midpoint, local_axes):
+
+    # The left-right axis is the second vector in local_axes (from get_midpoint_cross_section_from_centres)
+    left_right_vec = local_axes[1]
+
+    # Project section points onto the left-right axis (relative to the midpoint)
+    relative_points = section_points - midpoint
+    side_values = np.dot(relative_points, left_right_vec)
+
+    left_section = section_points[side_values < 0]
+    right_section = section_points[side_values >= 0]
+
+    left_section_centre = left_section.mean(axis=0)
+    right_section_centre = right_section.mean(axis=0)
+
+    # Create our left and right traces
+    left_midsection_trace = go.Scatter3d(
+        x=left_section[:, 0], y=left_section[:, 1], z=left_section[:, 2],
+        mode='markers', marker=dict(size=5, color='orange'), name='Left Midsection'
+    )
+
+    right_midsection_trace = go.Scatter3d(
+        x=right_section[:, 0], y=right_section[:, 1], z=right_section[:, 2],
+        mode='markers', marker=dict(size=5, color='blue'), name='Right Midsection'
+    )
+
+    left_section_centre_trace = go.Scatter3d(
+        x=[left_section_centre[0]], y=[left_section_centre[1]], z=[left_section_centre[2]],
+        mode='markers', marker=dict(size=8, color='orange'), name='Left Section Centre'
+    )
+
+    right_section_centre_trace = go.Scatter3d(
+        x=[right_section_centre[0]], y=[right_section_centre[1]], z=[right_section_centre[2]],
+        mode='markers', marker=dict(size=8, color='blue'), name='Right Section Centre'
+    )
+    return left_section, right_section, left_section_centre, right_section_centre,left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace
+
+def make_circle(coords, radius):
+    # Fit PCA
+    pca = PCA(n_components=3)
+    pca.fit(coords)
+    plane_origin = coords.mean(axis=0)
+    plane_normal = pca.components_[-1]  # normal vector to the best-fit plane
+
+    # Create circle points
+    circle_points = []
+    for angle in np.linspace(0, 2 * np.pi, 100):
+        x = radius * np.cos(angle)
+        y = radius * np.sin(angle)
+        z = 0
+        circle_points.append(plane_origin + x * pca.components_[0] + y * pca.components_[1] + z * plane_normal)
+    return np.array(circle_points)
+
+def get_centreline_estimate(top_circle_centre, bottom_circle_centre, left_section_centre, right_section_centre):
+    points = np.vstack([top_circle_centre, left_section_centre, bottom_circle_centre, right_section_centre, top_circle_centre])  # repeat first point to close
+    t = np.linspace(0, 1, len(points))
+    t_fine = np.linspace(0, 1, 200)
+    spline_x = CubicSpline(t, points[:,0], bc_type='periodic')(t_fine)
+    spline_y = CubicSpline(t, points[:,1], bc_type='periodic')(t_fine)
+    spline_z = CubicSpline(t, points[:,2], bc_type='periodic')(t_fine)
+    spline_trace = go.Scatter3d(
+        x=spline_x, y=spline_y, z=spline_z,
+        mode='lines',
+        line=dict(color='black', width=6),
+        name='Central Spline (Closed)'
+        )
+    return spline_trace, spline_x, spline_y, spline_z
+
+def get_centreline_estimate_and_split(top_circle_centre, bottom_circle_centre,
+                                      left_section_centre, right_section_centre,
+                                      n_points=200):
+    """
+    Build a closed spline centreline and split it into left and right guard cell halves
+    based on top and bottom anchors.
+    """
+    import numpy as np
+    from scipy.interpolate import CubicSpline
+    import plotly.graph_objects as go
+
+    # Full loop
+    points = np.vstack([
+        top_circle_centre,
+        left_section_centre,
+        bottom_circle_centre,
+        right_section_centre,
+        top_circle_centre
+    ])  # repeat to close
+
+    t = np.linspace(0, 1, len(points))
+    t_fine = np.linspace(0, 1, n_points)
+
+    spline_x = CubicSpline(t, points[:, 0], bc_type='periodic')(t_fine)
+    spline_y = CubicSpline(t, points[:, 1], bc_type='periodic')(t_fine)
+    spline_z = CubicSpline(t, points[:, 2], bc_type='periodic')(t_fine)
+    spline = np.column_stack([spline_x, spline_y, spline_z])
+
+    # Find closest indices to anchors
+    top_idx = np.argmin(np.linalg.norm(spline - top_circle_centre, axis=1))
+    bottom_idx = np.argmin(np.linalg.norm(spline - bottom_circle_centre, axis=1))
+
+    if top_idx < bottom_idx:
+        left_half = spline[top_idx:bottom_idx+1]
+        right_half = np.vstack([spline[bottom_idx:], spline[:top_idx+1]])
+    else:
+        right_half = spline[bottom_idx:top_idx+1]
+        left_half = np.vstack([spline[top_idx:], spline[:bottom_idx+1]])
+
+    # Plot traces
+    full_trace = go.Scatter3d(
+        x=spline_x, y=spline_y, z=spline_z,
+        mode='lines', line=dict(color='black', width=4),
+        name='Full Centreline'
+    )
+    left_trace = go.Scatter3d(
+        x=left_half[:, 0], y=left_half[:, 1], z=left_half[:, 2],
+        mode='lines', line=dict(color='red', width=6),
+        name='Left Guard Cell Centreline'
+    )
+    right_trace = go.Scatter3d(
+        x=right_half[:, 0], y=right_half[:, 1], z=right_half[:, 2],
+        mode='lines', line=dict(color='blue', width=6),
+        name='Right Guard Cell Centreline'
+    )
+
+    return full_trace, left_trace, right_trace, left_half, right_half
+
+
+from scipy.interpolate import CubicSpline
+import numpy as np
+import plotly.graph_objects as go
+
+def get_guard_cell_centreline(top_anchor, bottom_anchor, section_centres):
+    """
+    Estimate a smooth centreline for a single guard cell.
+    
+    Parameters
+    ----------
+    top_anchor : (3,) array
+        Point at the top of the guard cell (must be included in the spline).
+    bottom_anchor : (3,) array
+        Point at the bottom of the guard cell (must be included in the spline).
+    section_centres : (M,3) array
+        Optional intermediate centres along the guard cell cross-sections.
+
+    Returns
+    -------
+    spline_trace : go.Scatter3d
+        Plotly line trace of the spline.
+    spline_points : (N,3) array
+        Interpolated centreline points.
+    """
+    # Stack points in order: top → intermediates → bottom
+    control_points = np.vstack([top_anchor, section_centres, bottom_anchor])
+    
+    # Parametric coordinate
+    t = np.linspace(0, 1, len(control_points))
+    t_fine = np.linspace(0, 1, 200)
+    
+    # Natural cubic spline (not periodic)
+    spline_x = CubicSpline(t, control_points[:, 0], bc_type='natural')(t_fine)
+    spline_y = CubicSpline(t, control_points[:, 1], bc_type='natural')(t_fine)
+    spline_z = CubicSpline(t, control_points[:, 2], bc_type='natural')(t_fine)
+    
+    spline_points = np.vstack([spline_x, spline_y, spline_z]).T
+    
+    spline_trace = go.Scatter3d(
+        x=spline_x, y=spline_y, z=spline_z,
+        mode='lines',
+        line=dict(color='black', width=6),
+        name='Guard Cell Centreline'
+    )
+    
+    return spline_trace, spline_points
+
+
+def improve_centre_line_with_anchors( mesh, spline_x, spline_y, spline_z, centre_top, centre_bottom, left_section_centre, right_section_centre, num_sections=40):
+
+    indices = np.linspace(0, len(spline_x) - 1, num_sections + 6, dtype=int)  # +6 to allow for removal
+
+    # Find the closest index in the spline to each wall centre
+    spline_points = np.column_stack([spline_x, spline_y, spline_z])
+    top_idx = np.argmin(np.linalg.norm(spline_points - centre_top, axis=1))
+    bottom_idx = np.argmin(np.linalg.norm(spline_points - centre_bottom, axis=1))
+
+    def remove_near_wall(idx, indices, window=1):
+        closest = np.argmin(np.abs(indices - idx))
+        to_remove = [(closest + offset) % len(indices) for offset in range(-window, window+1)]
+        return set(to_remove)
+
+    remove_set = remove_near_wall(top_idx, indices, window=1) | remove_near_wall(bottom_idx, indices, window=1)
+    keep_mask = np.ones(len(indices), dtype=bool)
+    for i in remove_set:
+        keep_mask[i] = False
+    final_indices = indices[keep_mask]
+    final_indices = final_indices[:num_sections]
+
+    section_points_list = []
+    section_centroids = []
+
+    for idx in final_indices:
+        section_points = get_cross_section_points(mesh, spline_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            centroid = section_points.mean(axis=0)
+            section_centroids.append(centroid)
+
+    centroids = np.array(section_centroids)
+
+    # Insert anchor points at the closest centroid locations
+    anchors = [
+        centre_top,
+        left_section_centre,
+        centre_bottom,
+        right_section_centre,
+        centre_top  # repeat to close the loop
+    ]
+    anchor_indices = [np.argmin(np.linalg.norm(centroids - anchor, axis=1)) for anchor in anchors[:-1]]
+    centroids_with_anchors = centroids.copy()
+    offset = 0
+    for idx, anchor in sorted(zip(anchor_indices, anchors[:-1])):
+        centroids_with_anchors = np.insert(centroids_with_anchors, idx + offset, anchor, axis=0)
+        offset += 1
+    centroids_with_anchors = np.vstack([centroids_with_anchors, centroids_with_anchors[0]])
+
+    # Polyline with anchors
+    polyline_trace = go.Scatter3d(
+        x=centroids_with_anchors[:,0], y=centroids_with_anchors[:,1], z=centroids_with_anchors[:,2],
+        mode='lines', line=dict(color='orange', width=4), name='Centroid Polyline + Anchors'
+    )
+
+    # Smoothed polyline
+    window_length = 7 if len(centroids_with_anchors) > 7 else len(centroids_with_anchors) // 2 * 2 + 1
+    smoothed = np.column_stack([
+        savgol_filter(centroids_with_anchors[:,i], window_length=window_length, polyorder=2, mode='wrap')
+        for i in range(3)
+    ])
+    smoothed_trace = go.Scatter3d(
+        x=smoothed[:,0], y=smoothed[:,1], z=smoothed[:,2],
+        mode='lines', line=dict(color='red', width=6), name='Smoothed Centroid Line'
+    )
+
+    # Optionally, show anchor points as markers
+    anchor_trace = go.Scatter3d(
+        x=[a[0] for a in anchors], y=[a[1] for a in anchors], z=[a[2] for a in anchors],
+        mode='markers+text', marker=dict(size=8, color='black'), name='Anchors',
+        text=['Top','Left','Bottom','Right','Top'], textposition='top center'
+    )
+
+    return polyline_trace, smoothed_trace, anchor_trace, smoothed
+
+from scipy.signal import savgol_filter
+import numpy as np
+import plotly.graph_objects as go
+
+def improve_guard_cell_centreline(
+    mesh,
+    spline_x, spline_y, spline_z,
+    centre_top, centre_bottom,
+    num_sections=40
+):
+    """
+    Refine a guard cell centreline by sampling cross-sections
+    and re-fitting through centroids, anchored at top and bottom.
+    """
+    spline_points = np.column_stack([spline_x, spline_y, spline_z])
+
+    # Choose evenly spaced sample indices along the spline
+    indices = np.linspace(0, len(spline_points) - 1, num_sections, dtype=int)
+
+    section_points_list = []
+    section_centroids = []
+
+    for idx in indices:
+        section_points = get_cross_section_points(mesh, spline_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            centroid = section_points.mean(axis=0)
+            section_centroids.append(centroid)
+
+    centroids = np.array(section_centroids)
+
+    # Insert top and bottom anchors at the ends
+    centroids_with_anchors = np.vstack([centre_top, centroids, centre_bottom])
+
+    # Polyline trace before smoothing
+    polyline_trace = go.Scatter3d(
+        x=centroids_with_anchors[:,0], y=centroids_with_anchors[:,1], z=centroids_with_anchors[:,2],
+        mode='lines+markers', line=dict(color='orange', width=4), name='Centroid Polyline + Anchors'
+    )
+
+    # Smooth using Savitzky-Golay (open, no wrap)
+    window_length = 7 if len(centroids_with_anchors) > 7 else max(3, len(centroids_with_anchors)//2*2+1)
+    smoothed = np.column_stack([
+        savgol_filter(centroids_with_anchors[:,i], window_length=window_length, polyorder=2, mode='interp')
+        for i in range(3)
+    ])
+
+    smoothed_trace = go.Scatter3d(
+        x=smoothed[:,0], y=smoothed[:,1], z=smoothed[:,2],
+        mode='lines', line=dict(color='red', width=6), name='Smoothed Guard Cell Line'
+    )
+
+    # Anchor markers
+    anchor_trace = go.Scatter3d(
+        x=[centre_top[0], centre_bottom[0]],
+        y=[centre_top[1], centre_bottom[1]],
+        z=[centre_top[2], centre_bottom[2]],
+        mode='markers+text',
+        marker=dict(size=8, color='black'),
+        text=['Top','Bottom'], textposition='top center',
+        name='Anchors'
+    )
+
+    return polyline_trace, smoothed_trace, anchor_trace, smoothed
+
+
+def get_barycentric_coords(point, face_vertices):
+    # face_vertices: (3, 3) array
+    v0 = face_vertices[1] - face_vertices[0]
+    v1 = face_vertices[2] - face_vertices[0]
+    v2 = point - face_vertices[0]
+    d00 = np.dot(v0, v0)
+    d01 = np.dot(v0, v1)
+    d11 = np.dot(v1, v1)
+    d20 = np.dot(v2, v0)
+    d21 = np.dot(v2, v1)
+    denom = d00 * d11 - d01 * d01
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    return np.array([u, v, w])
+
+def barycentric_to_point(face_vertices, bary):
+    return bary[0]*face_vertices[0] + bary[1]*face_vertices[1] + bary[2]*face_vertices[2]
+
+def get_regularly_spaced_cross_sections(mesh, smoothed, centre_top, centre_bottom, num_sections=30):
+    """
+    Given a mesh and a smoothed centreline (Nx3 array), return
+    cross section points at regularly spaced intervals along the centreline,
+    avoiding points too close to the top and bottom wall centroids.
+    """
+    smoothed_x = smoothed[:,0]
+    smoothed_y = smoothed[:,1]
+    smoothed_z = smoothed[:,2]
+    smoothed_points = np.column_stack([smoothed_x, smoothed_y, smoothed_z])
+
+    dists = np.linalg.norm(np.diff(smoothed_points, axis=0), axis=1)
+    arc_length = np.concatenate([[0], np.cumsum(dists)])
+    total_length = arc_length[-1]
+    target_lengths = np.linspace(0, total_length, num_sections + 4)
+
+    # Interpolate to get regularly spaced points
+    interp_points = np.empty((len(target_lengths), 3))
+    for i in range(3):
+        interp_points[:, i] = np.interp(target_lengths, arc_length, smoothed_points[:, i])
+
+    smoothed_points = interp_points
+
+    # Find indices of closest points to top and bottom wall centroids
+    top_idx = np.argmin(np.linalg.norm(smoothed_points - centre_top, axis=1))
+    bottom_idx = np.argmin(np.linalg.norm(smoothed_points - centre_bottom, axis=1))
+
+    # Sample num_sections + 4 indices evenly along the centreline (to allow for ±1 removal at each wall)
+    indices = np.linspace(0, len(smoothed_points) - 1, num_sections + 4, dtype=int)
+
+    def remove_near_wall(idx, indices, window=1):
+        # Find the closest index in indices to idx, then remove ±window around it
+        closest = np.argmin(np.abs(indices - idx))
+        to_remove = [(closest + offset) % len(indices) for offset in range(-window, window+1)]
+        return set(to_remove)
+
+    # Indices to remove: ±1 around top and bottom wall
+    remove_set = remove_near_wall(top_idx, indices, window=1) | remove_near_wall(bottom_idx, indices, window=1)
+
+    keep_mask = np.ones(len(indices), dtype=bool)
+    for i in remove_set:
+        keep_mask[i] = False
+
+    final_indices = indices[keep_mask]
+
+    section_points_list = []
+    section_traces = []
+    section_bary_data = []
+
+    for idx in final_indices:
+        section_points = get_cross_section_points(mesh, smoothed_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            section_trace = go.Scatter3d(
+                x=section_points[:, 0],
+                y=section_points[:, 1],
+                z=section_points[:, 2],
+                mode='markers',
+                marker=dict(size=5, color='green'),
+                name=f'Section {idx}'
+            )
+            section_traces.append(section_trace)
+
+            # Compute barycentric data for each point in this section
+            section_bary = []
+            for pt in section_points:
+                _, _, face_idx = mesh.nearest.on_surface([pt])
+                face_idx = face_idx[0]
+                face_vertices = mesh.vertices[mesh.faces[face_idx]]
+                bary = get_barycentric_coords(pt, face_vertices)
+                section_bary.append((face_idx, bary))
+            section_bary_data.append(section_bary)
+
+    return section_points_list, section_traces, section_bary_data
+
+def get_regularly_spaced_cross_sections_with_normals(mesh, smoothed, centre_top, centre_bottom, num_sections=30):
+    """
+    Given a mesh and a smoothed centreline (Nx3 array), return
+    cross section points at regularly spaced intervals along the centreline,
+    avoiding points too close to the top and bottom wall centroids.
+    """
+    smoothed_x = smoothed[:,0]
+    smoothed_y = smoothed[:,1]
+    smoothed_z = smoothed[:,2]
+    smoothed_points = np.column_stack([smoothed_x, smoothed_y, smoothed_z])
+
+    dists = np.linalg.norm(np.diff(smoothed_points, axis=0), axis=1)
+    arc_length = np.concatenate([[0], np.cumsum(dists)])
+    total_length = arc_length[-1]
+    target_lengths = np.linspace(0, total_length, num_sections + 4)
+
+    # Interpolate to get regularly spaced points
+    interp_points = np.empty((len(target_lengths), 3))
+    for i in range(3):
+        interp_points[:, i] = np.interp(target_lengths, arc_length, smoothed_points[:, i])
+
+    smoothed_points = interp_points
+
+    # Find indices of closest points to top and bottom wall centroids
+    top_idx = np.argmin(np.linalg.norm(smoothed_points - centre_top, axis=1))
+    bottom_idx = np.argmin(np.linalg.norm(smoothed_points - centre_bottom, axis=1))
+
+    # Sample num_sections + 4 indices evenly along the centreline (to allow for ±1 removal at each wall)
+    indices = np.linspace(0, len(smoothed_points) - 1, num_sections + 4, dtype=int)
+
+    def remove_near_wall(idx, indices, window=1):
+        # Find the closest index in indices to idx, then remove ±window around it
+        closest = np.argmin(np.abs(indices - idx))
+        to_remove = [(closest + offset) % len(indices) for offset in range(-window, window+1)]
+        return set(to_remove)
+
+    # Indices to remove: ±1 around top and bottom wall
+    remove_set = remove_near_wall(top_idx, indices, window=1) | remove_near_wall(bottom_idx, indices, window=1)
+
+    keep_mask = np.ones(len(indices), dtype=bool)
+    for i in remove_set:
+        keep_mask[i] = False
+
+    final_indices = indices[keep_mask]
+
+    section_points_list = []
+    section_traces = []
+    section_bary_data = []
+
+    for idx in final_indices:
+        section_points, normals, midpoints = get_cross_section_points_with_normals(mesh, smoothed_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            section_trace = go.Scatter3d(
+                x=section_points[:, 0],
+                y=section_points[:, 1],
+                z=section_points[:, 2],
+                mode='markers',
+                marker=dict(size=5, color='green'),
+                name=f'Section {idx}'
+            )
+            section_traces.append(section_trace)
+
+            # Compute barycentric data for each point in this section
+            section_bary = []
+            for pt in section_points:
+                _, _, face_idx = mesh.nearest.on_surface([pt])
+                face_idx = face_idx[0]
+                face_vertices = mesh.vertices[mesh.faces[face_idx]]
+                bary = get_barycentric_coords(pt, face_vertices)
+                section_bary.append((face_idx, bary))
+            section_bary_data.append(section_bary)
+
+    return section_points_list, section_traces, section_bary_data, normals
+
+def split_mesh_at_wall_vertices(mesh, wall_vertices, left_centroid, right_centroid):
+    """
+    Split mesh into left and right guard cells using the wall vertices,
+    without using a slicing plane.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    wall_vertices : (M,) indices of the wall
+    left_centroid, right_centroid : (3,) np.arrays
+        Approximate centers of left and right guard cells
+
+    Returns
+    -------
+    left_mesh, right_mesh : trimesh.Trimesh
+    """
+    vertices = mesh.vertices
+
+    # Compute distance of all vertices to left/right centroid
+    dist_left = np.linalg.norm(vertices - left_centroid, axis=1)
+    dist_right = np.linalg.norm(vertices - right_centroid, axis=1)
+
+    # Assign vertices to the closer guard cell
+    left_mask = dist_left < dist_right
+    right_mask = dist_right <= dist_left
+
+    # Include wall in both
+    left_mask[wall_vertices] = True
+    right_mask[wall_vertices] = True
+
+    # Filter faces
+    left_faces_mask = np.all(left_mask[mesh.faces], axis=1)
+    right_faces_mask = np.all(right_mask[mesh.faces], axis=1)
+
+    left_faces = mesh.faces[left_faces_mask]
+    right_faces = mesh.faces[right_faces_mask]
+
+    # Remap vertex indices
+    def remap_vertices(mask, faces):
+        old_to_new = np.full(len(vertices), -1, dtype=int)
+        old_to_new[np.where(mask)[0]] = np.arange(np.sum(mask))
+        return trimesh.Trimesh(vertices=vertices[mask], faces=old_to_new[faces], process=True)
+
+    left_mesh = remap_vertices(left_mask, left_faces)
+    right_mesh = remap_vertices(right_mask, right_faces)
+
+    return left_mesh, right_mesh
+
+def refine_centre_line_with_three_anchors(
+    mesh,
+    spline_x,
+    spline_y,
+    spline_z,
+    centre_top,
+    centre_bottom,
+    side_section_centre,
+    num_sections=40
+):
+    """
+    Refine the centreline using only three anchor points (top, bottom, one side),
+    passing through those anchors and refined by cross-section centroids.
+    The curve will pass through the three anchors and be smoothed by cross-section centroids.
+    The result is an open curve (not a loop).
+    """
+    import numpy as np
+    from scipy.interpolate import splprep, splev
+    import plotly.graph_objects as go
+
+    # Build cross-section centroids along the initial spline
+    spline_points = np.column_stack([spline_x, spline_y, spline_z])
+    indices = np.linspace(0, len(spline_points) - 1, num_sections, dtype=int)
+    section_points_list = []
+    section_centroids = []
+    for idx in indices:
+        section_points = get_cross_section_points(mesh, spline_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            centroid = section_points.mean(axis=0)
+            section_centroids.append(centroid)
+    centroids = np.array(section_centroids)
+
+    # Insert anchors at start, side, end (top, side, bottom)
+    anchors = [centre_top, side_section_centre, centre_bottom]
+    # Find closest centroid to side anchor
+    side_idx = np.argmin(np.linalg.norm(centroids - side_section_centre, axis=1))
+    # Build ordered points: top anchor, centroids up to side, side anchor, centroids after side, bottom anchor
+    ordered_points = [centre_top]
+    if side_idx > 0:
+        ordered_points.extend(centroids[1:side_idx])
+    ordered_points.append(side_section_centre)
+    if side_idx < len(centroids) - 1:
+        ordered_points.extend(centroids[side_idx+1:-1])
+    ordered_points.append(centre_bottom)
+    ordered_points = np.array(ordered_points)
+
+    # Interpolate a smooth, non-periodic spline through these points
+    tck, u = splprep(ordered_points.T, s=0, per=0)
+    u_fine = np.linspace(0, 1, num_sections)
+    smoothed = np.array(splev(u_fine, tck)).T
+
+    # Polyline trace (unsmoothed, just anchor+centroid points)
+    polyline_trace = go.Scatter3d(
+        x=ordered_points[:,0], y=ordered_points[:,1], z=ordered_points[:,2],
+        mode='lines+markers', line=dict(color='orange', width=4), name='Centroid Polyline + Anchors (3)'
+    )
+    # Smoothed spline trace
+    smoothed_trace = go.Scatter3d(
+        x=smoothed[:,0], y=smoothed[:,1], z=smoothed[:,2],
+        mode='lines+markers', line=dict(color='red', width=6), name='Smoothed Centreline (3 anchors)'
+    )
+    # Anchor trace
+    anchor_trace = go.Scatter3d(
+        x=[a[0] for a in anchors], y=[a[1] for a in anchors], z=[a[2] for a in anchors],
+        mode='markers+text', marker=dict(size=8, color='black'), name='Anchors (3)',
+        text=['Top','Side','Bottom'], textposition='top center'
+    )
+    return polyline_trace, smoothed_trace, anchor_trace, smoothed
+
+
+
+
+
+
+
+
+
+
