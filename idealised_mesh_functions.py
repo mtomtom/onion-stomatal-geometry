@@ -187,14 +187,14 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             continue
         
         # Get baseline data (pressure = 0.0) from dataframe
-        baseline_data = df[(df["Mesh ID"] == mesh_id) & (df["Pressure (MPa)"] == 0.0)]
+        baseline_data = df[(df["Mesh ID"] == mesh_id) & (df["Pressure"] == 0.0)]
         
         if baseline_data.empty:
             print(f"No baseline data found for mesh {mesh_id}, skipping...")
             continue
             
         # Extract target parameters from dataframe
-        target_pore_area = baseline_data["Pore Area (um²)"].values[0]
+        target_pore_area = baseline_data["Pore Area"].values[0]
         print(f"Target pore area: {target_pore_area}")
         
         # Handle numpy arrays in the dataframe columns (stored as strings)
