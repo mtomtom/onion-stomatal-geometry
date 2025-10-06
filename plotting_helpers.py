@@ -188,6 +188,76 @@ def plot_sections_3d_plotly(mesh, smoothed_centerline, section_data_3d, base_nam
     fig.write_html(plotly_html_path)
     print(f"Created Plotly 3D HTML: {plotly_html_path}")
 
+def get_plotly_figure_for_app(mesh, centerline_data, section_data_3d, seam_points_for_plot=None):
+    """
+    Generates the Plotly figure object for the main 3D visualization in the Dash app.
+    """
+    import plotly.graph_objects as go
+
+    smoothed_centerline = centerline_data.get('centerline')
+    if smoothed_centerline is None:
+        return go.Figure() # Return empty figure if no centerline
+    smoothed_centerline = np.array(smoothed_centerline)
+
+    plotly_traces = []
+    # Mesh trace
+    plotly_traces.append(go.Mesh3d(
+        x=mesh.vertices[:,0], y=mesh.vertices[:,1], z=mesh.vertices[:,2],
+        i=mesh.faces[:,0], j=mesh.faces[:,1], k=mesh.faces[:,2],
+        opacity=0.6, color='lightgrey', name='Mesh', hoverinfo='none'
+    ))
+    # Centerline trace
+    plotly_traces.append(go.Scatter3d(
+        x=smoothed_centerline[:,0], y=smoothed_centerline[:,1], z=smoothed_centerline[:,2],
+        mode='lines',
+        line=dict(color='black', width=5),
+        name='Centerline'
+    ))
+    # Seam points trace
+    if seam_points_for_plot is not None and len(seam_points_for_plot) > 0:
+        seam_points_np = np.array(seam_points_for_plot)
+        plotly_traces.append(go.Scatter3d(
+            x=seam_points_np[:,0], y=seam_points_np[:,1], z=seam_points_np[:,2],
+            mode='markers', marker=dict(size=3, color='red', symbol='x'),
+            name='Seam'
+        ))
+    
+    # Section traces
+    cmap = matplotlib.colormaps['plasma']
+    if section_data_3d:
+        for i, sd in enumerate(section_data_3d):
+            pts3d = sd.get('points_3d')
+            if pts3d is None or len(pts3d) == 0:
+                continue
+            
+            pts3d = np.array(pts3d)
+            # Close the polygon for a continuous line
+            ordered_3d = np.vstack([pts3d, pts3d[0]])
+            
+            normp = sd['norm_pos']
+            color = cmap(normp)
+            rgba = f'rgba({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)},{color[3]})'
+            
+            plotly_traces.append(go.Scatter3d(
+                x=ordered_3d[:,0], y=ordered_3d[:,1], z=ordered_3d[:,2],
+                mode='lines',
+                line=dict(color=rgba, width=8),
+                name=f'Section {i} (pos {normp:.2f})'
+            ))
+
+    fig = go.Figure(data=plotly_traces)
+    fig.update_layout(
+        title='Interactive 3D View',
+        scene=dict(
+            xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
+    return fig
+
 def create_section_montage(section_points_list, ellipse_points_for_plot_list, 
                            positions, aspect_ratios_ellipse, output_path,
                            original_points_3d_list=None,
