@@ -1,0 +1,66 @@
+{
+	"backtrace" : 1,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_custom_target"
+		],
+		"files" : 
+		[
+			"Installation/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 812,
+				"parent" : 0
+			}
+		]
+	},
+	"id" : "install_FindCGAL::@998f8e79cd38d2de4c5a",
+	"name" : "install_FindCGAL",
+	"paths" : 
+	{
+		"build" : "Installation",
+		"source" : "Installation"
+	},
+	"sourceGroups" : 
+	[
+		{
+			"name" : "",
+			"sourceIndexes" : 
+			[
+				0
+			]
+		},
+		{
+			"name" : "CMake Rules",
+			"sourceIndexes" : 
+			[
+				1
+			]
+		}
+	],
+	"sources" : 
+	[
+		{
+			"backtrace" : 1,
+			"isGenerated" : true,
+			"path" : "/Users/tomkinsm/stomata-air-mattress/build/Installation/CMakeFiles/install_FindCGAL",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 0,
+			"isGenerated" : true,
+			"path" : "/Users/tomkinsm/stomata-air-mattress/build/Installation/CMakeFiles/install_FindCGAL.rule",
+			"sourceGroupIndex" : 1
+		}
+	],
+	"type" : "UTILITY"
+}

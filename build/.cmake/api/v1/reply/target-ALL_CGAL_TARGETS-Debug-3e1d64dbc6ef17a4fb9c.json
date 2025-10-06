@@ -1,0 +1,104 @@
+{
+	"backtrace" : 1,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_custom_target",
+			"add_dependencies",
+			"CGAL_add_subdirectories"
+		],
+		"files" : 
+		[
+			"Installation/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 826,
+				"parent" : 0
+			},
+			{
+				"command" : 2,
+				"file" : 0,
+				"line" : 861,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 837,
+				"parent" : 2
+			},
+			{
+				"command" : 2,
+				"file" : 0,
+				"line" : 862,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 837,
+				"parent" : 4
+			},
+			{
+				"command" : 2,
+				"file" : 0,
+				"line" : 864,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 837,
+				"parent" : 6
+			},
+			{
+				"command" : 2,
+				"file" : 0,
+				"line" : 866,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 837,
+				"parent" : 8
+			}
+		]
+	},
+	"dependencies" : 
+	[
+		{
+			"backtrace" : 3,
+			"id" : "examples::@998f8e79cd38d2de4c5a"
+		},
+		{
+			"backtrace" : 5,
+			"id" : "demos::@998f8e79cd38d2de4c5a"
+		},
+		{
+			"backtrace" : 7,
+			"id" : "tests::@998f8e79cd38d2de4c5a"
+		},
+		{
+			"backtrace" : 9,
+			"id" : "benchmarks::@998f8e79cd38d2de4c5a"
+		}
+	],
+	"id" : "ALL_CGAL_TARGETS::@998f8e79cd38d2de4c5a",
+	"name" : "ALL_CGAL_TARGETS",
+	"paths" : 
+	{
+		"build" : "Installation",
+		"source" : "Installation"
+	},
+	"sources" : [],
+	"type" : "UTILITY"
+}
