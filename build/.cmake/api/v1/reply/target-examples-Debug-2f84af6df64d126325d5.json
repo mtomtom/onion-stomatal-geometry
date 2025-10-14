@@ -1,0 +1,42 @@
+{
+	"backtrace" : 2,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_custom_target",
+			"CGAL_add_subdirectories"
+		],
+		"files" : 
+		[
+			"Installation/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 861,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 836,
+				"parent" : 1
+			}
+		]
+	},
+	"id" : "examples::@998f8e79cd38d2de4c5a",
+	"name" : "examples",
+	"paths" : 
+	{
+		"build" : "Installation",
+		"source" : "Installation"
+	},
+	"sources" : [],
+	"type" : "UTILITY"
+}
