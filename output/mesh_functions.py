@@ -1,15 +1,53 @@
 import numpy as np
 from skimage.draw import polygon
+import importlib
+import cross_section_helpers
+importlib.reload(cross_section_helpers)
 import cross_section_helpers as csh
 import trimesh
 import pandas as pd
 
-def process_mesh(file):
+def get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal_mesh_files):
+    # Find pore area from results files
+    for f in confocal_results_files:
+        file_mesh_id = "_".join(f.stem.split("_")[4:6])
+        if file_mesh_id == mesh_id:
+            pressures = np.round(np.arange(0, 2.1, 0.1), 2)
+            confocal_data = pd.read_csv(f, sep=r'\s+', header=None, names=["Pore Area (um^2)"], engine='python')            
+            confocal_data["Pressure (MPa)"] = pressures
+            pore_area = confocal_data.loc[
+                np.isclose(confocal_data["Pressure (MPa)"], pressure, atol=1e-2),
+                "Pore Area (um^2)"
+            ].values
+            pore_area_val = pore_area[0] if len(pore_area) > 0 else None
+            break
+    else:
+        pore_area_val = None
+
+    # Find volume from mesh files
+    for f in confocal_mesh_files:
+        parts = f.stem.split("_")
+        file_mesh_id = "_".join(parts[2:4])
+        pressure_str = parts[4]
+        try:
+            file_pressure = float(pressure_str)
+        except ValueError:
+            file_pressure = float(pressure_str.split(".")[0] + "." + pressure_str.split(".")[1])
+        if file_mesh_id == mesh_id and np.isclose(file_pressure, pressure, atol=1e-2):
+            mesh = trimesh.load(f)
+            vol = mesh.volume
+            break
+    else:
+        vol = None
+
+    return pore_area_val, vol
+
+def process_mesh(file, confocal_results_files, confocal_mesh_files):
     mesh_id = "_".join(file.stem.split("_")[2:4])
     cross_section_type = "confocal"
     pressure = float(file.stem.split("_")[-1])
     pressure = round(pressure, 2)
-    section_points_right, section_points_left, section_traces_left, section_traces_right = csh.analyze_stomata_mesh(
+    section_points_right, section_points_left, section_traces_left, section_traces_right, [spline_x, spline_y, spline_z] = csh.analyze_stomata_mesh(
         file, num_sections=20, n_points=40, visualize=False
     )
     mid_index = len(section_points_left) // 2
@@ -22,6 +60,7 @@ def process_mesh(file):
     right_midsection = section_points_right[mid_index]
     lr, major_length_l, minor_length_l = csh.calculate_cross_section_aspect_ratios_and_lengths(left_midsection)
     rr, major_length_r, minor_length_r = csh.calculate_cross_section_aspect_ratios_and_lengths(right_midsection)
+    pore_area, volume = get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal_mesh_files)
     return {
         "Mesh ID": mesh_id,
         "Cross-section type": cross_section_type,
@@ -38,6 +77,9 @@ def process_mesh(file):
         "Major length right": major_length_r[0],
         "Minor length left": minor_length_l[0],
         "Minor length right": minor_length_r[0],
+        'Pore Area' :pore_area, 
+        'Volume': volume,
+        'Spline length': csh.curve_length(spline_x, spline_y, spline_z)
     }
 
 def process_idealised_mesh(file):
@@ -109,7 +151,7 @@ def fast_pore_area(vertices, faces, step=0.01):
     pore_area = pore_pix * step * step
     return pore_area
 
-def get_pore_area_and_volume(df, results_file, mesh_files, pressures):
+def get_pore_area_and_volume_old(df, results_file, mesh_files, pressures):
     mesh_id = "_".join(results_file.stem.split("_")[4:6])
     confocal_data = pd.read_csv(results_file, sep=r'\s+', header=None, names=["Pore Area"])
     confocal_data["Pressure"] = pressures

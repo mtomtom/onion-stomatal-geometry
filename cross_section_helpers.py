@@ -1,21 +1,117 @@
+def get_regularly_spaced_cross_sections_batch(mesh, smoothed, centre_top, centre_bottom, num_sections=30):
+    """
+    Optimized version: Given a mesh and a smoothed centreline (Nx3 array), return
+    cross section points at regularly spaced intervals along the centreline,
+    avoiding points too close to the top and bottom wall centroids.
+    Uses batched nearest face search for barycentric data.
+    """
+    import numpy as np
+    smoothed_x = smoothed[:,0]
+    smoothed_y = smoothed[:,1]
+    smoothed_z = smoothed[:,2]
+    smoothed_points = np.column_stack([smoothed_x, smoothed_y, smoothed_z])
+
+    dists = np.linalg.norm(np.diff(smoothed_points, axis=0), axis=1)
+    arc_length = np.concatenate([[0], np.cumsum(dists)])
+    total_length = arc_length[-1]
+    target_lengths = np.linspace(0, total_length, num_sections + 4)
+
+    # Interpolate to get regularly spaced points
+    interp_points = np.empty((len(target_lengths), 3))
+    for i in range(3):
+        interp_points[:, i] = np.interp(target_lengths, arc_length, smoothed_points[:, i])
+
+    smoothed_points = interp_points
+
+    # Find indices of closest points to top and bottom wall centroids
+    top_idx = np.argmin(np.linalg.norm(smoothed_points - centre_top, axis=1))
+    bottom_idx = np.argmin(np.linalg.norm(smoothed_points - centre_bottom, axis=1))
+
+    # Sample num_sections + 4 indices evenly along the centreline (to allow for ±1 removal at each wall)
+    indices = np.linspace(0, len(smoothed_points) - 1, num_sections + 4, dtype=int)
+
+    def remove_near_wall(idx, indices, window=1):
+        closest = np.argmin(np.abs(indices - idx))
+        to_remove = [(closest + offset) % len(indices) for offset in range(-window, window+1)]
+        return set(to_remove)
+
+    remove_set = remove_near_wall(top_idx, indices, window=1) | remove_near_wall(bottom_idx, indices, window=1)
+
+    keep_mask = np.ones(len(indices), dtype=bool)
+    for i in remove_set:
+        keep_mask[i] = False
+
+    final_indices = indices[keep_mask]
+
+    section_points_list = []
+    section_traces = []
+    section_bary_data = []
+
+    # Collect all section points for batch nearest search
+    all_pts = []
+    section_lengths = []
+    for idx in final_indices:
+        section_points = get_cross_section_points(mesh, smoothed_points, [idx])
+        if section_points and section_points[0] is not None:
+            section_points = section_points[0]
+            section_points_list.append(section_points)
+            section_lengths.append(len(section_points))
+            section_trace = go.Scatter3d(
+                x=section_points[:, 0],
+                y=section_points[:, 1],
+                z=section_points[:, 2],
+                mode='markers',
+                marker=dict(size=5, color='green'),
+                name=f'Section {idx}'
+            )
+            section_traces.append(section_trace)
+            all_pts.append(section_points)
+
+    if len(all_pts) > 0:
+        all_pts_flat = np.vstack(all_pts)
+        _, _, face_indices = mesh.nearest.on_surface(all_pts_flat)
+        # Split face_indices for each section
+        split_indices = np.split(face_indices, np.cumsum(section_lengths)[:-1])
+        for section, face_idx_list in zip(section_points_list, split_indices):
+            section_bary = []
+            for pt, face_idx in zip(section, face_idx_list):
+                face_vertices = mesh.vertices[mesh.faces[face_idx]]
+                bary = get_barycentric_coords(pt, face_vertices)
+                section_bary.append((face_idx, bary))
+            section_bary_data.append(section_bary)
+    else:
+        section_bary_data = [[] for _ in section_points_list]
+
+    return section_points_list, section_traces, section_bary_data
 from sklearn.cluster import KMeans
 from scipy.spatial import ConvexHull
 from sklearn.decomposition import PCA
 from scipy.interpolate import CubicSpline
 from scipy.signal import savgol_filter
+import time
+
+def curve_length(x, y, z):
+    # Stack coordinates into (N, 3) array
+    points = np.column_stack((x, y, z))
+    # Compute distances between consecutive points
+    diffs = np.diff(points, axis=0)
+    segment_lengths = np.linalg.norm(diffs, axis=1)
+    # Sum to get total length
+    return segment_lengths.sum()
 
 def analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=False):
     ## Load in the mesh
-    mesh = trimesh.load(mesh_path)
-
+    mesh = trimesh.load(mesh_path, process=False)
     ## Get the wall vertices
     wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=0.2)
+
 
     centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace = get_top_bottom_wall_centres(mesh, wall_vertices)
 
     midpoint, traces, section_points, local_axes = get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom)
 
     ## Label the left and right cross sections
+
     left_section, right_section, left_section_centre, right_section_centre, left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace = get_left_right_midsections(section_points, midpoint, local_axes)
 
     ## The radius of the circles to place at the top and bottom walls is taken from the radius of the midsections
@@ -43,22 +139,19 @@ def analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=Fals
     ## To simplify analysis, we will split the mesh into left and right guard cells
     left, right = split_mesh_at_wall_vertices(mesh, wall_vertices, left_section_centre, right_section_centre)
     full_trace, left_trace, right_trace, left_half, right_half = get_centreline_estimate_and_split(centre_top, centre_bottom, left_section_centre, right_section_centre, n_points=40)
-    section_points_left, section_traces_left, section_bary_data_left = get_regularly_spaced_cross_sections(left, left_half, centre_top, centre_bottom, num_sections=20)
+    section_points_left, section_traces_left, section_bary_data_left = get_regularly_spaced_cross_sections_batch(left, left_half, centre_top, centre_bottom, num_sections=20)
+    section_points_right, section_traces_right, section_bary_data_right = get_regularly_spaced_cross_sections_batch(right, right_half, centre_top, centre_bottom, num_sections=20)
 
-    section_points_right, section_traces_right, section_bary_data_right = get_regularly_spaced_cross_sections(right, right_half, centre_top, centre_bottom, num_sections=20)
-
-    section_points_left, section_traces_left, section_bary_data_left = get_regularly_spaced_cross_sections(left, left_half, centre_top, centre_bottom, num_sections=20)
-
-    return section_points_right, section_points_left, section_traces_left, section_traces_right
+    return section_points_right, section_points_left, section_traces_left, section_traces_right, [spline_x, spline_y, spline_z]
 
 def load_and_analyze(args):
     pressure, obj_path, mesh_id = args
     filename = f"{obj_path}{mesh_id}_{pressure:.1f}.obj"
     mesh = trimesh.load_mesh(filename)
-    section_points_left, section_points_right = analyze_stomata_mesh(
+    section_points_left, section_points_right, [spline_x, spline_y, spline_z] = analyze_stomata_mesh(
         filename, num_sections=20, n_points=40, visualize=False
     )
-    return mesh, section_points_left, section_points_right
+    return mesh, section_points_left, section_points_right, [spline_x, spline_y, spline_z]
 
 def calculate_cross_section_aspect_ratios_and_lengths(sections_points_list):
     """
@@ -243,7 +336,7 @@ from scipy.spatial import ConvexHull
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
-def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list2, n_cols=5, figsize=(15, 10), filename=None, colors=('k-', 'r-')):
+def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list2, n_cols=5, figsize=(15, 10), filename=None, colors=('k-', 'r-'), align_to_x=True):
     """
     Plot each pair of cross sections (Nx3 arrays) in a grid of 2D subplots, overlaid.
     Projects both sections to the best-fit 2D plane of the first section using PCA.
@@ -255,7 +348,50 @@ def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list
     n_sections = min(len(sections_points_list1), len(sections_points_list2))
     n_rows = int(np.ceil(n_sections / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-    axes = axes.flatten()
+    # Ensure axes is always an array
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([axes])
+    elif n_rows == 1 or n_cols == 1:
+        axes = np.array(axes).flatten()
+    else:
+        axes = axes.flatten()
+
+    # Build a reference PCA basis from a stable section so that the first axis
+    # maps to horizontal (x-axis) consistently across all subplots.
+    pca_ref = None
+    # Prefer a valid mid section from list1; fallback to any valid in list1 then list2
+    def _pick_valid_section(lst):
+        idxs = [i for i, s in enumerate(lst) if s is not None and len(s) >= 3]
+        if not idxs:
+            return None
+        mid = idxs[len(idxs)//2]
+        return np.asarray(lst[mid])
+
+    ref_points = _pick_valid_section(sections_points_list1)
+    if ref_points is None:
+        ref_points = _pick_valid_section(sections_points_list2)
+    if ref_points is not None:
+        pca_ref = PCA(n_components=2).fit(np.asarray(ref_points))
+
+    # Compute a single global rotation so the reference section is level with the x-axis.
+    # This eliminates any consistent tilt relative to the horizontal axis across all subplots.
+    R_global = np.eye(2)
+    if align_to_x and ref_points is not None:
+        try:
+            if pca_ref is not None:
+                ref2d = pca_ref.transform(np.asarray(ref_points))
+            else:
+                p = PCA(n_components=2)
+                ref2d = p.fit_transform(np.asarray(ref_points))
+            ref2d = ref2d - ref2d.mean(axis=0)
+            if ref2d.shape[0] >= 1:
+                idx_far = int(np.argmax(np.linalg.norm(ref2d, axis=1)))
+                vec = ref2d[idx_far]
+                theta0 = np.arctan2(vec[1], vec[0])
+                cth, sth = np.cos(-theta0), np.sin(-theta0)
+                R_global = np.array([[cth, -sth], [sth, cth]])
+        except Exception:
+            R_global = np.eye(2)
 
     for i in range(n_sections):
         section1 = sections_points_list1[i]
@@ -269,53 +405,81 @@ def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list
         # Project both sections using PCA from section1 (if available), else section2
         if section1 is not None and len(section1) >= 3:
             section1 = np.asarray(section1)
-            pca = PCA(n_components=2)
-            section1_2d = pca.fit_transform(section1)
-            # Sort section1 points by angle around centroid
+            # Use global reference PCA basis if available; else fit per-section
+            if pca_ref is not None:
+                section1_2d = pca_ref.transform(section1)
+            else:
+                pca = PCA(n_components=2)
+                section1_2d = pca.fit_transform(section1)
+            # Center at centroid for alignment
             centroid1 = section1_2d.mean(axis=0)
             rel1 = section1_2d - centroid1
+            # Sort by angle around origin (centroid-aligned)
             angles1 = np.arctan2(rel1[:, 1], rel1[:, 0])
             sort_idx1 = np.argsort(angles1)
-            section1_2d_sorted = section1_2d[sort_idx1]
-            section1_2d_sorted = np.vstack([section1_2d_sorted, section1_2d_sorted[0]])
-            ax.plot(section1_2d_sorted[:, 0], section1_2d_sorted[:, 1], colors[0], label='Mesh 1')
+            s1_sorted = rel1[sort_idx1]
+            s1_sorted = np.vstack([s1_sorted, s1_sorted[0]])
+            # Apply a single global rotation so sections are level with the x-axis
+            s1_plot = s1_sorted @ R_global.T
+            ax.plot(s1_plot[:, 0], s1_plot[:, 1], colors[0], label='Mesh 1')
+            # Track radius for symmetric limits
+            rmax = float(np.linalg.norm(s1_plot, axis=1).max())
             if section2 is not None and len(section2) >= 3:
                 section2 = np.asarray(section2)
-                section2_2d = pca.transform(section2)
+                if pca_ref is not None:
+                    section2_2d = pca_ref.transform(section2)
+                else:
+                    section2_2d = pca.transform(section2)
                 centroid2 = section2_2d.mean(axis=0)
                 rel2 = section2_2d - centroid2
                 angles2 = np.arctan2(rel2[:, 1], rel2[:, 0])
                 sort_idx2 = np.argsort(angles2)
-                section2_2d_sorted = section2_2d[sort_idx2]
-                section2_2d_sorted = np.vstack([section2_2d_sorted, section2_2d_sorted[0]])
-                ax.plot(section2_2d_sorted[:, 0], section2_2d_sorted[:, 1], colors[1], label='Mesh 2')
+                s2_sorted = rel2[sort_idx2]
+                s2_sorted = np.vstack([s2_sorted, s2_sorted[0]])
+                s2_plot = s2_sorted @ R_global.T
+                ax.plot(s2_plot[:, 0], s2_plot[:, 1], colors[1], label='Mesh 2')
+                rmax = max(rmax, float(np.linalg.norm(s2_plot, axis=1).max()))
+            # Set symmetric limits about origin for better overlay alignment
+            if np.isfinite(rmax) and rmax > 0:
+                ax.set_xlim(-rmax, rmax)
+                ax.set_ylim(-rmax, rmax)
         elif section2 is not None and len(section2) >= 3:
             section2 = np.asarray(section2)
-            pca = PCA(n_components=2)
-            section2_2d = pca.fit_transform(section2)
+            if pca_ref is not None:
+                section2_2d = pca_ref.transform(section2)
+            else:
+                pca = PCA(n_components=2)
+                section2_2d = pca.fit_transform(section2)
             centroid2 = section2_2d.mean(axis=0)
             rel2 = section2_2d - centroid2
             angles2 = np.arctan2(rel2[:, 1], rel2[:, 0])
             sort_idx2 = np.argsort(angles2)
-            section2_2d_sorted = section2_2d[sort_idx2]
-            section2_2d_sorted = np.vstack([section2_2d_sorted, section2_2d_sorted[0]])
-            ax.plot(section2_2d_sorted[:, 0], section2_2d_sorted[:, 1], colors[1], label='Mesh 2')
+            s2_sorted = rel2[sort_idx2]
+            s2_sorted = np.vstack([s2_sorted, s2_sorted[0]])
+            s2_plot = s2_sorted @ R_global.T
+            ax.plot(s2_plot[:, 0], s2_plot[:, 1], colors[1], label='Mesh 2')
+            rmax = float(np.linalg.norm(s2_plot, axis=1).max())
+            if np.isfinite(rmax) and rmax > 0:
+                ax.set_xlim(-rmax, rmax)
+                ax.set_ylim(-rmax, rmax)
 
         ax.set_title(f'Section {i+1}')
         ax.axis('equal')
         ax.set_xticks([])
-    mesh_trace = go.Mesh3d(
-        x=mesh.vertices[:, 0],
-        y=mesh.vertices[:, 1],
-        z=mesh.vertices[:, 2],
-        i=mesh.faces[:, 0],
-        j=mesh.faces[:, 1],
-        k=mesh.faces[:, 2],
-        color='lightgray',
-        opacity=0.75,
-        name='Mesh'
-    )
-    return mesh_trace
+        plt.legend()
+        plt.savefig(filename, dpi=300) if filename else None
+    #mesh_trace = go.Mesh3d(
+    #    x=mesh.vertices[:, 0],
+    #    y=mesh.vertices[:, 1],
+    #    z=mesh.vertices[:, 2],
+    #    i=mesh.faces[:, 0],
+    #    j=mesh.faces[:, 1],
+    #    k=mesh.faces[:, 2],
+    #    color='lightgray',
+    #    opacity=0.75,
+    #    name='Mesh'
+    #)
+    #return mesh_trace
 
 ## Define function to visualize the mesh
 
@@ -328,8 +492,8 @@ def visualize_mesh(mesh, extra_details=None, title="Mesh Visualization"):
             i=mesh.faces[:, 0],
             j=mesh.faces[:, 1],
             k=mesh.faces[:, 2],
-            color='lightgray',
-            opacity=0.75,
+            color="#0072B2",
+            opacity=0.65,
             name='Mesh'
         )
     ]
