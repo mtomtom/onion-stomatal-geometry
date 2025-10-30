@@ -42,25 +42,29 @@ def get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal
 
     return pore_area_val, vol
 
-def process_mesh(file, confocal_results_files, confocal_mesh_files):
+def process_mesh(file, confocal_results_files, confocal_mesh_files, mid_area_left_0 = None, mid_area_right_0 = None):
     mesh_id = "_".join(file.stem.split("_")[2:4])
     cross_section_type = "confocal"
     pressure = float(file.stem.split("_")[-1])
     pressure = round(pressure, 2)
-    section_points_right, section_points_left, section_traces_left, section_traces_right, [spline_x, spline_y, spline_z] = csh.analyze_stomata_mesh(
-        file, num_sections=20, n_points=40, visualize=False
-    )
-    mid_index = len(section_points_left) // 2
-    tip_index = -1
-    left_tip = section_points_left[tip_index]
-    right_tip = section_points_right[tip_index]
-    lr_tip, major_length_l_tip, minor_length_l_tip = csh.calculate_cross_section_aspect_ratios_and_lengths(left_tip)
-    rr_tip, major_length_r_tip, minor_length_r_tip = csh.calculate_cross_section_aspect_ratios_and_lengths(right_tip)
-    left_midsection = section_points_left[mid_index]
-    right_midsection = section_points_right[mid_index]
-    lr, major_length_l, minor_length_l = csh.calculate_cross_section_aspect_ratios_and_lengths(left_midsection)
-    rr, major_length_r, minor_length_r = csh.calculate_cross_section_aspect_ratios_and_lengths(right_midsection)
-    pore_area, volume = get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal_mesh_files)
+
+    try:
+        section_points_right, section_points_left, section_traces_left, section_traces_right, [spline_x, spline_y, spline_z] = csh.analyze_stomata_mesh(
+            file, num_sections=20, n_points=40, visualize=False, mid_area_left_0=mid_area_left_0, mid_area_right_0=mid_area_right_0
+        )
+        mid_index = len(section_points_left) // 2
+        tip_index = -1
+        left_tip = section_points_left[tip_index]
+        right_tip = section_points_right[tip_index]
+        lr_tip, major_length_l_tip, minor_length_l_tip = csh.calculate_cross_section_aspect_ratios_and_lengths(left_tip)
+        rr_tip, major_length_r_tip, minor_length_r_tip = csh.calculate_cross_section_aspect_ratios_and_lengths(right_tip)
+        left_midsection = section_points_left[mid_index]
+        right_midsection = section_points_right[mid_index]
+        lr, major_length_l, minor_length_l = csh.calculate_cross_section_aspect_ratios_and_lengths(left_midsection)
+        rr, major_length_r, minor_length_r = csh.calculate_cross_section_aspect_ratios_and_lengths(right_midsection)
+        pore_area, volume = get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal_mesh_files)
+    except Exception as e:
+        print(f"Error processing {mesh_id}: {e}")
     return {
         "Mesh ID": mesh_id,
         "Cross-section type": cross_section_type,
@@ -82,25 +86,66 @@ def process_mesh(file, confocal_results_files, confocal_mesh_files):
         'Spline length': csh.curve_length(spline_x, spline_y, spline_z)
     }
 
-def process_idealised_mesh(file):
+import numpy as np
+import trimesh
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+
+def process_idealised_mesh(file, debug=False):
+    # --- Parse file name metadata ---
     mesh_id = "_".join(file.stem.split("_")[2:4])
     cross_section_type = file.stem.split("_")[4]
     pressure = float(file.stem.split("_")[-1])
     pressure = round(pressure, 2)
 
-    mesh = trimesh.load(file, process=True)
-    x_min, y_min, z_min = mesh.bounds[0]
-    x_max, y_max, z_max = mesh.bounds[1]
-    x_mid = (x_min + x_max) / 2
-    y_mid = (y_min + y_max) / 2
+    # --- Load mesh ---
+    mesh = trimesh.load(file, process=False)
 
-    tol = 0.4
-    midsection_mask = np.abs(mesh.vertices[:, 0] - x_mid) < tol
+    # --- Slice through midplane perpendicular to Y ---
+    # (so we cut the torus vertically through the hole)
+    y_mid = mesh.bounds[:, 1].mean()
+    tol = 0.2  # thickness of slice
+    midsection_mask = np.abs(mesh.vertices[:, 1] - y_mid) < tol
     midsection_points = mesh.vertices[midsection_mask]
-    one_side_mask = midsection_points[:, 1] > y_mid
-    one_guard_cell_points = midsection_points[one_side_mask]
 
+    if len(midsection_points) == 0:
+        raise ValueError("No vertices found within midsection tolerance.")
+
+    # --- Cluster into two halves (the two guard cells) ---
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=2, random_state=0).fit(midsection_points)
+    labels = kmeans.labels_
+
+    group1 = midsection_points[labels == 0]
+    group2 = midsection_points[labels == 1]
+
+    # Pick upper cell (higher z mean)
+    if group1[:, 2].mean() > group2[:, 2].mean():
+        one_guard_cell_points = group1
+    else:
+        one_guard_cell_points = group2
+
+    # Ensure 3D shape
+    if one_guard_cell_points.ndim != 2 or one_guard_cell_points.shape[1] != 3:
+        raise ValueError(
+            f"Expected shape (N,3), got {one_guard_cell_points.shape}"
+        )
+
+    # --- Calculate aspect ratio ---
     aspect_ratio = csh.calculate_cross_section_aspect_ratios(one_guard_cell_points)
+
+    # --- Optional plot for debugging ---
+    if debug:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 6))
+        plt.scatter(one_guard_cell_points[:, 0], one_guard_cell_points[:, 2], s=10)
+        plt.gca().set_aspect('equal')
+        plt.title("Selected guard cell cross-section (X vs Z)")
+        plt.xlabel("X")
+        plt.ylabel("Z")
+        plt.show()
+
+    # --- Calculate pore area ---
     pore_area = fast_pore_area(mesh.vertices, mesh.faces, step=0.01)
 
     return {
@@ -108,8 +153,10 @@ def process_idealised_mesh(file):
         "Cross-section type": cross_section_type,
         "Pressure (MPa)": pressure,
         "Aspect Ratio": aspect_ratio,
-        "Pore Area (um^2)": pore_area
+        "Pore Area (um^2)": pore_area,
     }
+
+
 
 def fast_pore_area(vertices, faces, step=0.01):
     verts_2d = vertices[:, :2]
@@ -187,3 +234,15 @@ def get_pore_area_and_volume_old(df, results_file, mesh_files, pressures):
         vol = mesh.volume
         df.loc[mask, "Volume"] = vol
     return df
+
+def curve_length(x, y, z):
+    points = np.column_stack((x, y, z))
+    diffs = np.diff(points, axis=0)
+    segment_lengths = np.linalg.norm(diffs, axis=1)
+    return segment_lengths.sum()
+
+def process_mesh_pressure(args):
+    mesh, p , mid_area_left_0, mid_area_right_0 = args
+    test_mesh = f"../Meshes/Onion meshes/pressure_results/Ac_DA_{mesh}_{p:.1f}.obj"
+    _, _, _, _, [spline_x, spline_y, spline_z] = csh.analyze_stomata_mesh(test_mesh, mid_area_left_0 = mid_area_left_0, mid_area_right_0 = mid_area_right_0)
+    return curve_length(spline_x, spline_y, spline_z)

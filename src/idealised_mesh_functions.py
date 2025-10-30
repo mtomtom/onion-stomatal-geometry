@@ -87,12 +87,12 @@ def fast_pore_area(vertices, faces, step=0.01):
     pore_area = pore_pix * step * step
     return pore_area
 
-def get_cross_sections(mesh_list, meshdir_path):
+def get_cross_sections(mesh_list, meshdir_path, mid_area_left_0, mid_area_right_0):
     section_right = []
     section_left = []
     for sm in mesh_list:
         mesh_path = meshdir_path + "Ac_DA_" + sm + ".obj"
-        section_points_right, section_points_left, _, _ = csh.analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=False)
+        section_points_right, section_points_left, _, _ = csh.analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=False, mid_area_left_0=mid_area_left_0, mid_area_right_0=mid_area_right_0)
         section_right.append(section_points_right)
         section_left.append(section_points_left)
     return section_right, section_left
@@ -164,6 +164,7 @@ def get_major_minor_stomata(mesh):
     length_minor = proj_minor.max() - proj_minor.min()
     return length_major, length_minor
 
+
 def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_segments=30, ar = "oval"):
     """
     Create idealised meshes using data from the dataframe.
@@ -179,12 +180,6 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
     for mesh_id in selected_meshes:
         print(f"Processing mesh: {mesh_id}")
         
-        # Load the original mesh for reference
-        try:
-            mesh = trimesh.load(f"../Meshes/Onion_OBJ/Ac_DA_{mesh_id}.obj", force='mesh')
-        except:
-            print(f"Could not load mesh file for {mesh_id}, skipping...")
-            continue
         
         # Get baseline data (pressure = 0.0) from dataframe
         baseline_data = df[(df["Mesh ID"] == mesh_id) & (df["Pressure"] == 0.0)]
@@ -259,22 +254,27 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
         # Iterative refinement to match target pore area
         for iteration in range(10):
             print(f"\nAttempt {iteration+1}:")
-            
-            # Create elliptical torus mesh
+        
+            # Create a scene with both halves — keeps them as separate parts
             try:
-                mesh = gim.create_elliptical_torus(
-                    major_radius_a, major_radius_b, 
-                    minor_radius_a, minor_radius_b, 
+                left_mesh, right_mesh = gim.create_elliptical_torus_with_shared_wall(
+                    major_radius_a, major_radius_b,
+                    minor_radius_a, minor_radius_b,
                     major_segments, minor_segments
                 )
+
+                # Scene keeps both halves separate (no merge)
+                scene = trimesh.Scene({'left': left_mesh, 'right': right_mesh})
+
             except Exception as e:
                 print(f"Error creating mesh: {e}")
                 break
-                
-            # Export the mesh for inspection
-            mesh_filename = f'idealised_attempt_{mesh_id}_{iteration+1}.ply'
-            mesh.export(mesh_filename)
-            
+
+            # --- Export the newly created scene for inspection ---
+            mesh_filename = f'idealised_attempt_{mesh_id}_{iteration+1}.obj'
+            scene.export(mesh_filename)
+            print(f"Exported scene for inspection: {mesh_filename}")
+
             # Check the pore area
             try:
                 ideal_mesh = trimesh.load(mesh_filename, force='mesh')
@@ -291,10 +291,16 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             # Check if we're close enough
             if abs(diff) < 0.5:
                 print("Pore area within acceptable range. Stopping iterations.")
-                final_filename = f'idealised_final_{mesh_id}_oval.ply'
+                final_filename = f'idealised_final_{mesh_id}_oval.obj'
                 if ar == "circular":
-                    final_filename = f'idealised_final_{mesh_id}_circular.ply'
-                mesh.export(final_filename)
+                    final_filename = f'idealised_final_{mesh_id}_circular.obj'
+
+                ## Reload the mesh as a scene, so we can save the parts
+                #final_scene = trimesh.load(mesh_filename, force='scene')
+                #final_scene.export(final_filename)
+                #print(f"Final mesh saved as: {final_filename}")
+                import shutil
+                shutil.copy(mesh_filename, final_filename)
                 print(f"Final mesh saved as: {final_filename}")
                 break
                 
@@ -330,3 +336,4 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             print("Maximum iterations reached without convergence.")
             
         print(f"Completed processing mesh {mesh_id}\n" + "="*50)
+
