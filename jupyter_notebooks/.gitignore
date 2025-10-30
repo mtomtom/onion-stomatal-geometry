@@ -1,0 +1,10 @@
+# Automatically generated .gitignore
+/*
+!Meshes/
+!Figures/
+!README.md
+!requirements.txt
+!juptyer_notebooks/
+!src/
+!AirMatress_manuscript_rjmAF.docx
+!.gitignore
