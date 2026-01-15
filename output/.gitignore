@@ -1,0 +1,9 @@
+# Automatically generated .gitignore
+/*
+!Meshes/
+!Figures/
+!README.md
+!requirements.txt
+!juptyer_notebooks/
+!src/
+!.gitignore
