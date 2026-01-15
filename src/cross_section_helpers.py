@@ -1,6 +1,7 @@
 ################################################### Imports ###################################################
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from scipy.spatial import ConvexHull
@@ -928,3 +929,94 @@ def calculate_cross_section_areas(sections_points_list):
             area = 0.0
         areas.append(area)
     return areas
+
+################################################## Midsection measurement utilities ###################################################
+
+def measure_cross_section_width_height(section_points):
+    """Return major-axis width and minor-axis height for a single cross section array."""
+    if section_points is None or len(section_points) < 3:
+        return 0.0, 0.0
+
+    _, major_lengths, minor_lengths = calculate_cross_section_aspect_ratios_and_lengths(section_points)
+    width = float(major_lengths[0]) if major_lengths else 0.0
+    height = float(minor_lengths[0]) if minor_lengths else 0.0
+    return width, height
+
+
+def _coerce_mesh_entry(mesh_entry):
+    if isinstance(mesh_entry, trimesh.Trimesh):
+        label = None
+        metadata = getattr(mesh_entry, "metadata", None)
+        if isinstance(metadata, dict):
+            label = metadata.get("file_name") or metadata.get("name")
+        return mesh_entry, label
+
+    mesh_path = Path(mesh_entry)
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Mesh path does not exist: {mesh_entry}")
+    mesh = trimesh.load(mesh_path, process=False)
+    return mesh, str(mesh_path)
+
+
+def _extract_midsections(mesh, dot_thresh=0.2):
+    wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
+    if wall_vertices.size == 0:
+        raise ValueError("Could not identify wall vertices for midsection measurement.")
+
+    centre_top, centre_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_vertices)
+    midpoint, _traces, section_points, local_axes = get_midpoint_cross_section_from_centres(
+        mesh, centre_top, centre_bottom
+    )
+    if section_points is None or len(section_points) < 3:
+        raise ValueError("Midpoint cross section returned insufficient points.")
+
+    left_section, right_section, *_ = get_left_right_midsections(section_points, midpoint, local_axes)
+    return left_section, right_section
+
+
+def batch_midsection_width_height(meshes, guard_cell="both", dot_thresh=0.2):
+    """Measure midsection width/height for an iterable of meshes.
+
+    Parameters
+    ----------
+    meshes : Sequence[Union[str, Path, trimesh.Trimesh]]
+        Paths or loaded meshes to evaluate.
+    guard_cell : {'left', 'right', 'both'}
+        Which guard cell(s) to report. 'both' returns dimensions for each side.
+    dot_thresh : float
+        Threshold passed to wall-vertex finder; tweak if walls are noisy.
+
+    Returns
+    -------
+    list[dict]
+        Each entry contains the mesh label plus requested width/height pairs.
+    """
+
+    guard_cell = guard_cell.lower()
+    if guard_cell not in {"left", "right", "both"}:
+        raise ValueError("guard_cell must be 'left', 'right', or 'both'.")
+
+    results = []
+    for idx, mesh_entry in enumerate(meshes):
+        mesh_obj, label = _coerce_mesh_entry(mesh_entry)
+        entry_label = label or f"in_memory_mesh_{idx}"
+        record = {"mesh": entry_label}
+        try:
+            left_section, right_section = _extract_midsections(mesh_obj, dot_thresh=dot_thresh)
+        except Exception as exc:
+            record["error"] = str(exc)
+            results.append(record)
+            continue
+
+        if guard_cell in ("left", "both"):
+            width, height = measure_cross_section_width_height(left_section)
+            record["left_width"] = width
+            record["left_height"] = height
+        if guard_cell in ("right", "both"):
+            width, height = measure_cross_section_width_height(right_section)
+            record["right_width"] = width
+            record["right_height"] = height
+
+        results.append(record)
+
+    return results

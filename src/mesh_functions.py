@@ -6,6 +6,8 @@ importlib.reload(cross_section_helpers)
 import cross_section_helpers as csh
 import trimesh
 import pandas as pd
+from scipy import ndimage
+from scipy.ndimage import binary_fill_holes
 
 def get_pore_area_and_volume(mesh_id, pressure, confocal_results_files, confocal_mesh_files):
     # Find pore area from results files
@@ -91,12 +93,12 @@ import trimesh
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 
-def process_idealised_mesh(file, debug=False):
+def process_idealised_mesh_old(file, debug=False):
     # --- Parse file name metadata ---
-    mesh_id = "_".join(file.stem.split("_")[2:4])
-    cross_section_type = file.stem.split("_")[4]
-    pressure = float(file.stem.split("_")[-1])
-    pressure = round(pressure, 2)
+    parts = file.stem.split("_")
+    mesh_id = "_".join(parts[3:5])          # '2_6a'
+    cross_section_type = parts[5]           # 'circular'
+    pressure = round(float(parts[-1]), 2)
 
     # --- Load mesh ---
     mesh = trimesh.load(file, process=False)
@@ -156,45 +158,343 @@ def process_idealised_mesh(file, debug=False):
         "Pore Area (um^2)": pore_area,
     }
 
+import numpy as np
+import trimesh
+from sklearn.cluster import MiniBatchKMeans
+
+def process_idealised_mesh(file, debug=False):
+    # --- Parse file name metadata ---
+    parts = file.stem.split("_")
+    mesh_id = "_".join(parts[3:5])          # '2_6a'
+    cross_section_type = parts[5]           # 'circular'
+    pressure = round(float(parts[-1]), 2)   # 0.8
 
 
-def fast_pore_area(vertices, faces, step=0.01):
+    # --- Load mesh ---
+    mesh = trimesh.load(file, process=False)
+
+    # --- Slice through midplane perpendicular to Y ---
+    y_mid = mesh.bounds[:, 1].mean()
+    tol = 0.2  # thickness of slice
+
+    # Efficient slicing using searchsorted
+    y_sorted_idx = np.argsort(mesh.vertices[:,1])
+    y_sorted = mesh.vertices[y_sorted_idx,1]
+    low, high = y_mid - tol, y_mid + tol
+    start = np.searchsorted(y_sorted, low, side='left')
+    end   = np.searchsorted(y_sorted, high, side='right')
+    midsection_points = mesh.vertices[y_sorted_idx[start:end]]
+
+    if len(midsection_points) == 0:
+        raise ValueError("No vertices found within midsection tolerance.")
+
+    # --- Cluster into two halves ---
+    kmeans = MiniBatchKMeans(n_clusters=2, batch_size=100, n_init=1, random_state=0)
+    labels = kmeans.fit_predict(midsection_points)
+
+    group1 = midsection_points[labels == 0]
+    group2 = midsection_points[labels == 1]
+
+    # Pick upper cell (higher z mean)
+    one_guard_cell_points = group1 if group1[:,2].mean() > group2[:,2].mean() else group2
+
+    # Ensure 3D shape
+    if one_guard_cell_points.ndim != 2 or one_guard_cell_points.shape[1] != 3:
+        raise ValueError(f"Expected shape (N,3), got {one_guard_cell_points.shape}")
+
+    # --- Calculate aspect ratio ---
+    aspect_ratio = csh.calculate_cross_section_aspect_ratios(one_guard_cell_points)
+
+    # --- Optional plot for debugging (random subset to speed up) ---
+    if debug:
+        import matplotlib.pyplot as plt
+        subset = one_guard_cell_points
+        if len(one_guard_cell_points) > 2000:
+            idx = np.random.choice(len(one_guard_cell_points), 2000, replace=False)
+            subset = one_guard_cell_points[idx]
+        plt.figure(figsize=(6,6))
+        plt.scatter(subset[:,0], subset[:,2], s=10)
+        plt.gca().set_aspect('equal')
+        plt.title("Selected guard cell cross-section (X vs Z)")
+        plt.xlabel("X")
+        plt.ylabel("Z")
+        plt.show()
+
+    # --- Calculate pore area ---
+    pore_area = pore_area_toroid(mesh)
+
+    return {
+        "Mesh ID": mesh_id,
+        "Cross-section type": cross_section_type,
+        "Pressure (MPa)": pressure,
+        "Aspect Ratio": aspect_ratio,
+        "Pore Area (um^2)": pore_area,
+    }
+
+import numpy as np
+from scipy import ndimage
+from matplotlib.path import Path
+
+import numpy as np
+from scipy.spatial import ConvexHull
+
+def fast_pore_area_fast(mesh_file, step=0.01):
+    """
+    Faster raster-based pore area estimate for planar (x,y) mesh.
+    Uses vectorized rasterization and ndimage filling for speed.
+    """
+    parts = mesh_file.stem.split("_")
+    mesh_id = "_".join(parts[3:5])        
+    cross_section_type = parts[5]      
+    pressure = round(float(parts[-1]), 2)
+
+    mesh = trimesh.load(mesh_file, process=False)
+    vertices = mesh.vertices
+    faces = mesh.faces
     verts_2d = vertices[:, :2]
     bb_min = verts_2d.min(axis=0)
     bb_max = verts_2d.max(axis=0)
-    size = ((bb_max - bb_min) / step).astype(int) + 2
-    raster = np.zeros((size[0], size[1]), dtype=np.uint8)
+    size = np.ceil((bb_max - bb_min) / step).astype(int) + 3
+    raster = np.zeros((size[0], size[1]), dtype=bool)
     origin = bb_min - step
 
-    def to_raster(pt):
-        return ((pt - origin) / step).astype(int)
+    # Convert all vertices to raster once
+    verts_pix = ((verts_2d - origin) / step).astype(int)
 
-    # Rasterize triangles efficiently
+    # Vectorized polygon fill for all triangles
     for tri in faces:
-        tri_2d = verts_2d[tri]
-        rr, cc = polygon(
-            [to_raster(tri_2d[0])[0], to_raster(tri_2d[1])[0], to_raster(tri_2d[2])[0]],
-            [to_raster(tri_2d[0])[1], to_raster(tri_2d[1])[1], to_raster(tri_2d[2])[1]],
-            raster.shape
-        )
+        pts = verts_pix[tri]
+        rr, cc = polygon(pts[:, 0], pts[:, 1], raster.shape)
+        raster[rr, cc] = True
+
+    # Fill holes (flood fill background implicitly)
+    filled = binary_fill_holes(raster)
+
+    # pore = filled XOR original = interior holes
+    pore_mask = filled ^ raster
+
+    pore_area = np.sum(pore_mask) * step * step
+    return {
+        "Mesh ID": mesh_id,
+        "Cross-section type": cross_section_type,
+        "Pressure": pressure,
+        "Pore Area": pore_area,
+    }
+
+def fast_pore_area_fast_ar(mesh_file, step=0.01):
+    """
+    Faster raster-based pore area estimate for planar (x,y) mesh.
+    Uses vectorized rasterization and ndimage filling for speed.
+    Also returns pore aspect ratio (width/height of pore region).
+    """
+    parts = mesh_file.stem.split("_")
+    mesh_id = "_".join(parts[3:5])        
+    cross_section_type = parts[5]      
+    pressure = round(float(parts[-1]), 2)
+
+    mesh = trimesh.load(mesh_file, process=False)
+    vertices = mesh.vertices
+    faces = mesh.faces
+    verts_2d = vertices[:, :2]
+    bb_min = verts_2d.min(axis=0)
+    bb_max = verts_2d.max(axis=0)
+    size = np.ceil((bb_max - bb_min) / step).astype(int) + 3
+    raster = np.zeros((size[0], size[1]), dtype=bool)
+    origin = bb_min - step
+
+    # Convert all vertices to raster once
+    verts_pix = ((verts_2d - origin) / step).astype(int)
+
+    # Vectorized polygon fill for all triangles
+    for tri in faces:
+        pts = verts_pix[tri]
+        rr, cc = polygon(pts[:, 0], pts[:, 1], raster.shape)
+        raster[rr, cc] = True
+
+    # Fill holes (flood fill background implicitly)
+    filled = binary_fill_holes(raster)
+
+    # pore = filled XOR original = interior holes
+    pore_mask = filled ^ raster
+
+    pore_area = np.sum(pore_mask) * step * step
+
+    # --- Aspect ratio calculation ---
+    pore_indices = np.argwhere(pore_mask)
+    if pore_indices.shape[0] > 0:
+        y_coords, x_coords = pore_indices[:, 0], pore_indices[:, 1]
+        width = (x_coords.max() - x_coords.min() + 1) * step
+        height = (y_coords.max() - y_coords.min() + 1) * step
+        aspect_ratio = width / height if height > 0 else float('nan')
+    else:
+        aspect_ratio = float('nan')
+
+    return {
+        "Mesh ID": mesh_id,
+        "Cross-section type": cross_section_type,
+        "Pressure": pressure,
+        "Pore Area": pore_area,
+        "Pore Aspect Ratio": aspect_ratio,
+    }
+
+def cross_section_points_and_aspect(mesh_path, tol=0.5, side="left", visualize=False):
+    """
+    Extract cross-section points for one guard cell from a torus-like mesh.
+    Assumes mesh is centered at (0,0,0) and symmetric along Y and X.
+    
+    Parameters
+    ----------
+    mesh_path : str
+        Path to OBJ mesh.
+    tol : float
+        Half-thickness of slice around Y=0.
+    side : str
+        "left" for x < 0 (default), "right" for x > 0.
+    visualize : bool
+        If True, plots the 2D cross-section.
+    
+    Returns
+    -------
+    points_2D : (N, 2) ndarray
+        Cross-section coordinates in the XZ plane.
+    aspect_ratio : float
+        Width / height of the cross-section.
+    """
+
+    parts = mesh_path.stem.split("_")
+
+    try:
+        mesh_id = "_".join(parts[3:5])          # e.g. "1_2"
+        cross_section_type = parts[5]           # e.g. "circular"
+        pressure = round(float(parts[-1]), 2)   # e.g. 0.0
+    except (IndexError, ValueError):
+        raise ValueError(f"Unexpected filename format: {mesh_path.name}")
+
+    mesh = trimesh.load(mesh_path, process=False)
+    if not isinstance(mesh, trimesh.Trimesh):
+        mesh = mesh.dump(concatenate=True)
+
+    # --- Slice points near the Y midplane ---
+    y_mid = 0.0
+    low, high = y_mid - tol, y_mid + tol
+    mask = (mesh.vertices[:, 1] > low) & (mesh.vertices[:, 1] < high)
+    midsection_points = mesh.vertices[mask]
+
+    if midsection_points.shape[0] == 0:
+        raise ValueError("No vertices found near Y=0 midplane.")
+
+    # --- Take only one half (left or right) ---
+    if side == "left":
+        half_points = midsection_points[midsection_points[:, 0] < 0]
+    elif side == "right":
+        half_points = midsection_points[midsection_points[:, 0] > 0]
+    else:
+        raise ValueError("side must be 'left' or 'right'.")
+
+    if half_points.shape[0] == 0:
+        raise ValueError(f"No vertices found on {side} half.")
+
+    # --- Project to XZ plane ---
+    points_2D = half_points[:, [0, 2]]
+
+    # --- Compute aspect ratio ---
+    min_pt = points_2D.min(axis=0)
+    max_pt = points_2D.max(axis=0)
+    width, height = max_pt - min_pt
+    aspect_ratio = width / height if height > 0 else np.nan
+
+    # --- Optional visualization ---
+    if visualize:
+        plt.figure(figsize=(5, 5))
+        plt.scatter(points_2D[:, 0], points_2D[:, 1], s=2, alpha=0.6)
+        plt.gca().set_aspect("equal")
+        plt.title(f"{side.capitalize()} cross-section (aspect = {aspect_ratio:.3f})")
+        plt.xlabel("X")
+        plt.ylabel("Z")
+        plt.show()
+
+    return {
+            "Mesh ID": mesh_id,
+            "Cross-section type": cross_section_type,
+            "Pressure": pressure,
+            "Cross section": points_2D,
+            "Aspect Ratio": aspect_ratio,
+        }
+
+
+def fast_pore_area_old_old(vertices, faces, step=0.02):
+    """
+    Faster pore area calculation by vectorizing triangle rasterization.
+    """
+    # 1. Take X/Y coordinates
+    verts_2d = vertices[:, :2]
+    bb_min = verts_2d.min(axis=0)
+    bb_max = verts_2d.max(axis=0)
+
+    # 2. Create raster grid
+    size = np.ceil((bb_max - bb_min) / step).astype(int) + 2
+    raster = np.zeros((size[1], size[0]), dtype=np.uint8)
+    origin = bb_min - step
+
+    # 3. Transform vertices to raster coordinates
+    verts_px = ((verts_2d - origin) / step).astype(int)
+
+    # 4. Vectorized triangle rasterization
+    for tri in faces:
+        tri_px = verts_px[tri]
+        # Compute bounding box of the triangle in pixel coordinates
+        xmin = tri_px[:, 0].min()
+        xmax = tri_px[:, 0].max() + 1
+        ymin = tri_px[:, 1].min()
+        ymax = tri_px[:, 1].max() + 1
+
+        # Generate all pixel coordinates in bounding box
+        x_grid, y_grid = np.meshgrid(np.arange(xmin, xmax),
+                                     np.arange(ymin, ymax))
+        pts = np.vstack((x_grid.ravel(), y_grid.ravel())).T
+
+        # Use matplotlib.path to check which points are inside triangle
+        path = Path(tri_px)
+        mask = path.contains_points(pts).reshape(x_grid.shape)
+        raster[y_grid, x_grid] |= mask.astype(np.uint8)
+
+    # 5. Fill holes
+    filled = ndimage.binary_fill_holes(raster)
+
+    # 6. Count pore pixels (holes)
+    pore_pix = np.sum(filled & ~raster)
+
+    # 7. Convert to area
+    pore_area = pore_pix * step * step
+    return pore_area
+
+
+
+def fast_pore_area_old(vertices, faces, step=0.02):
+    """
+    Vectorized and faster pore area calculation.
+    """
+    verts_2d = vertices[:, :2]
+    bb_min = verts_2d.min(axis=0)
+    bb_max = verts_2d.max(axis=0)
+    size = np.ceil((bb_max - bb_min) / step).astype(int) + 2
+    raster = np.zeros((size[1], size[0]), dtype=np.uint8)
+    origin = bb_min - step
+
+    # --- Vectorize coordinate transform ---
+    verts_px = ((verts_2d - origin) / step).astype(int)
+
+    # --- Rasterize all triangles ---
+    # Group into triplets of x/y coords
+    for tri in faces:
+        tri_px = verts_px[tri]
+        rr, cc = polygon(tri_px[:, 1], tri_px[:, 0], raster.shape)
         raster[rr, cc] = 1
 
-    # Flood fill from border (same as before)
-    from collections import deque
-    queue = deque()
-    for i in range(size[0]):
-        queue.append((i, 0))
-        queue.append((i, size[1]-1))
-    for j in range(size[1]):
-        queue.append((0, j))
-        queue.append((size[0]-1, j))
-    while queue:
-        x, y = queue.popleft()
-        if 0 <= x < size[0] and 0 <= y < size[1] and raster[x, y] == 0:
-            raster[x, y] = 2
-            queue.extend([(x-1, y), (x+1, y), (x, y-1), (x, y+1)])
+    # --- Flood fill (use fast C-optimized SciPy) ---
+    filled = ndimage.binary_fill_holes(raster)
+    pore_pix = np.sum(filled & ~raster)
 
-    pore_pix = np.sum(raster == 0)
     pore_area = pore_pix * step * step
     return pore_area
 
@@ -242,7 +542,10 @@ def curve_length(x, y, z):
     return segment_lengths.sum()
 
 def process_mesh_pressure(args):
-    mesh, p , mid_area_left_0, mid_area_right_0 = args
-    test_mesh = f"../Meshes/Onion meshes/pressure_results/Ac_DA_{mesh}_{p:.1f}.obj"
+    mesh, p , mid_area_left_0, mid_area_right_0, stiffening = args
+    if stiffening == "isotropic":
+        test_mesh = f"../Meshes/Onion meshes/pressure_results/Ac_DA_{mesh}_{p:.1f}.obj"
+    if stiffening == "anisotropic":
+        test_mesh = f"../Meshes/Onion meshes anisotropy/pressure_results/Ac_DA_{mesh}_{p:.1f}.obj"
     _, _, _, _, [spline_x, spline_y, spline_z] = csh.analyze_stomata_mesh(test_mesh, mid_area_left_0 = mid_area_left_0, mid_area_right_0 = mid_area_right_0)
     return curve_length(spline_x, spline_y, spline_z)

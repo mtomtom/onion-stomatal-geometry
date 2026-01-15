@@ -1,5 +1,5 @@
-import cross_section_helpers as csh
-import generate_idealised_mesh_new as gim
+import src.cross_section_helpers as csh
+import src.generate_idealised_mesh_new as gim
 import numpy as np
 from skimage.draw import polygon
 import trimesh

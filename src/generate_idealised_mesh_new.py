@@ -10,6 +10,131 @@ import matplotlib.pyplot as plt
 import trimesh
 #import tidy3d
 
+def create_elliptical_torus_with_shared_wall_taper(
+    major_radius_a=2.0,
+    major_radius_b=1.0,
+    minor_radius_a=0.3,
+    minor_radius_b=0.4,
+    major_segments=120,
+    minor_segments=40,
+    wall_thickness=0.0,
+    cap_inset_frac=0.05           # fraction of minor_radius to inset cap centre along normal
+):
+    """
+    Create two half-oval guard cell meshes forming a continuous ring along the y-axis.
+    Each half has tip caps. This version smoothly tapers the cross-section near tips
+    and insets the tip centre to avoid a 90-degree corner.
+    Returns left_mesh, right_mesh (Trimesh objects).
+    """
+    import numpy as np
+    import trimesh
+
+    # top-level parameters
+    ref_major_radius = 2.0
+    base_taper_frac = 0.05
+    base_taper_length_fraction = 0.05
+
+    # inside generate_half
+    
+
+
+    def generate_half(theta_start, theta_end, offset_sign):
+        vertices = []
+        faces = []
+        major_seg = major_segments // 2
+        taper_frac = base_taper_frac * (ref_major_radius / major_radius_a)
+        taper_length_fraction = base_taper_length_fraction * (ref_major_radius / major_radius_a)
+
+        # precompute taper region size in indices
+        taper_len = max(1, int(round(taper_length_fraction * major_seg)))
+        # Construct a taper weight function along i=0..major_seg-1 that is 1.0 in the middle
+        # and down to (1 - taper_frac) at the ends (over taper_len indices).
+        taper_weights = np.ones(major_seg, dtype=float)
+        if taper_len > 0:
+            # linear taper; you can change to cosine for smoother slope
+            for i in range(taper_len):
+                w = (i + 1) / (taper_len + 1)  # 0..1
+                # use cosine ease for smoother derivative
+                ease = 0.5 * (1 - np.cos(np.pi * w))
+                taper_weights[i] = 1.0 - taper_frac * (1 - ease)   # near start -> slightly reduced
+                taper_weights[major_seg - 1 - i] = 1.0 - taper_frac * (1 - ease)
+
+        # Generate vertices with taper applied based on i index
+        normals_at_section = []  # store normal for each section for cap inset
+        for i in range(major_seg):
+            theta = theta_start + i * (theta_end - theta_start) / (major_seg - 1)
+            path_x = major_radius_a * np.sin(theta)   # X vertical in plane
+            path_y = major_radius_b * np.cos(theta)   # Y horizontal in plane
+
+            # Tangent and normal
+            tx = major_radius_a * np.cos(theta)
+            ty = -major_radius_b * np.sin(theta)
+            tangent = np.array([tx, ty, 0.0])
+            tangent /= np.linalg.norm(tangent)
+            normal = np.array([-ty, tx, 0.0])
+            normal /= np.linalg.norm(normal)
+            binormal = np.array([0.0, 0.0, 1.0])
+
+            normals_at_section.append(normal.copy())
+
+            # taper factor for this section
+            taper_scale = taper_weights[i]
+
+            for j in range(minor_segments):
+                phi = j * 2.0 * np.pi / minor_segments
+                local_x = minor_radius_a * np.cos(phi) * taper_scale
+                local_z = minor_radius_b * np.sin(phi)  # don't taper z much; keep thickness
+                vertex = np.array([path_x, path_y, 0.0]) - local_x * normal + local_z * binormal \
+                         + (normal * (wall_thickness / 2.0) * offset_sign)
+                vertices.append(vertex)
+
+        # Generate side faces
+        for i in range(major_seg - 1):
+            for j in range(minor_segments):
+                nj = (j + 1) % minor_segments
+                v1 = i * minor_segments + j
+                v2 = (i + 1) * minor_segments + j
+                v3 = (i + 1) * minor_segments + nj
+                v4 = i * minor_segments + nj
+                faces.append([v1, v2, v3])
+                faces.append([v1, v3, v4])
+
+        # Tip wall at first cross-section (i=0)
+        tip_indices_start = np.arange(0, minor_segments)
+        # compute center as mean of tip indices then inset along local normal
+        center_start_pos = np.mean(np.array(vertices)[tip_indices_start], axis=0)
+        normal_start = normals_at_section[0]
+        cap_inset = cap_inset_frac * minor_radius_a
+        cap_inset_frac_scaled = cap_inset_frac * (ref_major_radius / major_radius_a)
+        cap_inset = cap_inset_frac_scaled * minor_radius_a
+
+        center_start = len(vertices)
+        vertices.append(center_start_pos + normal_start * (-cap_inset))  # inset towards interior
+        for j in range(minor_segments):
+            nj = (j + 1) % minor_segments
+            # ordering chosen to keep face normals consistent (may need flip depending on orientation)
+            faces.append([int(tip_indices_start[j]), int(tip_indices_start[nj]), center_start])
+
+        # Tip wall at last cross-section (i = major_seg - 1)
+        tip_indices_end = np.arange((major_seg - 1) * minor_segments, major_seg * minor_segments)
+        center_end_pos = np.mean(np.array(vertices)[tip_indices_end], axis=0)
+        normal_end = normals_at_section[-1]
+        center_end = len(vertices)
+        vertices.append(center_end_pos + normal_end * (-cap_inset))
+        for j in range(minor_segments):
+            nj = (j + 1) % minor_segments
+            faces.append([int(tip_indices_end[nj]), int(tip_indices_end[j]), center_end])
+
+        mesh = trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces), process=False)
+        mesh.fix_normals()
+        return mesh
+
+    left_mesh = generate_half(0.0, np.pi, offset_sign=-1)
+    right_mesh = generate_half(np.pi, 2.0 * np.pi, offset_sign=1)
+
+    return left_mesh, right_mesh
+
+
 
 def create_elliptical_torus_with_shared_wall(
     major_radius_a=2.0,
