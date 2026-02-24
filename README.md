@@ -1,6 +1,6 @@
-# stomata-air-mattress
+# onion-stomata-geometry
 
-*Cross-sectional shape changes promote stomatal opening in onion (2026)*
+*Guard cell cross-sectional shape changes promote stomatal opening in onion*
 
 Melissa Tomkins, Matthew J. Wilson, Jodie V. Armand, Nathanael Y. H. Tan, Briony Parker, Julie E. Gray, Andrew J. Fleming, Richard J. Morris and Richard S. Smith
 
