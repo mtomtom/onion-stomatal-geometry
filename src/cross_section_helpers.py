@@ -285,7 +285,7 @@ def get_top_bottom_wall_centres(mesh, wall_vertices):
     wall_coords = verts[wall_vertices]
     # Use KMeans clustering to separate into two groups (top and bottom walls)
     if len(wall_coords) >= 2:
-        kmeans = KMeans(n_clusters=2, random_state=0).fit(wall_coords)
+        kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(wall_coords)
         labels = kmeans.labels_
         group1 = wall_coords[labels == 0]
         group2 = wall_coords[labels == 1]

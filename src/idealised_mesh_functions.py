@@ -176,164 +176,168 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
     - minor_segments: Number of segments for minor radius (default: 30)
     """
     import trimesh
+    import tempfile
+    from pathlib import Path
     
     for mesh_id in selected_meshes:
-        print(f"Processing mesh: {mesh_id}")
-        
-        
-        # Get baseline data (pressure = 0.0) from dataframe
-        baseline_data = df[(df["Mesh ID"] == mesh_id) & (df["Pressure"] == 0.0)]
-        
-        if baseline_data.empty:
-            print(f"No baseline data found for mesh {mesh_id}, skipping...")
-            continue
+        ## Create a temporary folder to store the intermediate meshes
+        with tempfile.TemporaryDirectory() as tmpdir:
+            print(f"Processing mesh: {mesh_id}")
             
-        # Extract target parameters from dataframe
-        target_pore_area = baseline_data["Pore Area"].values[0]
-        print(f"Target pore area: {target_pore_area}")
-        
-        # Handle numpy arrays in the dataframe columns (stored as strings)
-        import ast
-        
-        def parse_dataframe_array(value):
-            """Parse string representations of numpy arrays from dataframe"""
-            if isinstance(value, str):
-                # Remove numpy type prefixes and convert to list
-                clean_str = value.replace('np.float64(', '').replace(')', '')
-                if clean_str.startswith('[') and clean_str.endswith(']'):
-                    # It's a list representation
-                    parsed = ast.literal_eval(clean_str)
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        return float(parsed[0])
+            
+            # Get baseline data (pressure = 0.0) from dataframe
+            baseline_data = df[(df["Mesh ID"] == mesh_id) & (df["Pressure"] == 0.0)]
+            
+            if baseline_data.empty:
+                print(f"No baseline data found for mesh {mesh_id}, skipping...")
+                continue
+                
+            # Extract target parameters from dataframe
+            target_pore_area = baseline_data["Pore Area"].values[0]
+            print(f"Target pore area: {target_pore_area}")
+            
+            # Handle numpy arrays in the dataframe columns (stored as strings)
+            import ast
+            
+            def parse_dataframe_array(value):
+                """Parse string representations of numpy arrays from dataframe"""
+                if isinstance(value, str):
+                    # Remove numpy type prefixes and convert to list
+                    clean_str = value.replace('np.float64(', '').replace(')', '')
+                    if clean_str.startswith('[') and clean_str.endswith(']'):
+                        # It's a list representation
+                        parsed = ast.literal_eval(clean_str)
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            return float(parsed[0])
+                        else:
+                            return float(parsed)
                     else:
-                        return float(parsed)
+                        return float(clean_str)
                 else:
-                    return float(clean_str)
-            else:
-                # Handle actual arrays/numbers
-                if hasattr(value, '__len__') and len(value) > 0:
-                    return float(value[0])
-                else:
-                    return float(value)
-        
-        midsection_ar_left = baseline_data["Midsection AR left"].values[0]
-        major_length_left = baseline_data["Measured major length"].values[0]  
-        minor_length_left = baseline_data["Measured minor length"].values[0]
-        
-        # Parse the values correctly
-        target_midsection_aspect_ratio = parse_dataframe_array(midsection_ar_left)
-        target_length = parse_dataframe_array(major_length_left)
-        target_width = parse_dataframe_array(minor_length_left)
-        
-        print(f"Target midsection aspect ratio: {target_midsection_aspect_ratio}")
-        print(f"Target length: {target_length}")
-        print(f"Target width: {target_width}")
-        
-        # Initialize radii - estimate minor radii based on aspect ratio and dimensions
-        # This is an initial guess that will be refined in the iteration loop
-        major_length_left_str = baseline_data["Major length left"].values[0]
-        minor_length_left_str = baseline_data["Minor length left"].values[0]
-
-        if ar == "circular":
-            minor_length_left_str = baseline_data["Major length left"].values[0]
-
-        # Use your parsing function to convert string to float
-        major_length_left = parse_dataframe_array(major_length_left_str)
-        minor_length_left = parse_dataframe_array(minor_length_left_str)
-
-        minor_radius_a = major_length_left / 2
-        minor_radius_b = minor_length_left / 2
-        
-        # Calculate major radii to maintain target dimensions
-        major_radius_a = (target_width - 2 * minor_radius_a) / 2
-        major_radius_b = (target_length - 2 * minor_radius_a) / 2
-        
-        print(f"Initial minor radii: a={minor_radius_a:.4f}, b={minor_radius_b:.4f}")
-        print(f"Initial major radii: a={major_radius_a:.4f}, b={major_radius_b:.4f}")
-        
-        # Iterative refinement to match target pore area
-        for iteration in range(10):
-            print(f"\nAttempt {iteration+1}:")
-        
-            # Create a scene with both halves — keeps them as separate parts
-            try:
-                left_mesh, right_mesh = gim.create_elliptical_torus_with_shared_wall(
-                    major_radius_a, major_radius_b,
-                    minor_radius_a, minor_radius_b,
-                    major_segments, minor_segments
-                )
-
-                # Scene keeps both halves separate (no merge)
-                scene = trimesh.Scene({'left': left_mesh, 'right': right_mesh})
-
-            except Exception as e:
-                print(f"Error creating mesh: {e}")
-                break
-
-            # --- Export the newly created scene for inspection ---
-            mesh_filename = f'idealised_attempt_{mesh_id}_{iteration+1}.obj'
-            scene.export(mesh_filename)
-            print(f"Exported scene for inspection: {mesh_filename}")
-
-            # Check the pore area
-            try:
-                ideal_mesh = trimesh.load(mesh_filename, force='mesh')
-                pore_area = fast_pore_area(ideal_mesh.vertices, ideal_mesh.faces, step=0.01)
-                print(f"Central pore area: {pore_area:.2f}")
-            except Exception as e:
-                print(f"Error calculating pore area: {e}")
-                break
+                    # Handle actual arrays/numbers
+                    if hasattr(value, '__len__') and len(value) > 0:
+                        return float(value[0])
+                    else:
+                        return float(value)
             
-            # Calculate difference from target
-            diff = target_pore_area - pore_area
-            print(f"Difference from target pore area: {diff:.2f}")
+            midsection_ar_left = baseline_data["Midsection AR left"].values[0]
+            major_length_left = baseline_data["Measured major length"].values[0]  
+            minor_length_left = baseline_data["Measured minor length"].values[0]
             
-            # Check if we're close enough
-            if abs(diff) < 0.5:
-                print("Pore area within acceptable range. Stopping iterations.")
-                final_filename = f'idealised_final_{mesh_id}_oval.obj'
-                if ar == "circular":
-                    final_filename = f'idealised_final_{mesh_id}_circular.obj'
+            # Parse the values correctly
+            target_midsection_aspect_ratio = parse_dataframe_array(midsection_ar_left)
+            target_length = parse_dataframe_array(major_length_left)
+            target_width = parse_dataframe_array(minor_length_left)
+            
+            print(f"Target midsection aspect ratio: {target_midsection_aspect_ratio}")
+            print(f"Target length: {target_length}")
+            print(f"Target width: {target_width}")
+            
+            # Initialize radii - estimate minor radii based on aspect ratio and dimensions
+            # This is an initial guess that will be refined in the iteration loop
+            major_length_left_str = baseline_data["Major length left"].values[0]
+            minor_length_left_str = baseline_data["Minor length left"].values[0]
 
-                ## Reload the mesh as a scene, so we can save the parts
-                #final_scene = trimesh.load(mesh_filename, force='scene')
-                #final_scene.export(final_filename)
-                #print(f"Final mesh saved as: {final_filename}")
-                import shutil
-                shutil.copy(mesh_filename, final_filename)
-                print(f"Final mesh saved as: {final_filename}")
-                break
-                
-            # Adjust minor radii to correct pore area
-            adjustment_factor = 0.1 * (diff / target_pore_area)
-            adjustment = adjustment_factor * minor_radius_a
+            if ar == "circular":
+                minor_length_left_str = baseline_data["Major length left"].values[0]
+
+            # Use your parsing function to convert string to float
+            major_length_left = parse_dataframe_array(major_length_left_str)
+            minor_length_left = parse_dataframe_array(minor_length_left_str)
+
+            minor_radius_a = major_length_left / 2
+            minor_radius_b = minor_length_left / 2
             
-            if diff > 0:  # Need larger pore area, reduce minor radii
-                minor_radius_a -= abs(adjustment)
-                minor_radius_b -= abs(adjustment)
-            else:  # Need smaller pore area, increase minor radii
-                minor_radius_a += abs(adjustment)
-                minor_radius_b += abs(adjustment)
-                
-            # Ensure radii don't become negative or too small
-            minor_radius_a = max(minor_radius_a, 0.1)
-            minor_radius_b = max(minor_radius_b, 0.1)
-            
-            print(f"Adjusting minor radii by {adjustment:.4f} to a={minor_radius_a:.4f}, b={minor_radius_b:.4f}")
-            
-            # Recalculate major radii to maintain target dimensions
+            # Calculate major radii to maintain target dimensions
             major_radius_a = (target_width - 2 * minor_radius_a) / 2
             major_radius_b = (target_length - 2 * minor_radius_a) / 2
             
-            # Ensure major radii are positive
-            if major_radius_a <= 0 or major_radius_b <= 0:
-                print("Major radii became negative or zero. Cannot continue with current parameters.")
-                break
+            print(f"Initial minor radii: a={minor_radius_a:.4f}, b={minor_radius_b:.4f}")
+            print(f"Initial major radii: a={major_radius_a:.4f}, b={major_radius_b:.4f}")
+            
+            # Iterative refinement to match target pore area
+            for iteration in range(10):
+                print(f"\nAttempt {iteration+1}:")
+            
+                # Create a scene with both halves — keeps them as separate parts
+                try:
+                    left_mesh, right_mesh = gim.create_elliptical_torus_with_shared_wall(
+                        major_radius_a, major_radius_b,
+                        minor_radius_a, minor_radius_b,
+                        major_segments, minor_segments
+                    )
+
+                    # Scene keeps both halves separate (no merge)
+                    scene = trimesh.Scene({'left': left_mesh, 'right': right_mesh})
+
+                except Exception as e:
+                    print(f"Error creating mesh: {e}")
+                    break
+
+                # --- Export the newly created scene for inspection ---
+                mesh_filename = Path(tmpdir) / f"idealised_attempt_{mesh_id}_{iteration+1}.obj"
+                scene.export(mesh_filename)
+                print(f"Exported scene for inspection: {mesh_filename}")
+
+                # Check the pore area
+                try:
+                    ideal_mesh = trimesh.load(mesh_filename, force='mesh')
+                    pore_area = fast_pore_area(ideal_mesh.vertices, ideal_mesh.faces, step=0.01)
+                    print(f"Central pore area: {pore_area:.2f}")
+                except Exception as e:
+                    print(f"Error calculating pore area: {e}")
+                    break
                 
-            print(f"New major radii: a={major_radius_a:.4f}, b={major_radius_b:.4f}")
-            
-        else:
-            print("Maximum iterations reached without convergence.")
-            
-        print(f"Completed processing mesh {mesh_id}\n" + "="*50)
+                # Calculate difference from target
+                diff = target_pore_area - pore_area
+                print(f"Difference from target pore area: {diff:.2f}")
+                
+                # Check if we're close enough
+                if abs(diff) < 0.5:
+                    print("Pore area within acceptable range. Stopping iterations.")
+                    final_filename = f'../Meshes/Idealised/idealised_final_{mesh_id}_oval.obj'
+                    if ar == "circular":
+                        final_filename = f'../Meshes/Idealised/idealised_final_{mesh_id}_circular.obj'
+
+                    ## Reload the mesh as a scene, so we can save the parts
+                    #final_scene = trimesh.load(mesh_filename, force='scene')
+                    #final_scene.export(final_filename)
+                    #print(f"Final mesh saved as: {final_filename}")
+                    import shutil
+                    shutil.copy(mesh_filename, final_filename)
+                    print(f"Final mesh saved as: {final_filename}")
+                    break
+                    
+                # Adjust minor radii to correct pore area
+                adjustment_factor = 0.1 * (diff / target_pore_area)
+                adjustment = adjustment_factor * minor_radius_a
+                
+                if diff > 0:  # Need larger pore area, reduce minor radii
+                    minor_radius_a -= abs(adjustment)
+                    minor_radius_b -= abs(adjustment)
+                else:  # Need smaller pore area, increase minor radii
+                    minor_radius_a += abs(adjustment)
+                    minor_radius_b += abs(adjustment)
+                    
+                # Ensure radii don't become negative or too small
+                minor_radius_a = max(minor_radius_a, 0.1)
+                minor_radius_b = max(minor_radius_b, 0.1)
+                
+                print(f"Adjusting minor radii by {adjustment:.4f} to a={minor_radius_a:.4f}, b={minor_radius_b:.4f}")
+                
+                # Recalculate major radii to maintain target dimensions
+                major_radius_a = (target_width - 2 * minor_radius_a) / 2
+                major_radius_b = (target_length - 2 * minor_radius_a) / 2
+                
+                # Ensure major radii are positive
+                if major_radius_a <= 0 or major_radius_b <= 0:
+                    print("Major radii became negative or zero. Cannot continue with current parameters.")
+                    break
+                    
+                print(f"New major radii: a={major_radius_a:.4f}, b={major_radius_b:.4f}")
+                
+            else:
+                print("Maximum iterations reached without convergence.")
+                
+            print(f"Completed processing mesh {mesh_id}\n" + "="*50)
 

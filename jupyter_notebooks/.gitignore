@@ -1,0 +1,9 @@
+# Automatically generated .gitignore
+/*
+!Meshes/
+!Figures/
+!README.md
+!requirements.txt
+!jupyter_notebooks/
+!output/src/
+!.gitignore

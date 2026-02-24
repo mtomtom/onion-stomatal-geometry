@@ -115,7 +115,7 @@ def process_idealised_mesh_old(file, debug=False):
 
     # --- Cluster into two halves (the two guard cells) ---
     from sklearn.cluster import KMeans
-    kmeans = KMeans(n_clusters=2, random_state=0).fit(midsection_points)
+    kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(midsection_points)
     labels = kmeans.labels_
 
     group1 = midsection_points[labels == 0]
