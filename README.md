@@ -1,4 +1,4 @@
-# onion-stomata-geometry
+# onion-stomatal-geometry
 
 *Guard cell cross-sectional shape changes promote stomatal opening in onion*
 
