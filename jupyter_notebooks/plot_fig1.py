@@ -71,7 +71,7 @@ def run_plot_fig1(sample_meshes= ["1_2","2_3","3_2"], confocal_df = None, mesh_d
             marker = "o"
             size = 10
             #marker_colour = adjust_lightness(base_colour, 0.45)
-            marker_colour = base_colour,
+            marker_colour = base_colour
             edge_colour = "k"
 
         plt.plot(
