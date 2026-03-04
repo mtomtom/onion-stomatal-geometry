@@ -82,7 +82,7 @@ for mesh in mesh_names:
         outfile = outpath_mesh + mesh + "_" + p + ".obj"
 
         ## Export obj
-        Process.Mesh__System__Export("Stack" + str(stack),outfile,'OBJ','No','Yes')
+        Process.Mesh__System__Export("Stack" + str(stack),outfile,'OBJ','No')
 
     ## Rename pore_area.txt and move it to the correct folder
     shutil.move("pore_area.txt",outpath_area +"pore_area_" + mesh + ".txt")
