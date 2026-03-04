@@ -23,9 +23,6 @@ if not os.path.exists(outpath_area):
     os.makedirs(outpath_area)
 
 selected_meshes = ['1_2', '1_3', '1_4', '1_5', '1_6', '1_8', '2_1', '2_3', '2_6a', '2_7', '3_2', '3_4', '3_6', '3_7']
-selected_meshes = ['1_6','1_8', '2_1', '2_3', '2_6a', '2_7', '3_2', '3_4', '3_6', '3_7']
-
-selected_meshes = ["1_2"]
 
 mesh_names = []
 

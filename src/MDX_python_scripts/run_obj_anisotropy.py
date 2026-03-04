@@ -21,8 +21,6 @@ if not os.path.exists(outpath_area):
     os.makedirs(outpath_area)
 
 mesh_names = ["Ac_DA_1_2", "Ac_DA_1_3", "Ac_DA_1_4", "Ac_DA_1_5", "Ac_DA_1_6", "Ac_DA_1_8", "Ac_DA_2_1", "Ac_DA_2_3", "Ac_DA_2_6a", "Ac_DA_2_7", "Ac_DA_3_2", "Ac_DA_3_4", "Ac_DA_3_6", "Ac_DA_3_7"]
-mesh_names = ["Ac_DA_1_2"]
-
 
 pressure = np.arange(0.0, 2.1, 0.1)
 pressure = [f"{p:.1f}" for p in pressure]
