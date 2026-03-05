@@ -228,6 +228,11 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             target_midsection_aspect_ratio = parse_dataframe_array(midsection_ar_left)
             target_length = parse_dataframe_array(major_length_left)
             target_width = parse_dataframe_array(minor_length_left)
+
+            margin = 0.01 * target_width 
+
+            # Cap the minor radius so it can NEVER overlap the center
+            max_allowable_minor_radius = (target_width / 2) - margin
             
             print(f"Target midsection aspect ratio: {target_midsection_aspect_ratio}")
             print(f"Target length: {target_length}")
@@ -247,6 +252,9 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
 
             minor_radius_a = major_length_left / 2
             minor_radius_b = minor_length_left / 2
+
+            minor_radius_a = min(minor_radius_a, max_allowable_minor_radius)
+            minor_radius_b = min(minor_radius_b, max_allowable_minor_radius)
             
             # Calculate major radii to maintain target dimensions
             major_radius_a = (target_width - 2 * minor_radius_a) / 2
@@ -320,8 +328,10 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
                     minor_radius_b += abs(adjustment)
                     
                 # Ensure radii don't become negative or too small
-                minor_radius_a = max(minor_radius_a, 0.1)
-                minor_radius_b = max(minor_radius_b, 0.1)
+                #minor_radius_a = max(minor_radius_a, 0.1)
+                #minor_radius_b = max(minor_radius_b, 0.1)
+                minor_radius_a = min(minor_radius_a, max_allowable_minor_radius)
+                minor_radius_b = min(minor_radius_b, max_allowable_minor_radius)
                 
                 print(f"Adjusting minor radii by {adjustment:.4f} to a={minor_radius_a:.4f}, b={minor_radius_b:.4f}")
                 

@@ -221,7 +221,7 @@ def process_idealised_mesh(file, debug=False):
         plt.show()
 
     # --- Calculate pore area ---
-    pore_area = pore_area_toroid(mesh)
+    pore_area = fast_pore_area_fast(mesh, step=0.01)
 
     return {
         "Mesh ID": mesh_id,
@@ -238,17 +238,24 @@ from matplotlib.path import Path
 import numpy as np
 from scipy.spatial import ConvexHull
 
-def fast_pore_area_fast(mesh_file, step=0.01):
+def fast_pore_area_fast(mesh, step=0.01):
     """
     Faster raster-based pore area estimate for planar (x,y) mesh.
     Uses vectorized rasterization and ndimage filling for speed.
+    No file I/O overhead—mesh object must be pre-loaded.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Loaded mesh object
+    step : float
+        Rasterization step size (default 0.01)
+        
+    Returns
+    -------
+    float
+        Pore area in mesh units squared
     """
-    parts = mesh_file.stem.split("_")
-    mesh_id = "_".join(parts[3:5])        
-    cross_section_type = parts[5]      
-    pressure = round(float(parts[-1]), 2)
-
-    mesh = trimesh.load(mesh_file, process=False)
     vertices = mesh.vertices
     faces = mesh.faces
     verts_2d = vertices[:, :2]
@@ -274,25 +281,26 @@ def fast_pore_area_fast(mesh_file, step=0.01):
     pore_mask = filled ^ raster
 
     pore_area = np.sum(pore_mask) * step * step
-    return {
-        "Mesh ID": mesh_id,
-        "Cross-section type": cross_section_type,
-        "Pressure": pressure,
-        "Pore Area": pore_area,
-    }
+    return pore_area
 
-def fast_pore_area_fast_ar(mesh_file, step=0.01):
+def fast_pore_area_fast_ar(mesh, step=0.01):
     """
-    Faster raster-based pore area estimate for planar (x,y) mesh.
+    Faster raster-based pore area estimate with aspect ratio for planar (x,y) mesh.
     Uses vectorized rasterization and ndimage filling for speed.
-    Also returns pore aspect ratio (width/height of pore region).
+    No file I/O overhead—mesh object must be pre-loaded.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Loaded mesh object
+    step : float
+        Rasterization step size (default 0.01)
+        
+    Returns
+    -------
+    tuple
+        (pore_area, aspect_ratio) where aspect_ratio = width/height of pore region
     """
-    parts = mesh_file.stem.split("_")
-    mesh_id = "_".join(parts[3:5])        
-    cross_section_type = parts[5]      
-    pressure = round(float(parts[-1]), 2)
-
-    mesh = trimesh.load(mesh_file, process=False)
     vertices = mesh.vertices
     faces = mesh.faces
     verts_2d = vertices[:, :2]
@@ -329,12 +337,38 @@ def fast_pore_area_fast_ar(mesh_file, step=0.01):
     else:
         aspect_ratio = float('nan')
 
+    return pore_area, aspect_ratio
+
+def fast_pore_area_fast_from_file(mesh_file, step=0.01):
+    """
+    Wrapper for fast_pore_area_fast that loads mesh from file path.
+    Safe to use with ProcessPoolExecutor (only serializes file path, not mesh object).
+    
+    Parameters
+    ----------
+    mesh_file : Path or str
+        Path to mesh file
+    step : float
+        Rasterization step size (default 0.01)
+        
+    Returns
+    -------
+    dict
+        Dictionary with Mesh ID, cross-section type, pressure, and pore area
+    """
+    parts = mesh_file.stem.split("_")
+    mesh_id = "_".join(parts[3:5])        
+    cross_section_type = parts[5]      
+    pressure = round(float(parts[-1]), 2)
+
+    mesh = trimesh.load(mesh_file, process=False)
+    pore_area = fast_pore_area_fast(mesh, step=step)
+    
     return {
         "Mesh ID": mesh_id,
         "Cross-section type": cross_section_type,
         "Pressure": pressure,
         "Pore Area": pore_area,
-        "Pore Aspect Ratio": aspect_ratio,
     }
 
 def cross_section_points_and_aspect(mesh_path, tol=0.5, side="left", visualize=False):
