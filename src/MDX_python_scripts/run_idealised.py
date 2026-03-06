@@ -5,10 +5,8 @@ from pathlib import Path
 sys.path.append(os.path.dirname(__file__))
 import helper_functions as hf
 
-## Code to create all of the obj files for the pressure vs pore area plots
 
 ## Path to mesh files: update as necessary
-
 path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Meshes", "Idealised")) + os.sep
 
 ## The subfolder in which the resulting meshes will be saved
@@ -27,8 +25,8 @@ selected_meshes = ['1_2', '1_3', '1_4', '1_5', '1_6', '1_8', '2_1', '2_3', '2_6a
 mesh_names = []
 
 for mesh_id in selected_meshes:
-    mesh_names.append(f"idealised_final_mdx_{mesh_id}_oval")
-    mesh_names.append(f"idealised_final_mdx_{mesh_id}_circular")
+    mesh_names.append(f"idealised_final_{mesh_id}_oval")
+    mesh_names.append(f"idealised_final_{mesh_id}_circular")
 
 pressure = np.arange(0.0, 2.1, 0.1)
 pressure = [f"{p:.1f}" for p in pressure]
@@ -43,9 +41,15 @@ stack = 2
 for mesh in mesh_names:
     mesh_name = path + mesh + ".obj"
     ## Load the mesh
-    Process.Mesh__System__Import("Stack" + str(stack), mesh_name, 'Imported','No','No')
+    Process.Mesh__System__Import("Stack" + str(stack), mesh_name, 'Imported','No','No','No')
     ## Set the correct stack
     Process.Stack__System__Set_Current_Stack("Stack" + str(stack),"")
+
+    ## Create 3D mesh
+    hf.create_3d_mesh(Process)
+
+    ## Set the correct cell complex
+    Process.Model__CCF__999_Set_Current_Cell_Complex('Final')
 
     ## Set the reference configuration
     hf.ref_cfg(Process)
