@@ -38,7 +38,7 @@ def set_pressure(Process, press):
     Process.Mesh__Selection__Action__Clear_Selection('All')
 
 def run_fem(Process):
-    Process.Model__CCF__01_FEM_Membranes('', '', '10', '.1', '.0001', '1', '1.1', '0.7', '0.1', '10', '0.1', 'Backward Euler', 'Preconditioned Conjugate Gradient', '50', '1e-10', 'Yes', '10e-5', 'Model/CCF/04 StressStrain', '', 'Model/CCF/02 Triangle Derivs', 'Model/CCF/08 Pressure Derivs', 'Model/CCF/10 Dirichlet Derivs')
+    Process.Model__CCF__01_FEM_Membranes('', '', '10', '.1', '.0001', '1', '1.1', '0.7', '0.1', '10', '0.1', 'Backward Euler', 'Preconditioned Conjugate Gradient', '200', '1e-20', 'Yes', '10e-5', 'Model/CCF/04 StressStrain', '', 'Model/CCF/02 Triangle Derivs', 'Model/CCF/08 Pressure Derivs', 'Model/CCF/10 Dirichlet Derivs')
 
 def set_aniso_from_lines(Process):
     Process.Mesh__Selection__Action__Clear_Selection('All')

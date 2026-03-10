@@ -148,6 +148,9 @@ def create_elliptical_torus_with_shared_wall(
     """
     Create two half-oval guard cell meshes forming a continuous ring along the y-axis.
     Each half has a wall at both tips (triangular caps).
+    
+    The two halves are offset by wall_thickness/2 on each side to prevent overlapping
+    geometry at the shared wall interface.
 
     Returns:
         left_mesh, right_mesh: two separate Trimesh objects
@@ -583,88 +586,6 @@ def plot_radius_distribution(side_radius_a, tip_radius_a, side_radius_b=None, ti
     plt.show()
     
     return radius_a_values
-
-# --- Example Usage ---
-if __name__ == '__main__':
-    # Create a torus with an elliptical path and a circular cross-section
-    # major_radius_a: radius of path ellipse along x-axis
-    # major_radius_b: radius of path ellipse along y-axis
-    # minor_radius_a: radius of cross-section ellipse along x-axis 
-    # minor_radius_b: radius of cross-section ellipse along y-axis 
-    # if minor_radius_a == minor_radius_b, it becomes a circular cross-section
-
-    ## Get the parameters for the elliptical torus from the confocal mesh
-
-    ## Create our tables
-
-    mesh_name =["1_2","1_3","1_4","1_5","1_6","1_8","2_1", "2_3", "2_6a", "2_6b", "2_7","3_1","3_2", "3_3", "3_4","3_6", "3_7"]
-    minor_radius_a = [8, 8, 7.5, 9, 7.9, 7.4, 6.7, 7.2, 8, 7.8, 7, 7.5, 8.4, 8.5, 8.1, 8.5, 7.9]
-    minor_radius_b = [5, 5, 5.5, 6, 5.5, 5.8, 5.0, 4, 5, 6, 5.3, 5.5, 6, 6, 7, 6.5, 5.9]
-    stomata_length = [43, 40,40.5, 48.2, 45.2, 40.3, 37, 39.6, 37.5, 36, 40, 42.1, 41.6, 40.6, 40.5, 45.5, 41] # vertical dimension (y-axis)
-    stomata_width = [37, 39, 35.4, 41.5, 37, 37.6, 36.0, 37.6, 37.0, 35, 33.5, 32.9, 37.2, 35.8, 36.3, 38.5, 35] # horizontal dimension (x-axis)
-    confocal_pore_area = [40.9,44.7,43.0, 49.6, 53.9, 65.7, 73.8, 74.2, 21.7, 14.2, 49.2, 22, 20.9, 7.3, 23.5, 37.3, 22.3]
-
-    for i in range(len(mesh_name)):
-        this_mesh = mesh_name[i]
-        major_radius_a = (stomata_width[i] - 2 * minor_radius_a[i]) / 2
-        major_radius_b = (stomata_length[i] - 2 * minor_radius_a[i]) / 2
-
-        elliptical_torus_mesh = create_elliptical_torus(
-            major_radius_a=major_radius_a,  # Wider path
-            major_radius_b=major_radius_b,  # Narrower path
-            minor_radius_a=minor_radius_a[i], 
-            minor_radius_b=minor_radius_b[i], 
-            major_segments=100,
-            minor_segments=50
-        )
-    ## Save the mesh to a PLY file
-        elliptical_torus_mesh.export('Meshes/Idealised/idealised_' + this_mesh + '.ply')
-
-
-    ## Create our donut meshes
-    for i in range(len(mesh_name)):
-        this_mesh = mesh_name[i]
-        major_radius_a = (stomata_width[i] - 2 * minor_radius_a[i]) / 2
-        major_radius_b = (stomata_length[i] - 2 * minor_radius_a[i]) / 2
-
-        elliptical_torus_mesh = create_elliptical_torus(
-            major_radius_a=major_radius_a,  # Wider path
-            major_radius_b=major_radius_b,  # Narrower path
-            minor_radius_a=minor_radius_a[i], 
-            minor_radius_b=minor_radius_a[i], 
-            major_segments=100,
-            minor_segments=50
-        )
-    ## Save the mesh to a PLY file
-        elliptical_torus_mesh.export('Meshes/Idealised/idealised_' + this_mesh + '_equal.ply')
-
-    ## Let's create some bulged versions of the meshes
-
-    mesh_name =["1_2","1_3","1_4","1_5","1_6","1_8","2_1", "2_3", "2_6a", "2_6b", "2_7","3_1","3_2", "3_3", "3_4","3_6", "3_7"]
-    tip_radius_a = [8, 8, 7.5, 9, 7.9, 7.4, 6.7, 7.2, 8, 7.8, 7, 7.5, 8.4, 8.5, 8.1, 8.5, 7.9]
-    tip_radius_b = [8, 5, 5.5, 6, 5.5, 5.8, 5.0, 4, 5, 6, 5.3, 5.5, 6, 6, 7, 6.5, 5.9]
-    stomata_length = [43, 40,40.5, 48.2, 45.2, 40.3, 37, 39.6, 37.5, 36, 40, 42.1, 41.6, 40.6, 40.5, 45.5, 41] # vertical dimension (y-axis)
-    stomata_width = [37, 39, 35.4, 41.5, 37, 37.6, 36.0, 37.6, 37.0, 35, 33.5, 32.9, 37.2, 35.8, 36.3, 38.5, 35] # horizontal dimension (x-axis)
-    confocal_pore_area = [40.9,44.7,43.0, 49.6, 53.9, 65.7, 73.8, 74.2, 21.7, 14.2, 49.2, 22, 20.9, 7.3, 23.5, 37.3, 22.3]
-
-    mesh_num = 1
-    for i in range(0, mesh_num):
-        this_mesh = mesh_name[i]
-        major_radius_a = (stomata_width[i] - 2 * minor_radius_a[i]) / 2
-        major_radius_b = (stomata_length[i] - 2 * minor_radius_a[i]) / 2
-
-        elliptical_torus_mesh = create_elliptical_torus_bulged(
-            major_radius_a=major_radius_a,  # Wider path
-            major_radius_b=major_radius_b,  # Narrower path
-            mid_radius_a=minor_radius_a[i], 
-            mid_radius_b=minor_radius_b[i], 
-            tip_radius_a=tip_radius_a[i],
-            tip_radius_b=tip_radius_b[i],
-            major_segments=100,
-            minor_segments=50
-        )
-    ## Save the mesh to a PLY file
-        elliptical_torus_mesh.export('Meshes/Idealised/idealised_bulged' + this_mesh + '.ply')
 
 
 

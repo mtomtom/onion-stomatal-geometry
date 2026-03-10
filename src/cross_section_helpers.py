@@ -12,9 +12,35 @@ import plotly.graph_objects as go
 ################################################### Plotting and visualisation ###################################################
 
 def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list2, n_cols=5, figsize=(15, 10), filename=None, colors=('k-', 'r-'), align_to_x=True, linewidth=2, ylim=5, mesh1 = "Mesh 1", mesh2 = "Mesh 2"):
-    """
-    Plot each pair of cross sections (Nx3 arrays) in a grid of 2D subplots, overlaid.
-    Projects both sections to the best-fit 2D plane of the first section using PCA.
+    """Plot paired cross sections in a grid of 2D subplots with overlay.
+    
+    Projects both sections to the best-fit 2D plane using PCA and displays them
+    overlaid in a grid layout. Uses a reference PCA basis for consistent alignment.
+    
+    Parameters
+    ----------
+    sections_points_list1 : list of ndarray
+        First set of cross sections, each an (N, 3) array of 3D points.
+    sections_points_list2 : list of ndarray
+        Second set of cross sections to overlay.
+    n_cols : int, optional
+        Number of columns in the grid (default: 5).
+    figsize : tuple, optional
+        Figure size (width, height) in inches (default: (15, 10)).
+    filename : str, optional
+        If provided, save the figure to this path.
+    colors : tuple of str, optional
+        Line colors for (mesh1, mesh2) (default: ('k-', 'r-')).
+    align_to_x : bool, optional
+        If True, rotate sections to align major axis with x-axis (default: True).
+    linewidth : float, optional
+        Line width for plotting (default: 2).
+    ylim : float, optional
+        Y-axis limits as ±ylim (default: 5).
+    mesh1 : str, optional
+        Label for first mesh in legend (default: "Mesh 1").
+    mesh2 : str, optional
+        Label for second mesh in legend (default: "Mesh 2").
     """
 
     n_sections = min(len(sections_points_list1), len(sections_points_list2))
@@ -152,9 +178,38 @@ def plot_cross_sections_grid_overlay(sections_points_list1, sections_points_list
     #)
     #return mesh_trace
 
-## Define function to visualize the mesh
+def get_midsection_area(mesh):
+
+    wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=0.2)
+    centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace = get_top_bottom_wall_centres(mesh, wall_vertices)
+    midpoint, traces, section_points, local_axes = get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom)
+    left_section, right_section, left_section_centre, right_section_centre, left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace = get_left_right_midsections(section_points, midpoint, local_axes)
+
+    ## The radius of the circles to place at the top and bottom walls is taken from the radius of the midsections
+    area1 = cross_section_area_2d(left_section)
+    area2 = cross_section_area_2d(right_section)
+
+    return area1, area2
 
 def visualize_mesh(mesh, extra_details=None, title="Mesh Visualization", opacity = 0.65):
+    """Visualize a 3D mesh using Plotly.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh to visualize.
+    extra_details : list or plotly trace, optional
+        Additional Plotly traces to include in the visualization.
+    title : str, optional
+        Figure title (default: "Mesh Visualization").
+    opacity : float, optional
+        Mesh opacity between 0 and 1 (default: 0.65).
+    
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive 3D figure.
+    """
     traces = [
         go.Mesh3d(
             x=mesh.vertices[:, 0],
@@ -187,6 +242,22 @@ def visualize_mesh(mesh, extra_details=None, title="Mesh Visualization", opacity
 ################################################### Helper functions ###################################################
 
 def curve_length(x, y, z):
+    """Calculate total length of a 3D curve.
+    
+    Parameters
+    ----------
+    x : array_like
+        X-coordinates of curve points.
+    y : array_like
+        Y-coordinates of curve points.
+    z : array_like
+        Z-coordinates of curve points.
+    
+    Returns
+    -------
+    float
+        Total arc length of the curve.
+    """
     # Stack coordinates into (N, 3) array
     points = np.column_stack((x, y, z))
     # Compute distances between consecutive points
@@ -196,7 +267,22 @@ def curve_length(x, y, z):
     return segment_lengths.sum()
 
 def get_circle_trace(circle, name="Circle", colour="red"):
-    ## Create the circle traces
+    """Create a Plotly trace for a 3D circle.
+    
+    Parameters
+    ----------
+    circle : ndarray
+        Circle points as (N, 3) array.
+    name : str, optional
+        Name for the trace in the legend (default: "Circle").
+    colour : str, optional
+        Line color (default: "red").
+    
+    Returns
+    -------
+    plotly.graph_objects.Scatter3d
+        Plotly trace for the circle.
+    """
     circle_trace = go.Scatter3d(
         x=circle[:, 0],
         y=circle[:, 1],
@@ -208,7 +294,25 @@ def get_circle_trace(circle, name="Circle", colour="red"):
     return circle_trace
 
 def order_points_consistently(points, normal, midpoint):
-    # build a stable 2D basis in the slicing plane
+    """Order cross-section points consistently by angle around centroid.
+    
+    Projects points onto a 2D plane perpendicular to the normal vector and
+    sorts them by angular position around the midpoint.
+    
+    Parameters
+    ----------
+    points : ndarray
+        Points to order as (N, 3) array.
+    normal : ndarray
+        Normal vector defining the slicing plane.
+    midpoint : ndarray
+        Center point for angular ordering.
+    
+    Returns
+    -------
+    ndarray
+        Reordered points array.
+    """
     ref = np.array([0,0,1]) if abs(np.dot(normal,[0,0,1])) < 0.9 else np.array([1,0,0])
     v1 = np.cross(normal, ref); v1 /= np.linalg.norm(v1)
     v2 = np.cross(normal, v1)
@@ -220,7 +324,20 @@ def order_points_consistently(points, normal, midpoint):
     return points[order]
 
 def get_barycentric_coords(point, face_vertices):
-    # face_vertices: (3, 3) array
+    """Calculate barycentric coordinates of a point within a triangle.
+    
+    Parameters
+    ----------
+    point : ndarray
+        3D point coordinates.
+    face_vertices : ndarray
+        Triangle vertices as (3, 3) array.
+    
+    Returns
+    -------
+    ndarray
+        Barycentric coordinates (u, v, w) where u + v + w = 1.
+    """
     v0 = face_vertices[1] - face_vertices[0]
     v1 = face_vertices[2] - face_vertices[0]
     v2 = point - face_vertices[0]
@@ -236,20 +353,60 @@ def get_barycentric_coords(point, face_vertices):
     return np.array([u, v, w])
 
 def barycentric_to_point(face_vertices, bary):
+    """Convert barycentric coordinates to 3D point.
+    
+    Parameters
+    ----------
+    face_vertices : ndarray
+        Triangle vertices as (3, 3) array.
+    bary : ndarray
+        Barycentric coordinates (u, v, w).
+    
+    Returns
+    -------
+    ndarray
+        3D point coordinates.
+    """
     return bary[0]*face_vertices[0] + bary[1]*face_vertices[1] + bary[2]*face_vertices[2]
 
 def cross_section_area_2d(points):
-        pca = PCA(n_components=2)
-        pts2 = pca.fit_transform(points)
-        hull = ConvexHull(pts2)
-        return hull.volume
+    """Compute 2D area of cross-section points using convex hull.
+    
+    Parameters
+    ----------
+    points : ndarray
+        Cross-section points as (N, 3) array.
+    
+    Returns
+    -------
+    float
+        Area of the convex hull in 2D projection.
+    """
+    pca = PCA(n_components=2)
+    pts2 = pca.fit_transform(points)
+    hull = ConvexHull(pts2)
+    return hull.volume
 
 ################################################### Analyze mesh functions ###################################################
 
 def find_wall_vertices_vertex_normals(mesh: trimesh.Trimesh, dot_thresh=0.2):
-    """
-    Fallback: mark a vertex as wall if its incident face normals contain
-    at least one pair with dot < - (1 - dot_thresh) (i.e., strong opposition).
+    """Identify wall vertices based on opposing face normals.
+    
+    A vertex is classified as wall if its incident face normals contain at least
+    one pair with strong opposition (dot product below threshold).
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh to analyze.
+    dot_thresh : float, optional
+        Threshold for detecting opposing normals (default: 0.2).
+        Vertices with normals having dot < -(1 - dot_thresh) are marked as wall.
+    
+    Returns
+    -------
+    ndarray
+        Integer array of wall vertex indices.
     """
     face_normals = mesh.face_normals
     # Build incident face list per vertex
@@ -280,7 +437,25 @@ def find_wall_vertices_vertex_normals(mesh: trimesh.Trimesh, dot_thresh=0.2):
     return np.array(wall_vertices, dtype=int)
 
 def get_top_bottom_wall_centres(mesh, wall_vertices):
-    ## Separate these into top and bottom walls
+    """Separate wall vertices into top and bottom groups and compute their centers.
+    
+    Uses K-means clustering to split wall vertices into two groups based on
+    Y-coordinate, then identifies top and bottom walls.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh.
+    wall_vertices : ndarray
+        Indices of wall vertices.
+    
+    Returns
+    -------
+    tuple
+        (centre_top, centre_bottom, top_wall_coords, bottom_wall_coords,
+         top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace)
+        Centers and coordinates of top/bottom walls plus Plotly visualization traces.
+    """
     verts = mesh.vertices
     wall_coords = verts[wall_vertices]
     # Use KMeans clustering to separate into two groups (top and bottom walls)
@@ -414,6 +589,28 @@ def get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom):
     return midpoint, traces, section_points, local_axes
 
 def get_left_right_midsections(section_points, midpoint, local_axes):
+    """Split cross-section points into left and right guard cells.
+    
+    Projects section points onto the left-right axis (second axis in local_axes)
+    and separates them based on their position relative to the midpoint.
+    
+    Parameters
+    ----------
+    section_points : ndarray
+        Cross-section points as (N, 3) array.
+    midpoint : ndarray
+        Central point for splitting.
+    local_axes : ndarray
+        3x3 array of local coordinate axes [wall_vec, left_right_vec, normal_vec].
+    
+    Returns
+    -------
+    tuple
+        (left_section, right_section, left_section_centre, right_section_centre,
+         left_midsection_trace, right_midsection_trace, 
+         left_section_centre_trace, right_section_centre_trace)
+        Section points, centers, and Plotly visualization traces for both sides.
+    """
 
     # The left-right axis is the second vector in local_axes (from get_midpoint_cross_section_from_centres)
     left_right_vec = local_axes[1]
@@ -451,7 +648,23 @@ def get_left_right_midsections(section_points, midpoint, local_axes):
     return left_section, right_section, left_section_centre, right_section_centre,left_midsection_trace, right_midsection_trace, left_section_centre_trace, right_section_centre_trace
 
 def make_circle(coords, radius):
-    # Fit PCA
+    """Create a 3D circle fitted to a point cloud.
+    
+    Fits a plane to the input coordinates using PCA and creates a circle
+    of specified radius in that plane.
+    
+    Parameters
+    ----------
+    coords : ndarray
+        Points defining the plane as (N, 3) array.
+    radius : float
+        Radius of the circle to create.
+    
+    Returns
+    -------
+    ndarray
+        Circle points as (100, 3) array.
+    """
     pca = PCA(n_components=3)
     pca.fit(coords)
     plane_origin = coords.mean(axis=0)
@@ -467,6 +680,28 @@ def make_circle(coords, radius):
     return np.array(circle_points)
 
 def get_centreline_estimate(top_circle_centre, bottom_circle_centre, left_section_centre, right_section_centre):
+    """Estimate stomata centreline using cubic spline interpolation.
+    
+    Creates a closed cubic spline passing through the four key points:
+    top, left, bottom, and right centers.
+    
+    Parameters
+    ----------
+    top_circle_centre : ndarray
+        Center of top wall circle.
+    bottom_circle_centre : ndarray
+        Center of bottom wall circle.
+    left_section_centre : ndarray
+        Center of left midsection.
+    right_section_centre : ndarray
+        Center of right midsection.
+    
+    Returns
+    -------
+    tuple
+        (spline_trace, spline_x, spline_y, spline_z)
+        Plotly trace and coordinate arrays for the centreline.
+    """
     points = np.vstack([top_circle_centre, left_section_centre, bottom_circle_centre, right_section_centre, top_circle_centre])  # repeat first point to close
     t = np.linspace(0, 1, len(points))
     t_fine = np.linspace(0, 1, 200)
@@ -482,20 +717,26 @@ def get_centreline_estimate(top_circle_centre, bottom_circle_centre, left_sectio
     return spline_trace, spline_x, spline_y, spline_z
 
 def split_mesh_at_wall_vertices(mesh, wall_vertices, left_centroid, right_centroid):
-    """
-    Split mesh into left and right guard cells using the wall vertices,
-    without using a slicing plane.
-
+    """Split stomata mesh into left and right guard cells.
+    
+    Assigns vertices to guard cells based on proximity to left or right centroids,
+    with wall vertices included in both meshes.
+    
     Parameters
     ----------
     mesh : trimesh.Trimesh
-    wall_vertices : (M,) indices of the wall
-    left_centroid, right_centroid : (3,) np.arrays
-        Approximate centers of left and right guard cells
-
+        Input stomata mesh.
+    wall_vertices : ndarray
+        Indices of wall vertices (M,).
+    left_centroid : ndarray
+        Approximate center of left guard cell (3,).
+    right_centroid : ndarray
+        Approximate center of right guard cell (3,).
+    
     Returns
     -------
-    left_mesh, right_mesh : trimesh.Trimesh
+    tuple of (trimesh.Trimesh, trimesh.Trimesh)
+        Left and right guard cell meshes.
     """
     vertices = mesh.vertices
 
@@ -532,9 +773,29 @@ def split_mesh_at_wall_vertices(mesh, wall_vertices, left_centroid, right_centro
 def get_centreline_estimate_and_split(top_circle_centre, bottom_circle_centre,
                                       left_section_centre, right_section_centre,
                                       n_points=200):
-    """
-    Build a closed spline centreline and split it into left and right guard cell halves
-    based on top and bottom anchors.
+    """Build closed spline centreline and split into left and right halves.
+    
+    Creates a periodic cubic spline through the four key centers and divides
+    it into separate centrelines for left and right guard cells.
+    
+    Parameters
+    ----------
+    top_circle_centre : ndarray
+        Center of top wall circle.
+    bottom_circle_centre : ndarray
+        Center of bottom wall circle.
+    left_section_centre : ndarray
+        Center of left midsection.
+    right_section_centre : ndarray
+        Center of right midsection.
+    n_points : int, optional
+        Number of points for spline interpolation (default: 200).
+    
+    Returns
+    -------
+    tuple
+        (full_trace, left_trace, right_trace, left_half, right_half)
+        Plotly traces and coordinate arrays for full and split centrelines.
     """
     import numpy as np
     from scipy.interpolate import CubicSpline
@@ -588,11 +849,30 @@ def get_centreline_estimate_and_split(top_circle_centre, bottom_circle_centre,
     return full_trace, left_trace, right_trace, left_half, right_half
 
 def get_regularly_spaced_cross_sections_batch(mesh, smoothed, centre_top, centre_bottom, num_sections=30):
-    """
-    Optimized version: Given a mesh and a smoothed centreline (Nx3 array), return
-    cross section points at regularly spaced intervals along the centreline,
-    avoiding points too close to the top and bottom wall centroids.
-    Uses batched nearest face search for barycentric data.
+    """Extract regularly spaced cross sections along a centreline.
+    
+    Optimized version that samples cross sections at regular arc-length intervals,
+    avoiding regions near top and bottom walls. Uses batched face search for
+    efficient barycentric coordinate calculation.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh to section.
+    smoothed : ndarray
+        Smoothed centreline as (N, 3) array.
+    centre_top : ndarray
+        Top wall center coordinates.
+    centre_bottom : ndarray
+        Bottom wall center coordinates.
+    num_sections : int, optional
+        Number of cross sections to extract (default: 30).
+    
+    Returns
+    -------
+    tuple
+        (section_points_list, section_traces, section_bary_data)
+        Lists of section points, Plotly traces, and barycentric data.
     """
     import numpy as np
     smoothed_x = smoothed[:,0]
@@ -676,7 +956,34 @@ def get_regularly_spaced_cross_sections_batch(mesh, smoothed, centre_top, centre
 ################################################## Main Mesh Analysis Function ###################################################
 
 def analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=False, mid_area_left_0 = None, mid_area_right_0 = None):
-    ## Load in the mesh
+    """Comprehensive analysis of stomata mesh geometry.
+    
+    Performs complete geometric analysis including wall detection, guard cell
+    separation, centreline estimation, and cross-section extraction.
+    
+    Parameters
+    ----------
+    mesh_path : str or Path
+        Path to mesh file.
+    num_sections : int, optional
+        Number of cross sections to extract per guard cell (default: 20).
+    n_points : int, optional
+        Number of points for centreline interpolation (default: 40).
+    visualize : bool, optional
+        If True, display interactive 3D visualization (default: False).
+    mid_area_left_0 : float, optional
+        Reference mid-area for left guard cell (used for circle radius).
+    mid_area_right_0 : float, optional
+        Reference mid-area for right guard cell (used for circle radius).
+    
+    Returns
+    -------
+    tuple
+        (section_points_right, section_points_left, 
+         section_traces_left, section_traces_right, 
+         [spline_x, spline_y, spline_z])
+        Cross-section points, visualization traces, and centreline coordinates.
+    """
     mesh = trimesh.load(mesh_path, process=False)
     ## Get the wall vertices
     wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=0.2)
@@ -725,9 +1032,24 @@ def analyze_stomata_mesh(mesh_path, num_sections=20, n_points=40, visualize=Fals
 ################################################## Additional cross section functions ###############################################
 
 def get_cross_section_points(mesh, centreline, indices):
-    """
-    For a given set of indices along a centreline, compute the cross-section points.
-    Ensures only the segment nearest the centreline point is returned.
+    """Extract cross-section points at specified centreline positions.
+    
+    For each index, computes a cross section perpendicular to the centreline
+    tangent. When multiple segments exist, returns only the nearest segment.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh to section.
+    centreline : ndarray
+        Centreline points as (N, 3) array.
+    indices : array_like
+        Indices along centreline where cross sections are desired.
+    
+    Returns
+    -------
+    list of ndarray
+        Cross-section points for each index.
     """
     tangents = np.gradient(centreline, axis=0)
     tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
@@ -755,9 +1077,22 @@ def get_cross_section_points(mesh, centreline, indices):
     return sections_points_list
 
 def calculate_cross_section_aspect_ratios_and_lengths(sections_points_list):
-    """
-    Compute aspect ratio (major/minor), major axis length, and minor axis length for each cross section.
-    Returns three lists: aspect_ratios, major_lengths, minor_lengths.
+    """Compute aspect ratios and axis lengths for cross sections.
+    
+    For each cross section, calculates the aspect ratio (major/minor) along with
+    the major and minor axis lengths using PCA-based alignment.
+    
+    Parameters
+    ----------
+    sections_points_list : list of ndarray or ndarray
+        Either a list where each element is an (N_i, 3) array of points,
+        or a single (N, 3) array.
+    
+    Returns
+    -------
+    tuple of (list, list, list)
+        (aspect_ratios, major_lengths, minor_lengths) for each section.
+        Returns 0.0 for invalid or degenerate sections.
     """
     from sklearn.decomposition import PCA
     import numpy as np
@@ -908,10 +1243,19 @@ def calculate_cross_section_aspect_ratios(sections_points_list):
     return aspect_ratios
 
 def calculate_cross_section_areas(sections_points_list):
-    """
-    Calculate the area of each cross section in a list.
-    Each cross section should be an (N, 3) array-like of points.
-    Returns a list of areas (float), one per cross section. If a section has <3 points, area is 0.
+    """Calculate area of each cross section using convex hull.
+    
+    Projects each 3D cross section to 2D using PCA and computes the convex hull area.
+    
+    Parameters
+    ----------
+    sections_points_list : list of array_like
+        Each element is an (N, 3) array of cross-section points.
+    
+    Returns
+    -------
+    list of float
+        Area for each cross section. Returns 0.0 for sections with <3 points.
     """
     from sklearn.decomposition import PCA
     from scipy.spatial import ConvexHull
@@ -933,7 +1277,19 @@ def calculate_cross_section_areas(sections_points_list):
 ################################################## Midsection measurement utilities ###################################################
 
 def measure_cross_section_width_height(section_points):
-    """Return major-axis width and minor-axis height for a single cross section array."""
+    """Measure width and height of a single cross section.
+    
+    Parameters
+    ----------
+    section_points : ndarray
+        Cross-section points as (N, 3) array.
+    
+    Returns
+    -------
+    tuple of (float, float)
+        (width, height) corresponding to major and minor axis lengths.
+        Returns (0.0, 0.0) for invalid sections.
+    """
     if section_points is None or len(section_points) < 3:
         return 0.0, 0.0
 
@@ -944,6 +1300,23 @@ def measure_cross_section_width_height(section_points):
 
 
 def _coerce_mesh_entry(mesh_entry):
+    """Internal helper to convert mesh input to standardized format.
+    
+    Parameters
+    ----------
+    mesh_entry : str, Path, or trimesh.Trimesh
+        Mesh to process.
+    
+    Returns
+    -------
+    tuple of (trimesh.Trimesh, str or None)
+        Loaded mesh and its label/path.
+    
+    Raises
+    ------
+    FileNotFoundError
+        If mesh path does not exist.
+    """
     if isinstance(mesh_entry, trimesh.Trimesh):
         label = None
         metadata = getattr(mesh_entry, "metadata", None)
@@ -959,6 +1332,25 @@ def _coerce_mesh_entry(mesh_entry):
 
 
 def _extract_midsections(mesh, dot_thresh=0.2):
+    """Internal helper to extract left and right midsections from a mesh.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input stomata mesh.
+    dot_thresh : float, optional
+        Wall vertex detection threshold (default: 0.2).
+    
+    Returns
+    -------
+    tuple of (ndarray, ndarray)
+        (left_section, right_section) midsection points.
+    
+    Raises
+    ------
+    ValueError
+        If wall vertices cannot be identified or midsection has insufficient points.
+    """
     wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
     if wall_vertices.size == 0:
         raise ValueError("Could not identify wall vertices for midsection measurement.")
@@ -975,21 +1367,26 @@ def _extract_midsections(mesh, dot_thresh=0.2):
 
 
 def batch_midsection_width_height(meshes, guard_cell="both", dot_thresh=0.2):
-    """Measure midsection width/height for an iterable of meshes.
-
+    """Measure midsection width and height for multiple meshes.
+    
+    Batch processes an iterable of meshes to extract midsection dimensions
+    for one or both guard cells.
+    
     Parameters
     ----------
     meshes : Sequence[Union[str, Path, trimesh.Trimesh]]
-        Paths or loaded meshes to evaluate.
-    guard_cell : {'left', 'right', 'both'}
-        Which guard cell(s) to report. 'both' returns dimensions for each side.
-    dot_thresh : float
-        Threshold passed to wall-vertex finder; tweak if walls are noisy.
-
+        Paths to mesh files or loaded mesh objects.
+    guard_cell : {'left', 'right', 'both'}, optional
+        Which guard cell(s) to measure (default: 'both').
+    dot_thresh : float, optional
+        Threshold for wall-vertex detection (default: 0.2).
+        Adjust if wall detection is noisy.
+    
     Returns
     -------
-    list[dict]
+    list of dict
         Each entry contains the mesh label plus requested width/height pairs.
+        Failed analyses include an 'error' field.
     """
 
     guard_cell = guard_cell.lower()

@@ -1,10 +1,26 @@
-import src.cross_section_helpers as csh
-import src.generate_idealised_mesh_new as gim
+import cross_section_helpers as csh
+import generate_idealised_mesh_new as gim
 import numpy as np
 from skimage.draw import polygon
 import trimesh
+from mesh_functions import fast_pore_area
 
 def orient_top_view(tri: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Orient a mesh to top view using principal component analysis.
+    
+    Aligns the mesh so that the smallest-variance axis points along the Z-axis,
+    effectively providing a top-down view of the mesh.
+    
+    Parameters
+    ----------
+    tri : trimesh.Trimesh
+        Input mesh to be oriented.
+    
+    Returns
+    -------
+    trimesh.Trimesh
+        Reoriented mesh with smallest-variance axis aligned to Z.
+    """
     V = tri.vertices - tri.vertices.mean(axis=0)
     # SVD on covariance
     U, S, VT = np.linalg.svd(np.cov(V.T))
@@ -24,8 +40,22 @@ def orient_top_view(tri: trimesh.Trimesh) -> trimesh.Trimesh:
     tri_oriented.apply_transform(np.block([[R, np.zeros((3,1))],[np.zeros((1,3)), 1]]))
     return tri_oriented
 
-# Helper: align in-plane so the major XY axis points along +Y (vertical)
 def align_inplane_to_Y(tri: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Align mesh in-plane so the major XY axis points along +Y (vertical).
+    
+    Rotates the mesh around the Z-axis to align its major in-plane axis with
+    the Y-axis, and ensures the minor axis points toward +X.
+    
+    Parameters
+    ----------
+    tri : trimesh.Trimesh
+        Input mesh to be aligned.
+    
+    Returns
+    -------
+    trimesh.Trimesh
+        Mesh with major axis aligned to +Y and minor axis to +X.
+    """
     verts = tri.vertices.copy()
     xy = verts[:, :2] - verts[:, :2].mean(axis=0)
     C = np.cov(xy.T)
@@ -47,47 +77,26 @@ def align_inplane_to_Y(tri: trimesh.Trimesh) -> trimesh.Trimesh:
         tri_rot.apply_transform(np.block([[Rz_flip, np.zeros((3,1))],[np.zeros((1,3)), 1]]))
     return tri_rot
 
-def fast_pore_area(vertices, faces, step=0.01):
-    verts_2d = vertices[:, :2]
-    bb_min = verts_2d.min(axis=0)
-    bb_max = verts_2d.max(axis=0)
-    size = ((bb_max - bb_min) / step).astype(int) + 2
-    raster = np.zeros((size[0], size[1]), dtype=np.uint8)
-    origin = bb_min - step
-
-    def to_raster(pt):
-        return ((pt - origin) / step).astype(int)
-
-    # Rasterize triangles efficiently
-    for tri in faces:
-        tri_2d = verts_2d[tri]
-        rr, cc = polygon(
-            [to_raster(tri_2d[0])[0], to_raster(tri_2d[1])[0], to_raster(tri_2d[2])[0]],
-            [to_raster(tri_2d[0])[1], to_raster(tri_2d[1])[1], to_raster(tri_2d[2])[1]],
-            raster.shape
-        )
-        raster[rr, cc] = 1
-
-    # Flood fill from border (same as before)
-    from collections import deque
-    queue = deque()
-    for i in range(size[0]):
-        queue.append((i, 0))
-        queue.append((i, size[1]-1))
-    for j in range(size[1]):
-        queue.append((0, j))
-        queue.append((size[0]-1, j))
-    while queue:
-        x, y = queue.popleft()
-        if 0 <= x < size[0] and 0 <= y < size[1] and raster[x, y] == 0:
-            raster[x, y] = 2
-            queue.extend([(x-1, y), (x+1, y), (x, y-1), (x, y+1)])
-
-    pore_pix = np.sum(raster == 0)
-    pore_area = pore_pix * step * step
-    return pore_area
 
 def get_cross_sections(mesh_list, meshdir_path, mid_area_left_0, mid_area_right_0):
+    """Extract cross-section points from a list of stomata meshes.
+    
+    Parameters
+    ----------
+    mesh_list : list
+        List of mesh identifiers to process.
+    meshdir_path : str
+        Path to directory containing mesh files.
+    mid_area_left_0 : float
+        Reference mid-area for left guard cell.
+    mid_area_right_0 : float
+        Reference mid-area for right guard cell.
+    
+    Returns
+    -------
+    tuple of (list, list)
+        Cross-section points for right and left guard cells.
+    """
     section_right = []
     section_left = []
     for sm in mesh_list:
@@ -98,6 +107,20 @@ def get_cross_sections(mesh_list, meshdir_path, mid_area_left_0, mid_area_right_
     return section_right, section_left
 
 def get_aspect_ratios(section_right, section_left):
+    """Calculate aspect ratios and lengths from cross-section data.
+    
+    Parameters
+    ----------
+    section_right : list
+        Cross-section points for right guard cells.
+    section_left : list
+        Cross-section points for left guard cells.
+    
+    Returns
+    -------
+    tuple of (list, list, list)
+        Cross-section aspect ratios, major lengths, and minor lengths for each section.
+    """
     cross_section_ratios = []
     major_lengths = []
     minor_lengths = []
@@ -110,7 +133,29 @@ def get_aspect_ratios(section_right, section_left):
     return cross_section_ratios, major_lengths, minor_lengths
 
 def get_midsection_and_tip_data(cross_section_ratios, major_lengths, minor_lengths):
-
+    """Extract midsection and tip measurements from cross-section data.
+    
+    Processes cross-section aspect ratios and lengths to extract measurements
+    at the midsection and tip locations for both left and right guard cells.
+    
+    Parameters
+    ----------
+    cross_section_ratios : list
+        Aspect ratios along cross-sections for left and right guard cells.
+    major_lengths : list
+        Major axis lengths along cross-sections.
+    minor_lengths : list
+        Minor axis lengths along cross-sections.
+    
+    Returns
+    -------
+    tuple of (list, list, list, list, list, list, list, list)
+        Eight lists containing:
+        - left_midsection_ar, right_midsection_ar: Aspect ratios at midsection
+        - left_tip_ar, right_tip_ar: Aspect ratios at tip
+        - left_midsection_major, right_midsection_major: Major lengths at midsection
+        - left_midsection_minor, right_midsection_minor: Minor lengths at midsection
+    """
     left_midsection_ar = []
     right_midsection_ar = []
     left_tip_ar = []
@@ -148,6 +193,21 @@ def get_midsection_and_tip_data(cross_section_ratios, major_lengths, minor_lengt
     return left_midsection_ar, right_midsection_ar, left_tip_ar, right_tip_ar, left_midsection_major, right_midsection_major, left_midsection_minor, right_midsection_minor
 
 def get_major_minor_stomata(mesh):
+    """Calculate major and minor axis lengths of a stomata mesh.
+    
+    Orients the mesh to top view, aligns it to the Y-axis, and calculates
+    the lengths along the major and minor principal axes.
+    
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input stomata mesh.
+    
+    Returns
+    -------
+    tuple of (float, float)
+        Major and minor axis lengths of the stomata.
+    """
     mesh = orient_top_view(mesh)
     mesh = align_inplane_to_Y(mesh) 
     verts = mesh.vertices
@@ -166,14 +226,30 @@ def get_major_minor_stomata(mesh):
 
 
 def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_segments=30, ar = "oval"):
-    """
-    Create idealised meshes using data from the dataframe.
+    """Create idealised stomata meshes using empirical data.
     
-    Parameters:
-    - selected_meshes: List of mesh IDs to process
-    - df: DataFrame containing mesh data with columns for pressure, aspect ratios, lengths, and pore areas
-    - major_segments: Number of segments for major radius (default: 100)
-    - minor_segments: Number of segments for minor radius (default: 30)
+    Generates idealised elliptical torus meshes matching target pore areas and
+    dimensions from experimental data. Iteratively refines mesh parameters to
+    achieve target pore area within tolerance.
+    
+    Parameters
+    ----------
+    selected_meshes : list
+        List of mesh IDs to process.
+    df : pandas.DataFrame
+        DataFrame containing mesh data with columns for pressure, aspect ratios,
+        lengths, and pore areas.
+    major_segments : int, optional
+        Number of segments for major radius (default: 100).
+    minor_segments : int, optional
+        Number of segments for minor radius (default: 30).
+    ar : str, optional
+        Shape type, either "oval" or "circular" (default: "oval").
+    
+    Notes
+    -----
+    Saves final meshes to ../Meshes/Idealised/ directory.
+    Uses iterative refinement with up to 10 iterations to match target pore area.
     """
     import trimesh
     import tempfile
@@ -200,7 +276,18 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             import ast
             
             def parse_dataframe_array(value):
-                """Parse string representations of numpy arrays from dataframe"""
+                """Parse string representations of numpy arrays from dataframe.
+                
+                Parameters
+                ----------
+                value : str or array-like
+                    String representation of array or actual numeric value.
+                
+                Returns
+                -------
+                float
+                    Parsed numeric value.
+                """
                 if isinstance(value, str):
                     # Remove numpy type prefixes and convert to list
                     clean_str = value.replace('np.float64(', '').replace(')', '')
@@ -232,7 +319,7 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
             margin = 0.01 * target_width 
 
             # Cap the minor radius so it can NEVER overlap the center
-            max_allowable_minor_radius = (target_width / 2) - margin
+            max_allowable_minor_radius = (target_width / 4) - margin
             
             print(f"Target midsection aspect ratio: {target_midsection_aspect_ratio}")
             print(f"Target length: {target_length}")
@@ -272,7 +359,8 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
                     left_mesh, right_mesh = gim.create_elliptical_torus_with_shared_wall(
                         major_radius_a, major_radius_b,
                         minor_radius_a, minor_radius_b,
-                        major_segments, minor_segments
+                        major_segments, minor_segments,
+                         wall_thickness=0.0
                     )
 
                     # Scene keeps both halves separate (no merge)
@@ -290,7 +378,7 @@ def run_idealised_mesh_creation(selected_meshes, df, major_segments=100, minor_s
                 # Check the pore area
                 try:
                     ideal_mesh = trimesh.load(mesh_filename, force='mesh')
-                    pore_area = fast_pore_area(ideal_mesh.vertices, ideal_mesh.faces, step=0.01)
+                    pore_area = fast_pore_area(ideal_mesh, step=0.05)
                     print(f"Central pore area: {pore_area:.2f}")
                 except Exception as e:
                     print(f"Error calculating pore area: {e}")
