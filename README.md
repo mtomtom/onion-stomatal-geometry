@@ -9,9 +9,9 @@ Melissa Tomkins, Matthew J. Wilson, Jodie V. Armand, Nathanael Y. H. Tan, Briony
 This repository contains the full computational pipeline for generating meshes, executing  simulations, and analyzing the resulting data.
 
 ### 📓 Jupyter Notebooks
-* [`analysis_pipeline.ipynb`](./analysis_pipeline.ipynb): Core logic for mesh generation and simulation result analysis.
-* [`main_figures.ipynb`](./main_figures.ipynb): Visualization scripts for all figures presented in the main manuscript.
-* [`SI_figures.ipynb`](./SI_figures.ipynb): Visualization scripts for Supporting Information (SI) figures.
+* [`analysis_pipeline.ipynb`](./jupyter_notebooks/analysis_pipeline.ipynb): Core logic for mesh generation and simulation result analysis.
+* [`main_figures.ipynb`](./jupyter_notebooks/main_figures.ipynb): Visualization scripts for all figures presented in the main manuscript.
+* [`SI_figures.ipynb`](./jupyter_notebooks/SI_figures.ipynb): Visualization scripts for Supporting Information (SI) figures.
 
 > **Note:** For interactive stomatal guard cell mesh measurements, please refer to the accompanying [Streamlit Web App](https://your-streamlit-link-here.com).
 
