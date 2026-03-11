@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, cKDTree
 from scipy.interpolate import CubicSpline
 import trimesh
 import plotly.graph_objects as go
@@ -436,11 +436,538 @@ def find_wall_vertices_vertex_normals(mesh: trimesh.Trimesh, dot_thresh=0.2):
         wall_vertices.append(vidx)
     return np.array(wall_vertices, dtype=int)
 
-def get_top_bottom_wall_centres(mesh, wall_vertices):
-    """Separate wall vertices into top and bottom groups and compute their centers.
-    
-    Uses K-means clustering to split wall vertices into two groups based on
-    Y-coordinate, then identifies top and bottom walls.
+def find_wall_vertices_axis_extrema(mesh: trimesh.Trimesh, axis=1, quantile=0.08, max_quantile=0.30, min_vertices=20):
+    """Identify candidate wall vertices from coordinate extrema (no normals).
+
+    This fallback is useful when mesh generation changes smooth local normals
+    enough that opposition-based wall detection returns no vertices.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh to analyze.
+    axis : int, optional
+        Coordinate axis used for top-bottom separation (default: 1 for y-axis).
+    quantile : float, optional
+        Initial tail quantile for selecting extreme vertices (default: 0.08).
+    max_quantile : float, optional
+        Maximum tail quantile used during adaptive widening (default: 0.30).
+    min_vertices : int, optional
+        Minimum number of vertices required to consider fallback valid.
+
+    Returns
+    -------
+    ndarray
+        Integer array of candidate wall vertex indices.
+    """
+    verts = mesh.vertices
+    if verts is None or len(verts) == 0:
+        return np.array([], dtype=int)
+
+    coords = verts[:, axis]
+    q = float(quantile)
+    while q <= float(max_quantile):
+        low_cut = np.quantile(coords, q)
+        high_cut = np.quantile(coords, 1.0 - q)
+        idx = np.where((coords <= low_cut) | (coords >= high_cut))[0]
+        if idx.size >= int(min_vertices):
+            return idx.astype(int)
+        q += 0.04
+
+    return np.array([], dtype=int)
+
+
+def find_wall_vertices_interface_band(
+    mesh: trimesh.Trimesh,
+    distance_quantile=0.08,
+    opposite_quantile=0.20,
+    min_vertices=20,
+    interface_axis=None,
+):
+    """Identify wall vertices near the interface plane between two guard-cell lobes.
+
+    Vertices are split into two coarse lobes with KMeans (k=2). The interface
+    is approximated as the mid-plane orthogonal to the lobe-centroid axis.
+    Vertices with smallest distance to this plane are treated as wall
+    candidates.
+    """
+    verts = mesh.vertices
+    if verts is None or len(verts) < 10:
+        return np.array([], dtype=int)
+
+    if interface_axis is not None:
+        axis_idx = int(interface_axis)
+        axis_vec = np.zeros(3, dtype=float)
+        axis_vec[axis_idx] = 1.0
+        labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(
+            verts[:, axis_idx].reshape(-1, 1)
+        )
+        c0 = verts[labels == 0].mean(axis=0)
+        c1 = verts[labels == 1].mean(axis=0)
+    else:
+        # Dynamically evaluate PCA components using relaxed wall-vertex normals
+        # to robustly distinguish left/right guard cells based on the inner pore wall.
+        pca = PCA(n_components=2)
+        pca.fit(verts - verts.mean(axis=0))
+        
+        # 1. Find SOME wall vertices by gently relaxing the threshold
+        # The true inner wall always lies firmly on the left/right dividing line
+        wall_cand = []
+        for t in [0.2, 0.35, 0.5, 0.65]:
+            wv = find_wall_vertices_vertex_normals(mesh, dot_thresh=t)
+            if len(wv) >= 10:
+                wall_cand = wv
+                break
+                
+        best_labels = None
+        best_i = 1 # default to standard width
+        
+        if len(wall_cand) >= 10:
+            # 2. Project the wall vertices onto PC0 and PC1.
+            # The Left/Right split axis (Width) is the one where the wall has ~0 variance!
+            vars = []
+            for i in range(2):
+                proj = (verts[wall_cand] - verts.mean(axis=0)) @ pca.components_[i]
+                vars.append(np.var(proj))
+            best_i = np.argmin(vars)
+            
+            axis = pca.components_[best_i]
+            proj = (verts - verts.mean(axis=0)) @ axis
+            best_labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+        else:
+            # Fallback to pure geometry if no wall found even after heavy relaxation
+            # best_score = float('inf')
+            best_i = 1
+            axis = pca.components_[best_i]
+            proj = (verts - verts.mean(axis=0)) @ axis
+            best_labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+            
+            """
+            for i in range(2):
+                axis = pca.components_[i]
+                proj = (verts - verts.mean(axis=0)) @ axis
+                lbls = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+                c0_test = verts[lbls == 0].mean(axis=0)
+                c1_test = verts[lbls == 1].mean(axis=0)
+                if len(verts[lbls == 0]) > 0 and len(verts[lbls == 1]) > 0:
+                    d0 = np.min(np.linalg.norm(verts[lbls == 0] - c0_test, axis=1))
+                    d1 = np.min(np.linalg.norm(verts[lbls == 1] - c1_test, axis=1))
+                    score = d0 + d1
+                    if score < best_score:
+                        best_score = score
+                        best_i = i
+                        best_labels = lbls
+                    
+        """
+        labels = best_labels
+        c0 = verts[labels == 0].mean(axis=0)
+        c1 = verts[labels == 1].mean(axis=0)
+        axis_vec = c1 - c0
+
+    idx0 = np.where(labels == 0)[0]
+    idx1 = np.where(labels == 1)[0]
+    if idx0.size < 5 or idx1.size < 5:
+        return np.array([], dtype=int)
+
+    norm = np.linalg.norm(axis_vec)
+    if norm < 1e-10:
+        return np.array([], dtype=int)
+    axis_vec = axis_vec / norm
+
+    # Calculate midpoint purely from geometric bounds to guarantee symmetry
+    midpoint = 0.5 * (verts.max(axis=0) + verts.min(axis=0))
+    signed = (verts - midpoint) @ axis_vec
+    dist_to_interface = np.abs(signed)
+
+    plane_thresh = np.quantile(dist_to_interface, float(distance_quantile))
+    plane_idx = np.where(dist_to_interface <= plane_thresh)[0]
+
+    pts0 = verts[idx0]
+    pts1 = verts[idx1]
+    d0, _ = cKDTree(pts1).query(pts0, k=1)
+    d1, _ = cKDTree(pts0).query(pts1, k=1)
+    t0 = np.quantile(d0, float(opposite_quantile))
+    t1 = np.quantile(d1, float(opposite_quantile))
+    close_idx = np.concatenate([idx0[d0 <= t0], idx1[d1 <= t1]])
+
+    idx = np.intersect1d(plane_idx, close_idx).astype(int)
+    if idx.size < int(min_vertices):
+        idx = plane_idx.astype(int)
+
+    if idx.size < int(min_vertices):
+        return np.array([], dtype=int)
+    return idx
+
+
+def _get_interface_plane_geometry(mesh: trimesh.Trimesh, interface_axis=None):
+    """Estimate interface plane between two coarse guard-cell lobes.
+
+    Returns
+    -------
+    tuple
+        (midpoint, axis_vec, dist_to_interface)
+        where dist_to_interface is abs signed distance of each vertex to plane.
+    """
+    verts = mesh.vertices
+    if verts is None or len(verts) < 10:
+        return None, None, None
+
+    if interface_axis is not None:
+        axis_idx = int(interface_axis)
+        labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(
+            verts[:, axis_idx].reshape(-1, 1)
+        )
+        c0 = verts[labels == 0].mean(axis=0)
+        c1 = verts[labels == 1].mean(axis=0)
+        axis_vec = np.zeros(3, dtype=float)
+        axis_vec[axis_idx] = 1.0
+    else:
+        # Dynamically evaluate PCA components using relaxed wall-vertex normals
+        # to robustly distinguish left/right guard cells based on the inner pore wall.
+        pca = PCA(n_components=2)
+        pca.fit(verts - verts.mean(axis=0))
+        
+        # 1. Find SOME wall vertices by gently relaxing the threshold
+        # The true inner wall always lies firmly on the left/right dividing line
+        wall_cand = []
+        for t in [0.2, 0.35, 0.5, 0.65]:
+            wv = find_wall_vertices_vertex_normals(mesh, dot_thresh=t)
+            if len(wv) >= 10:
+                wall_cand = wv
+                break
+                
+        best_labels = None
+        best_i = 1 # default to standard width
+        
+        if len(wall_cand) >= 10:
+            # 2. Project the wall vertices onto PC0 and PC1.
+            # The Left/Right split axis (Width) is the one where the wall has ~0 variance!
+            vars = []
+            for i in range(2):
+                proj = (verts[wall_cand] - verts.mean(axis=0)) @ pca.components_[i]
+                vars.append(np.var(proj))
+            best_i = np.argmin(vars)
+            
+            axis = pca.components_[best_i]
+            proj = (verts - verts.mean(axis=0)) @ axis
+            best_labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+        else:
+            # Fallback to pure geometry if no wall found even after heavy relaxation
+            # best_score = float('inf')
+            best_i = 1
+            axis = pca.components_[best_i]
+            proj = (verts - verts.mean(axis=0)) @ axis
+            best_labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+            
+            """
+            for i in range(2):
+                axis = pca.components_[i]
+                proj = (verts - verts.mean(axis=0)) @ axis
+                lbls = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(proj.reshape(-1, 1))
+                c0_test = verts[lbls == 0].mean(axis=0)
+                c1_test = verts[lbls == 1].mean(axis=0)
+                if len(verts[lbls == 0]) > 0 and len(verts[lbls == 1]) > 0:
+                    d0 = np.min(np.linalg.norm(verts[lbls == 0] - c0_test, axis=1))
+                    d1 = np.min(np.linalg.norm(verts[lbls == 1] - c1_test, axis=1))
+                    score = d0 + d1
+                    if score < best_score:
+                        best_score = score
+                        best_i = i
+                        best_labels = lbls
+                    
+        """
+        labels = best_labels
+        c0 = verts[labels == 0].mean(axis=0)
+        c1 = verts[labels == 1].mean(axis=0)
+        axis_vec = c1 - c0
+
+    norm = np.linalg.norm(axis_vec)
+    if norm < 1e-10:
+        return None, None, None
+    axis_vec = axis_vec / norm
+    midpoint = 0.5 * (c0 + c1)
+    signed = (verts - midpoint) @ axis_vec
+    dist_to_interface = np.abs(signed)
+    return midpoint, axis_vec, dist_to_interface
+
+
+def _wall_vertices_match_interface(
+    mesh: trimesh.Trimesh,
+    wall_vertices,
+    interface_axis=None,
+    near_quantile=0.20,
+    min_near_fraction=0.50,
+):
+    """Check whether candidate wall vertices lie near the inter-cell interface.
+
+    This guards against normals-based candidates landing on external poles.
+    """
+    wall_vertices = np.asarray(wall_vertices, dtype=int)
+    if wall_vertices.size == 0:
+        return False
+
+    _mid, _axis, dist_to_interface = _get_interface_plane_geometry(
+        mesh, interface_axis=interface_axis
+    )
+    if dist_to_interface is None:
+        return False
+
+    near_thresh = np.quantile(dist_to_interface, float(near_quantile))
+    wall_dists = dist_to_interface[wall_vertices]
+    near_fraction = float(np.mean(wall_dists <= near_thresh)) if wall_dists.size else 0.0
+    return near_fraction >= float(min_near_fraction)
+
+def visualize_wall_vertex_methods(mesh_entry, dot_thresh=0.2, axis=1, quantile=0.08):
+    """Visualize wall-vertex selections from normals and axis-extrema methods.
+
+    Parameters
+    ----------
+    mesh_entry : str, Path, or trimesh.Trimesh
+        Mesh path or loaded mesh.
+    dot_thresh : float, optional
+        Threshold for normal-based wall detection.
+    axis : int, optional
+        Axis used by axis-extrema fallback (0=x, 1=y, 2=z).
+    quantile : float, optional
+        Tail quantile used by axis-extrema method.
+
+    Returns
+    -------
+    dict
+        Summary with vertex index arrays and counts for each method.
+    """
+    mesh, label = _coerce_mesh_entry(mesh_entry)
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("visualize_wall_vertex_methods requires a trimesh.Trimesh input.")
+    mesh_name = label or "in_memory_mesh"
+
+    wall_normals = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
+    wall_extrema = find_wall_vertices_axis_extrema(mesh, axis=axis, quantile=quantile)
+    overlap = np.intersect1d(wall_normals, wall_extrema)
+
+    traces = []
+    verts = mesh.vertices
+
+    if wall_normals.size:
+        traces.append(
+            go.Scatter3d(
+                x=verts[wall_normals, 0],
+                y=verts[wall_normals, 1],
+                z=verts[wall_normals, 2],
+                mode='markers',
+                marker=dict(size=2.5, color='#D55E00'),
+                name='Wall (normals)'
+            )
+        )
+    if wall_extrema.size:
+        traces.append(
+            go.Scatter3d(
+                x=verts[wall_extrema, 0],
+                y=verts[wall_extrema, 1],
+                z=verts[wall_extrema, 2],
+                mode='markers',
+                marker=dict(size=2.0, color='#009E73'),
+                name='Wall (axis extrema)'
+            )
+        )
+    if overlap.size:
+        traces.append(
+            go.Scatter3d(
+                x=verts[overlap, 0],
+                y=verts[overlap, 1],
+                z=verts[overlap, 2],
+                mode='markers',
+                marker=dict(size=3.0, color='#CC79A7'),
+                name='Overlap'
+            )
+        )
+
+    if wall_normals.size >= 2:
+        n_top, n_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_normals)
+        traces.extend([
+            go.Scatter3d(
+                x=[n_top[0]], y=[n_top[1]], z=[n_top[2]],
+                mode='markers', marker=dict(size=7, color='#A73F00'),
+                name='Normals top centre'
+            ),
+            go.Scatter3d(
+                x=[n_bottom[0]], y=[n_bottom[1]], z=[n_bottom[2]],
+                mode='markers', marker=dict(size=7, color='#A73F00', symbol='diamond'),
+                name='Normals bottom centre'
+            ),
+        ])
+    if wall_extrema.size >= 2:
+        e_top, e_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_extrema)
+        traces.extend([
+            go.Scatter3d(
+                x=[e_top[0]], y=[e_top[1]], z=[e_top[2]],
+                mode='markers', marker=dict(size=7, color='#007A58'),
+                name='Extrema top centre'
+            ),
+            go.Scatter3d(
+                x=[e_bottom[0]], y=[e_bottom[1]], z=[e_bottom[2]],
+                mode='markers', marker=dict(size=7, color='#007A58', symbol='diamond'),
+                name='Extrema bottom centre'
+            ),
+        ])
+
+    title = (
+        f"Wall method comparison: {Path(mesh_name).name} "
+        f"(normals={len(wall_normals)}, extrema={len(wall_extrema)}, overlap={len(overlap)})"
+    )
+    visualize_mesh(mesh, extra_details=traces, title=title, opacity=0.25)
+
+    return {
+        "mesh": mesh_name,
+        "wall_vertices_normals": wall_normals,
+        "wall_vertices_axis_extrema": wall_extrema,
+        "overlap_vertices": overlap,
+        "n_normals": int(len(wall_normals)),
+        "n_axis_extrema": int(len(wall_extrema)),
+        "n_overlap": int(len(overlap)),
+    }
+
+
+def visualize_detected_midsection(
+    mesh_entry,
+    dot_thresh=0.2,
+    min_normals_wall_vertices=20,
+    wall_split_axis="auto",
+    wall_interface_axis=None,
+):
+    """Visualize where the pipeline detects the midsection on a mesh.
+
+    Parameters
+    ----------
+    mesh_entry : str, Path, or trimesh.Trimesh
+        Mesh path or loaded mesh.
+    dot_thresh : float, optional
+        Threshold for normals-based wall detection.
+    min_normals_wall_vertices : int, optional
+        Minimum wall-vertex count needed to trust normals before fallback.
+
+    Returns
+    -------
+    dict
+        Diagnostic summary including method, counts, centers, and dimensions.
+    """
+    mesh, label = _coerce_mesh_entry(mesh_entry)
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("visualize_detected_midsection requires a trimesh.Trimesh input.")
+
+    mesh_name = label or "in_memory_mesh"
+
+    wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
+    wall_method = "normals"
+    normals_ok = (
+        wall_vertices.size >= int(min_normals_wall_vertices)
+        and _wall_vertices_match_interface(
+            mesh,
+            wall_vertices,
+            interface_axis=wall_interface_axis,
+        )
+    )
+    if not normals_ok:
+        wall_vertices = find_wall_vertices_interface_band(mesh, interface_axis=wall_interface_axis)
+        wall_method = "interface_band"
+
+    if wall_vertices.size == 0:
+        wall_vertices = find_wall_vertices_axis_extrema(mesh)
+        wall_method = "axis_extrema"
+
+    if wall_vertices.size == 0:
+        raise ValueError("Could not identify wall vertices for midsection visualization.")
+
+    centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, *_ = get_top_bottom_wall_centres(
+        mesh,
+        wall_vertices,
+        split_axis=wall_split_axis,
+    )
+    wall_axis_override = None
+    if wall_split_axis not in (None, "auto"):
+        wall_axis_override = np.zeros(3, dtype=float)
+        wall_axis_override[int(wall_split_axis)] = 1.0
+    midpoint, _traces, section_points, local_axes = get_midpoint_cross_section_from_centres(
+        mesh, centre_top, centre_bottom, wall_axis=wall_axis_override
+    )
+    if section_points is None or len(section_points) < 3:
+        raise ValueError("Midpoint cross section returned insufficient points.")
+
+    left_section, right_section, left_centre, right_centre, *_ = get_left_right_midsections(
+        section_points, midpoint, local_axes
+    )
+
+    lw, lh = measure_cross_section_width_height(left_section)
+    rw, rh = measure_cross_section_width_height(right_section)
+
+    traces = [
+        go.Scatter3d(
+            x=top_wall_coords[:, 0], y=top_wall_coords[:, 1], z=top_wall_coords[:, 2],
+            mode='markers', marker=dict(size=2.5, color='#D55E00'), name='Top wall vertices'
+        ),
+        go.Scatter3d(
+            x=bottom_wall_coords[:, 0], y=bottom_wall_coords[:, 1], z=bottom_wall_coords[:, 2],
+            mode='markers', marker=dict(size=2.5, color='#56B4E9'), name='Bottom wall vertices'
+        ),
+        go.Scatter3d(
+            x=[centre_top[0]], y=[centre_top[1]], z=[centre_top[2]],
+            mode='markers', marker=dict(size=8, color='#D55E00'), name='Top wall centre'
+        ),
+        go.Scatter3d(
+            x=[centre_bottom[0]], y=[centre_bottom[1]], z=[centre_bottom[2]],
+            mode='markers', marker=dict(size=8, color='#56B4E9'), name='Bottom wall centre'
+        ),
+        go.Scatter3d(
+            x=[midpoint[0]], y=[midpoint[1]], z=[midpoint[2]],
+            mode='markers', marker=dict(size=9, color='black'), name='Midpoint'
+        ),
+        go.Scatter3d(
+            x=left_section[:, 0], y=left_section[:, 1], z=left_section[:, 2],
+            mode='markers', marker=dict(size=3, color='#E69F00'), name='Left midsection points'
+        ),
+        go.Scatter3d(
+            x=right_section[:, 0], y=right_section[:, 1], z=right_section[:, 2],
+            mode='markers', marker=dict(size=3, color='#0072B2'), name='Right midsection points'
+        ),
+        go.Scatter3d(
+            x=[left_centre[0]], y=[left_centre[1]], z=[left_centre[2]],
+            mode='markers', marker=dict(size=7, color='#E69F00', symbol='diamond'), name='Left section centre'
+        ),
+        go.Scatter3d(
+            x=[right_centre[0]], y=[right_centre[1]], z=[right_centre[2]],
+            mode='markers', marker=dict(size=7, color='#0072B2', symbol='diamond'), name='Right section centre'
+        ),
+    ]
+
+    title = (
+        f"Detected midsection: {Path(mesh_name).name} "
+        f"(method={wall_method}, n_wall={len(wall_vertices)})"
+    )
+    visualize_mesh(mesh, extra_details=traces, title=title, opacity=0.20)
+
+    return {
+        "mesh": mesh_name,
+        "wall_method": wall_method,
+        "n_wall_vertices": int(len(wall_vertices)),
+        "n_midsection_points": int(len(section_points)),
+        "n_left_points": int(len(left_section)),
+        "n_right_points": int(len(right_section)),
+        "centre_top": centre_top,
+        "centre_bottom": centre_bottom,
+        "midpoint": midpoint,
+        "left_width": float(lw),
+        "left_height": float(lh),
+        "right_width": float(rw),
+        "right_height": float(rh),
+    }
+
+def get_top_bottom_wall_centres(mesh, wall_vertices, split_axis="auto"):
+    """Split wall vertices into two internal-junction endpoints and compute centers.
+
+    For current stomata workflows, `wall_vertices` are expected to represent the
+    inter-guard-cell wall band. This function separates that band into two
+    endpoint groups (historically named top/bottom) used to define the axis for
+    midpoint sectioning.
     
     Parameters
     ----------
@@ -458,32 +985,92 @@ def get_top_bottom_wall_centres(mesh, wall_vertices):
     """
     verts = mesh.vertices
     wall_coords = verts[wall_vertices]
-    # Use KMeans clustering to separate into two groups (top and bottom walls)
+    # Split the wall band into two endpoint groups.
+    # Default uses deterministic axis split (legacy behavior is y-axis).
     if len(wall_coords) >= 2:
-        kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(wall_coords)
-        labels = kmeans.labels_
-        group1 = wall_coords[labels == 0]
-        group2 = wall_coords[labels == 1]
-        # Assign top/bottom by comparing mean y values
-        if group1[:, 1].mean() > group2[:, 1].mean():
-            top_wall_coords = group1
-            bottom_wall_coords = group2
+        if split_axis not in (None, "auto"):
+            axis_idx = int(split_axis)
+            projections = wall_coords[:, axis_idx]
+            split_value = np.median(projections)
+            top_mask = projections >= split_value
+            bottom_mask = ~top_mask
+
+            # Degenerate fallback if all points land on one side of the median.
+            if top_mask.sum() == 0 or bottom_mask.sum() == 0:
+                q_low, q_high = np.quantile(projections, [0.45, 0.55])
+                top_mask = projections >= q_high
+                bottom_mask = projections <= q_low
+
+            # Final fallback for extremely degenerate distributions.
+            if top_mask.sum() == 0 or bottom_mask.sum() == 0:
+                labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(
+                    projections.reshape(-1, 1)
+                )
+                group1 = wall_coords[labels == 0]
+                group2 = wall_coords[labels == 1]
+                if projections[labels == 0].mean() >= projections[labels == 1].mean():
+                    top_wall_coords = group1
+                    bottom_wall_coords = group2
+                else:
+                    top_wall_coords = group2
+                    bottom_wall_coords = group1
+            else:
+                top_wall_coords = wall_coords[top_mask]
+                bottom_wall_coords = wall_coords[bottom_mask]
         else:
-            top_wall_coords = group2
-            bottom_wall_coords = group1
+            mesh_centered = mesh.vertices - mesh.vertices.mean(axis=0)
+            cov_mesh = np.cov(mesh_centered.T)
+            evals_mesh, evecs_mesh = np.linalg.eigh(cov_mesh)
+            long_axis = evecs_mesh[:, int(np.argmax(evals_mesh))]
+
+            _mid, interface_axis, _dist = _get_interface_plane_geometry(mesh, interface_axis=None)
+            if interface_axis is not None:
+                endpoint_axis = long_axis - np.dot(long_axis, interface_axis) * interface_axis
+            else:
+                endpoint_axis = long_axis
+
+            axis_norm = np.linalg.norm(endpoint_axis)
+            if axis_norm < 1e-10:
+                wc_center = wall_coords - wall_coords.mean(axis=0)
+                cov = np.cov(wc_center.T)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                endpoint_axis = eigvecs[:, int(np.argmax(eigvals))]
+            else:
+                endpoint_axis = endpoint_axis / axis_norm
+
+            projections = (wall_coords - wall_coords.mean(axis=0)) @ endpoint_axis
+            split_value = np.median(projections)
+            top_mask = projections >= split_value
+            bottom_mask = ~top_mask
+
+            if top_mask.sum() == 0 or bottom_mask.sum() == 0:
+                labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(
+                    projections.reshape(-1, 1)
+                )
+                group1 = wall_coords[labels == 0]
+                group2 = wall_coords[labels == 1]
+                if projections[labels == 0].mean() >= projections[labels == 1].mean():
+                    top_wall_coords = group1
+                    bottom_wall_coords = group2
+                else:
+                    top_wall_coords = group2
+                    bottom_wall_coords = group1
+            else:
+                top_wall_coords = wall_coords[top_mask]
+                bottom_wall_coords = wall_coords[bottom_mask]
     else:
         # Fallback: use all as top, none as bottom
         top_wall_coords = wall_coords
         bottom_wall_coords = np.empty((0, 3))
 
-    # Create the wall traces
+    # Create the wall traces (endpoint groups on the internal wall band)
     top_wall_trace = go.Scatter3d(
         x=top_wall_coords[:, 0],
         y=top_wall_coords[:, 1],
         z=top_wall_coords[:, 2],
         mode='markers',
         marker=dict(size=5, color='red'),
-        name='Top Wall Vertices'
+        name='Internal Wall Endpoint A'
     )
     bottom_wall_trace = go.Scatter3d(
         x=bottom_wall_coords[:, 0],
@@ -491,7 +1078,7 @@ def get_top_bottom_wall_centres(mesh, wall_vertices):
         z=bottom_wall_coords[:, 2],
         mode='markers',
         marker=dict(size=5, color='blue'),
-        name='Bottom Wall Vertices'
+        name='Internal Wall Endpoint B'
     )
 
     centre_top = top_wall_coords.mean(axis=0)
@@ -503,7 +1090,7 @@ def get_top_bottom_wall_centres(mesh, wall_vertices):
         z=[centre_top[2]],
         mode='markers',
         marker=dict(size=5, color='red'),
-        name='Top Wall Centre'
+        name='Internal Wall Centre A'
     )
     centre_bottom_trace = go.Scatter3d(
         x=[centre_bottom[0]],
@@ -511,12 +1098,12 @@ def get_top_bottom_wall_centres(mesh, wall_vertices):
         z=[centre_bottom[2]],
         mode='markers',
         marker=dict(size=5, color='blue'),
-        name='Bottom Wall Centre'
+        name='Internal Wall Centre B'
     )
 
     return centre_top, centre_bottom, top_wall_coords, bottom_wall_coords, top_wall_trace, bottom_wall_trace, centre_top_trace, centre_bottom_trace
 
-def get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom):
+def get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom, wall_axis=None):
     """
     Take a cross section at the midpoint between two precomputed wall centres.
     The cross section plane is perpendicular to the line joining the centres.
@@ -542,9 +1129,19 @@ def get_midpoint_cross_section_from_centres(mesh, centre_top, centre_bottom):
         3x3 array: [wall_vec, left_right_vec, normal_vec]
     """
 
-    # Define wall axis (from bottom to top)
-    wall_vec = centre_top - centre_bottom
-    wall_vec /= np.linalg.norm(wall_vec)
+    # Define wall axis (from bottom to top), unless explicitly provided.
+    if wall_axis is not None:
+        wall_vec = np.asarray(wall_axis, dtype=float)
+        wall_norm = np.linalg.norm(wall_vec)
+        if wall_norm < 1e-10:
+            raise ValueError("wall_axis has near-zero magnitude.")
+        wall_vec = wall_vec / wall_norm
+    else:
+        wall_vec = centre_top - centre_bottom
+        wall_norm = np.linalg.norm(wall_vec)
+        if wall_norm < 1e-10:
+            raise ValueError("Top/bottom centres are too close to define a wall axis.")
+        wall_vec = wall_vec / wall_norm
 
     # Midpoint
     midpoint = (centre_top + centre_bottom) / 2
@@ -615,15 +1212,35 @@ def get_left_right_midsections(section_points, midpoint, local_axes):
     # The left-right axis is the second vector in local_axes (from get_midpoint_cross_section_from_centres)
     left_right_vec = local_axes[1]
 
-    # Project section points onto the left-right axis (relative to the midpoint)
-    relative_points = section_points - midpoint
-    side_values = np.dot(relative_points, left_right_vec)
+    # Split section points using straight projection onto the left-right axis.
+    left_section = np.empty((0, 3))
+    right_section = np.empty((0, 3))
 
-    left_section = section_points[side_values < 0]
-    right_section = section_points[side_values >= 0]
+    if section_points is not None and len(section_points) >= 3:
+        projs = (section_points - midpoint) @ left_right_vec
+        left_section = section_points[projs <= 0]
+        right_section = section_points[projs > 0]
+        relative_points = section_points - midpoint
+        side_values = np.dot(relative_points, left_right_vec)
+        left_section = section_points[side_values < 0]
+        right_section = section_points[side_values >= 0]
 
-    left_section_centre = left_section.mean(axis=0)
-    right_section_centre = right_section.mean(axis=0)
+    # Robust centre estimate in local PCA box coordinates to avoid density bias.
+    def _robust_section_centre(points):
+        if points is None or len(points) == 0:
+            return np.asarray(midpoint, dtype=float)
+        if len(points) < 3:
+            return points.mean(axis=0)
+        pca_local = PCA(n_components=2)
+        pts2 = pca_local.fit_transform(points)
+        centre2 = np.array([
+            0.5 * (pts2[:, 0].min() + pts2[:, 0].max()),
+            0.5 * (pts2[:, 1].min() + pts2[:, 1].max()),
+        ])
+        return pca_local.mean_ + centre2[0] * pca_local.components_[0] + centre2[1] * pca_local.components_[1]
+
+    left_section_centre = _robust_section_centre(left_section)
+    right_section_centre = _robust_section_centre(right_section)
 
     # Create our left and right traces
     left_midsection_trace = go.Scatter3d(
@@ -1331,7 +1948,14 @@ def _coerce_mesh_entry(mesh_entry):
     return mesh, str(mesh_path)
 
 
-def _extract_midsections(mesh, dot_thresh=0.2):
+def _extract_midsections(
+    mesh,
+    dot_thresh=0.2,
+    return_wall_method=False,
+    min_normals_wall_vertices=20,
+    wall_split_axis="auto",
+    wall_interface_axis=None,
+):
     """Internal helper to extract left and right midsections from a mesh.
     
     Parameters
@@ -1340,11 +1964,16 @@ def _extract_midsections(mesh, dot_thresh=0.2):
         Input stomata mesh.
     dot_thresh : float, optional
         Wall vertex detection threshold (default: 0.2).
+    min_normals_wall_vertices : int, optional
+        Minimum number of wall vertices required to trust the normals-based
+        method before falling back to the geometry-based method (default: 20).
     
     Returns
     -------
-    tuple of (ndarray, ndarray)
-        (left_section, right_section) midsection points.
+    tuple
+        By default returns (left_section, right_section).
+        If return_wall_method=True, returns
+        (left_section, right_section, wall_method).
     
     Raises
     ------
@@ -1352,21 +1981,54 @@ def _extract_midsections(mesh, dot_thresh=0.2):
         If wall vertices cannot be identified or midsection has insufficient points.
     """
     wall_vertices = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
+    wall_method = "normals"
+    normals_ok = (
+        wall_vertices.size >= int(min_normals_wall_vertices)
+        and _wall_vertices_match_interface(
+            mesh,
+            wall_vertices,
+            interface_axis=wall_interface_axis,
+        )
+    )
+    if not normals_ok:
+        wall_vertices = find_wall_vertices_interface_band(mesh, interface_axis=wall_interface_axis)
+        wall_method = "interface_band"
+
+    if wall_vertices.size == 0:
+        wall_vertices = find_wall_vertices_axis_extrema(mesh)
+        wall_method = "axis_extrema"
+
     if wall_vertices.size == 0:
         raise ValueError("Could not identify wall vertices for midsection measurement.")
 
-    centre_top, centre_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_vertices)
+    centre_top, centre_bottom, *_ = get_top_bottom_wall_centres(
+        mesh,
+        wall_vertices,
+        split_axis=wall_split_axis,
+    )
+    wall_axis_override = None
+    if wall_split_axis not in (None, "auto"):
+        wall_axis_override = np.zeros(3, dtype=float)
+        wall_axis_override[int(wall_split_axis)] = 1.0
     midpoint, _traces, section_points, local_axes = get_midpoint_cross_section_from_centres(
-        mesh, centre_top, centre_bottom
+        mesh, centre_top, centre_bottom, wall_axis=wall_axis_override
     )
     if section_points is None or len(section_points) < 3:
         raise ValueError("Midpoint cross section returned insufficient points.")
 
     left_section, right_section, *_ = get_left_right_midsections(section_points, midpoint, local_axes)
+    if return_wall_method:
+        return left_section, right_section, wall_method
     return left_section, right_section
 
 
-def batch_midsection_width_height(meshes, guard_cell="both", dot_thresh=0.2):
+def batch_midsection_width_height(
+    meshes,
+    guard_cell="both",
+    dot_thresh=0.2,
+    wall_split_axis="auto",
+    wall_interface_axis=None,
+):
     """Measure midsection width and height for multiple meshes.
     
     Batch processes an iterable of meshes to extract midsection dimensions
@@ -1399,7 +2061,16 @@ def batch_midsection_width_height(meshes, guard_cell="both", dot_thresh=0.2):
         entry_label = label or f"in_memory_mesh_{idx}"
         record = {"mesh": entry_label}
         try:
-            left_section, right_section = _extract_midsections(mesh_obj, dot_thresh=dot_thresh)
+            midsections = _extract_midsections(
+                mesh_obj,
+                dot_thresh=dot_thresh,
+                return_wall_method=True,
+                wall_split_axis=wall_split_axis,
+                wall_interface_axis=wall_interface_axis,
+            )
+            left_section, right_section = midsections[0], midsections[1]
+            wall_method = midsections[2] if len(midsections) > 2 else "normals"
+            record["wall_method"] = wall_method
         except Exception as exc:
             record["error"] = str(exc)
             results.append(record)

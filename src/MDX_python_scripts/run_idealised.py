@@ -60,6 +60,9 @@ for mesh in mesh_names:
     ## Set material properties
     hf.material_props(Process, E13, E2, poisson)
 
+    ## Save the initialised mesh
+    Process.Mesh__System__Save("Stack2", path + mesh + "_initial.mdxm", 'No')
+
     ## Delete previous temporary area file_path
     filename = "pore_area.txt"
 
