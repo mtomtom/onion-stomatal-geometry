@@ -352,22 +352,6 @@ def get_barycentric_coords(point, face_vertices):
     u = 1.0 - v - w
     return np.array([u, v, w])
 
-def barycentric_to_point(face_vertices, bary):
-    """Convert barycentric coordinates to 3D point.
-    
-    Parameters
-    ----------
-    face_vertices : ndarray
-        Triangle vertices as (3, 3) array.
-    bary : ndarray
-        Barycentric coordinates (u, v, w).
-    
-    Returns
-    -------
-    ndarray
-        3D point coordinates.
-    """
-    return bary[0]*face_vertices[0] + bary[1]*face_vertices[1] + bary[2]*face_vertices[2]
 
 def cross_section_area_2d(points):
     """Compute 2D area of cross-section points using convex hull.
@@ -717,115 +701,6 @@ def _wall_vertices_match_interface(
     near_fraction = float(np.mean(wall_dists <= near_thresh)) if wall_dists.size else 0.0
     return near_fraction >= float(min_near_fraction)
 
-def visualize_wall_vertex_methods(mesh_entry, dot_thresh=0.2, axis=1, quantile=0.08):
-    """Visualize wall-vertex selections from normals and axis-extrema methods.
-
-    Parameters
-    ----------
-    mesh_entry : str, Path, or trimesh.Trimesh
-        Mesh path or loaded mesh.
-    dot_thresh : float, optional
-        Threshold for normal-based wall detection.
-    axis : int, optional
-        Axis used by axis-extrema fallback (0=x, 1=y, 2=z).
-    quantile : float, optional
-        Tail quantile used by axis-extrema method.
-
-    Returns
-    -------
-    dict
-        Summary with vertex index arrays and counts for each method.
-    """
-    mesh, label = _coerce_mesh_entry(mesh_entry)
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise TypeError("visualize_wall_vertex_methods requires a trimesh.Trimesh input.")
-    mesh_name = label or "in_memory_mesh"
-
-    wall_normals = find_wall_vertices_vertex_normals(mesh, dot_thresh=dot_thresh)
-    wall_extrema = find_wall_vertices_axis_extrema(mesh, axis=axis, quantile=quantile)
-    overlap = np.intersect1d(wall_normals, wall_extrema)
-
-    traces = []
-    verts = mesh.vertices
-
-    if wall_normals.size:
-        traces.append(
-            go.Scatter3d(
-                x=verts[wall_normals, 0],
-                y=verts[wall_normals, 1],
-                z=verts[wall_normals, 2],
-                mode='markers',
-                marker=dict(size=2.5, color='#D55E00'),
-                name='Wall (normals)'
-            )
-        )
-    if wall_extrema.size:
-        traces.append(
-            go.Scatter3d(
-                x=verts[wall_extrema, 0],
-                y=verts[wall_extrema, 1],
-                z=verts[wall_extrema, 2],
-                mode='markers',
-                marker=dict(size=2.0, color='#009E73'),
-                name='Wall (axis extrema)'
-            )
-        )
-    if overlap.size:
-        traces.append(
-            go.Scatter3d(
-                x=verts[overlap, 0],
-                y=verts[overlap, 1],
-                z=verts[overlap, 2],
-                mode='markers',
-                marker=dict(size=3.0, color='#CC79A7'),
-                name='Overlap'
-            )
-        )
-
-    if wall_normals.size >= 2:
-        n_top, n_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_normals)
-        traces.extend([
-            go.Scatter3d(
-                x=[n_top[0]], y=[n_top[1]], z=[n_top[2]],
-                mode='markers', marker=dict(size=7, color='#A73F00'),
-                name='Normals top centre'
-            ),
-            go.Scatter3d(
-                x=[n_bottom[0]], y=[n_bottom[1]], z=[n_bottom[2]],
-                mode='markers', marker=dict(size=7, color='#A73F00', symbol='diamond'),
-                name='Normals bottom centre'
-            ),
-        ])
-    if wall_extrema.size >= 2:
-        e_top, e_bottom, *_ = get_top_bottom_wall_centres(mesh, wall_extrema)
-        traces.extend([
-            go.Scatter3d(
-                x=[e_top[0]], y=[e_top[1]], z=[e_top[2]],
-                mode='markers', marker=dict(size=7, color='#007A58'),
-                name='Extrema top centre'
-            ),
-            go.Scatter3d(
-                x=[e_bottom[0]], y=[e_bottom[1]], z=[e_bottom[2]],
-                mode='markers', marker=dict(size=7, color='#007A58', symbol='diamond'),
-                name='Extrema bottom centre'
-            ),
-        ])
-
-    title = (
-        f"Wall method comparison: {Path(mesh_name).name} "
-        f"(normals={len(wall_normals)}, extrema={len(wall_extrema)}, overlap={len(overlap)})"
-    )
-    visualize_mesh(mesh, extra_details=traces, title=title, opacity=0.25)
-
-    return {
-        "mesh": mesh_name,
-        "wall_vertices_normals": wall_normals,
-        "wall_vertices_axis_extrema": wall_extrema,
-        "overlap_vertices": overlap,
-        "n_normals": int(len(wall_normals)),
-        "n_axis_extrema": int(len(wall_extrema)),
-        "n_overlap": int(len(overlap)),
-    }
 
 
 def visualize_detected_midsection(
@@ -1859,37 +1734,6 @@ def calculate_cross_section_aspect_ratios(sections_points_list):
             aspect_ratios.append(width / height)
     return aspect_ratios
 
-def calculate_cross_section_areas(sections_points_list):
-    """Calculate area of each cross section using convex hull.
-    
-    Projects each 3D cross section to 2D using PCA and computes the convex hull area.
-    
-    Parameters
-    ----------
-    sections_points_list : list of array_like
-        Each element is an (N, 3) array of cross-section points.
-    
-    Returns
-    -------
-    list of float
-        Area for each cross section. Returns 0.0 for sections with <3 points.
-    """
-    from sklearn.decomposition import PCA
-    from scipy.spatial import ConvexHull
-    areas = []
-    for points in sections_points_list:
-        if points is None or len(points) < 3:
-            areas.append(0.0)
-            continue
-        pca = PCA(n_components=2)
-        pts2 = pca.fit_transform(np.asarray(points))
-        try:
-            hull = ConvexHull(pts2)
-            area = hull.volume  # 2D 'volume' is area
-        except Exception:
-            area = 0.0
-        areas.append(area)
-    return areas
 
 ################################################## Midsection measurement utilities ###################################################
 
